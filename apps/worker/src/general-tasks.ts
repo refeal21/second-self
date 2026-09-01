@@ -57,10 +57,13 @@ type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel';
 export class GeneralTaskManager {
   private readonly tasks = new Map<string, GeneralTask>();
   private rateLimits: RateLimitSnapshot | null = null;
+  private readonly unsubscribers: Array<() => void>;
 
   constructor(private readonly client: CodexAppServerClient) {
-    client.onServerMessage((message) => this.receiveServerMessage(message));
-    client.onExit((detail) => this.receiveExit(detail));
+    this.unsubscribers = [
+      client.onServerMessage((message) => this.receiveServerMessage(message)),
+      client.onExit((detail) => this.receiveExit(detail)),
+    ];
   }
 
   async startTask(input: StartGeneralTask): Promise<GeneralTask> {
@@ -162,6 +165,10 @@ export class GeneralTaskManager {
     return this.rateLimits ? { ...this.rateLimits } : null;
   }
 
+  dispose(): void {
+    for (const unsubscribe of this.unsubscribers.splice(0)) unsubscribe();
+  }
+
   private async resumeAfterReconnect(threadId: string): Promise<string> {
     await this.client.reconnect();
     return this.client.resumeThread(threadId);
@@ -187,6 +194,9 @@ export class GeneralTaskManager {
         break;
       case 'turn/completed':
         this.completeTurn(task, params);
+        break;
+      case 'serverRequest/resolved':
+        this.resolveInteraction(task, params);
         break;
       case 'thread/tokenUsage/updated':
         task.tokenUsage = asRecord(params.tokenUsage);
@@ -218,6 +228,7 @@ export class GeneralTaskManager {
 
   private completeTurn(task: GeneralTask, params: Record<string, unknown>): void {
     const turn = asRecord(params.turn);
+    if (typeof turn?.id !== 'string' || turn.id !== task.turnId) return;
     const status = turn?.status;
     if (status === 'completed') task.status = 'completed';
     else if (status === 'interrupted') task.status = task.status === 'cancelled' ? 'cancelled' : 'interrupted';
@@ -226,13 +237,27 @@ export class GeneralTaskManager {
       const error = asRecord(turn?.error);
       task.error = typeof error?.message === 'string' ? error.message : 'Codex turn failed';
     }
+    if (['completed', 'interrupted', 'failed'].includes(String(status))) {
+      task.pendingInteraction = null;
+    }
   }
 
   private recordError(task: GeneralTask, params: Record<string, unknown>): void {
+    if (typeof params.turnId === 'string' && params.turnId !== task.turnId) return;
     if (params.willRetry === true) return;
     const error = asRecord(params.error);
     task.status = 'failed';
     task.error = typeof error?.message === 'string' ? error.message : 'Codex App Server error';
+    task.pendingInteraction = null;
+  }
+
+  private resolveInteraction(task: GeneralTask, params: Record<string, unknown>): void {
+    const interaction = task.pendingInteraction;
+    if (!interaction || params.requestId !== interaction.requestId) return;
+    task.pendingInteraction = null;
+    if (task.status === 'waiting_for_approval' || task.status === 'waiting_for_input') {
+      task.status = 'running';
+    }
   }
 
   private blockForInteraction(
@@ -242,6 +267,9 @@ export class GeneralTaskManager {
     status: 'waiting_for_approval' | 'waiting_for_input',
   ): void {
     if (message.id === undefined) return;
+    const params = asRecord(message.params);
+    if (params?.turnId !== task.turnId) return;
+    if (!['running', 'waiting_for_approval', 'waiting_for_input'].includes(task.status)) return;
     task.pendingInteraction = { requestId: message.id, kind, params: message.params };
     task.status = status;
   }

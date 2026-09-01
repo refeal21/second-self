@@ -11,6 +11,7 @@ use digital_twin_desktop_lib::codex_process::{
     build_codex_app_server_command, resolve_codex_binary, CodexAppServerProcess, CodexBinaryProbe,
     SystemCodexBinaryProbe, CHATGPT_BUNDLED_CODEX_PATH,
 };
+use digital_twin_desktop_lib::tauri_codex::CodexProcessState;
 
 #[derive(Default)]
 struct FakeProbe {
@@ -128,4 +129,17 @@ fn system_probe_rejects_a_file_without_execute_permission() {
     assert!(!SystemCodexBinaryProbe.is_executable(&fixture));
 
     fs::remove_file(fixture).unwrap();
+}
+
+#[test]
+fn process_generations_are_monotonic_and_only_the_latest_is_current() {
+    let state = CodexProcessState::default();
+
+    let first = state.reserve_generation();
+    let second = state.reserve_generation();
+
+    assert_eq!(first, 1);
+    assert_eq!(second, 2);
+    assert!(!state.is_current_generation(first));
+    assert!(state.is_current_generation(second));
 }

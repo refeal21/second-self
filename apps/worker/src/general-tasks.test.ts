@@ -76,6 +76,22 @@ async function runningTask() {
   return { transport, manager };
 }
 
+function emitApproval(transport: ScriptedAppServer, requestId = 'approval-1'): void {
+  transport.emit({
+    id: requestId,
+    method: 'item/commandExecution/requestApproval',
+    params: {
+      kind: 'command',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemId: 'item-1',
+      startedAtMs: 1_788_220_800_000,
+      environmentId: null,
+      command: 'git status',
+    },
+  });
+}
+
 describe('general task transcript and lifecycle', () => {
   it('streams assistant deltas into one transcript item and completes the task', async () => {
     const { transport, manager } = await runningTask();
@@ -119,19 +135,7 @@ describe('general task transcript and lifecycle', () => {
 
   it('surfaces command approval requests and sends the user decision', async () => {
     const { transport, manager } = await runningTask();
-    transport.emit({
-      id: 'approval-1',
-      method: 'item/commandExecution/requestApproval',
-      params: {
-        kind: 'command',
-        threadId: 'thread-1',
-        turnId: 'turn-1',
-        itemId: 'item-1',
-        startedAtMs: 1_788_220_800_000,
-        environmentId: null,
-        command: 'git status',
-      },
-    });
+    emitApproval(transport);
 
     expect(manager.getTask('task-1')).toMatchObject({
       status: 'waiting_for_approval',
@@ -147,6 +151,98 @@ describe('general task transcript and lifecycle', () => {
       result: { decision: 'accept' },
     });
     expect(manager.getTask('task-1')?.status).toBe('running');
+  });
+
+  it('clears a pending interaction when the server resolves the matching request', async () => {
+    const { transport, manager } = await runningTask();
+    emitApproval(transport, 'approval-current');
+
+    transport.emit({
+      method: 'serverRequest/resolved',
+      params: { threadId: 'thread-1', requestId: 'approval-current' },
+    });
+
+    expect(manager.getTask('task-1')).toMatchObject({
+      status: 'running',
+      pendingInteraction: null,
+    });
+  });
+
+  it('does not clear a newer interaction when a stale request is resolved', async () => {
+    const { transport, manager } = await runningTask();
+    emitApproval(transport, 'approval-current');
+
+    transport.emit({
+      method: 'serverRequest/resolved',
+      params: { threadId: 'thread-1', requestId: 'approval-old' },
+    });
+
+    expect(manager.getTask('task-1')).toMatchObject({
+      status: 'waiting_for_approval',
+      pendingInteraction: { requestId: 'approval-current' },
+    });
+  });
+
+  it.each([
+    ['completed', 'completed'],
+    ['interrupted', 'interrupted'],
+    ['failed', 'failed'],
+  ] as const)('clears pending interaction when a turn is %s', async (turnStatus, taskStatus) => {
+    const { transport, manager } = await runningTask();
+    emitApproval(transport);
+
+    transport.emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: turnStatus,
+          error: turnStatus === 'failed' ? { message: 'Turn failed' } : null,
+        },
+      },
+    });
+
+    expect(manager.getTask('task-1')).toMatchObject({
+      status: taskStatus,
+      pendingInteraction: null,
+    });
+  });
+
+  it('keeps the active interaction when a stale turn completes', async () => {
+    const { transport, manager } = await runningTask();
+    emitApproval(transport);
+
+    transport.emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-old', status: 'completed', error: null },
+      },
+    });
+
+    expect(manager.getTask('task-1')).toMatchObject({
+      status: 'waiting_for_approval',
+      pendingInteraction: { requestId: 'approval-1' },
+    });
+  });
+
+  it('ignores a stale approval request after the turn completed', async () => {
+    const { transport, manager } = await runningTask();
+    transport.emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed', error: null },
+      },
+    });
+
+    emitApproval(transport, 'approval-late');
+
+    expect(manager.getTask('task-1')).toMatchObject({
+      status: 'completed',
+      pendingInteraction: null,
+    });
   });
 
   it('surfaces blocking user questions and returns answers by question id', async () => {
@@ -234,6 +330,7 @@ describe('general task transcript and lifecycle', () => {
 
   it('records a terminal App Server error on the task', async () => {
     const { transport, manager } = await runningTask();
+    emitApproval(transport);
 
     transport.emit({
       method: 'error',
@@ -248,6 +345,7 @@ describe('general task transcript and lifecycle', () => {
     expect(manager.getTask('task-1')).toMatchObject({
       status: 'failed',
       error: 'Model unavailable',
+      pendingInteraction: null,
     });
   });
 
@@ -280,6 +378,48 @@ describe('general task transcript and lifecycle', () => {
         { role: 'user', text: 'Draft an outline.' },
         { role: 'assistant', text: 'Partial output' },
       ],
+    });
+  });
+
+  it('disposes manager subscriptions before a replacement manager is constructed', async () => {
+    const transport = new ScriptedAppServer();
+    const client = new CodexAppServerClient(transport);
+    await client.connect();
+    const oldManager = new GeneralTaskManager(client);
+    await oldManager.startTask({
+      id: 'task-old',
+      cwd: '/workspace',
+      prompt: 'Old task',
+      createdAt: '2026-09-01T00:00:00.000Z',
+    });
+    oldManager.dispose();
+
+    const currentManager = new GeneralTaskManager(client);
+    await currentManager.startTask({
+      id: 'task-current',
+      cwd: '/workspace',
+      prompt: 'Current task',
+      createdAt: '2026-09-01T00:01:00.000Z',
+    });
+    transport.emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', delta: 'Once' },
+    });
+    emitApproval(transport);
+    transport.crash();
+
+    expect(oldManager.getTask('task-old')).toMatchObject({
+      status: 'running',
+      transcript: [{ role: 'user', text: 'Old task' }],
+      pendingInteraction: null,
+    });
+    expect(currentManager.getTask('task-current')).toMatchObject({
+      status: 'interrupted',
+      transcript: [
+        { role: 'user', text: 'Current task' },
+        { role: 'assistant', text: 'Once' },
+      ],
+      pendingInteraction: null,
     });
   });
 });

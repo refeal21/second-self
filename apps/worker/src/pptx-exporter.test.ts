@@ -95,6 +95,12 @@ describe('PptxGenJS editable exporter', () => {
     const notesXml = await archive
       .file('ppt/notesSlides/notesSlide1.xml')
       ?.async('string');
+    const relationshipsXml = await archive
+      .file('ppt/slides/_rels/slide1.xml.rels')
+      ?.async('string');
+    const chartXml = await archive
+      .file('ppt/charts/chart1.xml')
+      ?.async('string');
     const media = Object.keys(archive.files).filter(
       (path) => path.startsWith('ppt/media/') && !archive.files[path]?.dir,
     );
@@ -104,8 +110,21 @@ describe('PptxGenJS editable exporter', () => {
     expect(slideXml).toContain('<a:tbl>');
     expect(slideXml).toContain('<c:chart');
     expect(slideXml).toContain('<p:sp>');
+    expect(slideXml).toContain('<a:prstGeom prst="rect">');
     expect(slideXml?.match(/Approved growth title/g)).toHaveLength(1);
+    expect(slideXml).not.toContain('<p:pic>');
     expect(media).toEqual([]);
+    expect(relationshipsXml).toContain(
+      'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"',
+    );
+    expect(relationshipsXml).toContain('Target="/ppt/charts/chart1.xml"');
+    expect(relationshipsXml).toContain(
+      'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"',
+    );
+    expect(relationshipsXml).not.toContain('/image"');
+    expect(chartXml).toContain('<c:numCache>');
+    expect(chartXml).toContain('<c:v>100</c:v>');
+    expect(chartXml).toContain('<c:v>112</c:v>');
     expect(notesXml).toContain('[Sources]');
     expect(notesXml).toContain('Annual report');
     expect(notesXml).toContain('page 8');

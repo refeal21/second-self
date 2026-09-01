@@ -1,18 +1,32 @@
+import { createHash } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { basename, delimiter, isAbsolute, join } from 'node:path';
+import { basename, delimiter, extname, isAbsolute, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
+import { PNG } from 'pngjs';
 import type { WorkspaceArtifactAccess } from './workspace-artifacts.js';
 
 export interface CommandResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  timedOut?: boolean;
+}
+
+export interface CommandRunOptions {
+  timeoutMs: number;
+  maxOutputBytes: number;
+  env?: Readonly<Record<string, string>>;
 }
 
 export interface CommandRunner {
   canExecute(command: string): Promise<boolean>;
-  run(command: string, args: readonly string[]): Promise<CommandResult>;
+  run(
+    command: string,
+    args: readonly string[],
+    options: CommandRunOptions,
+  ): Promise<CommandResult>;
 }
 
 export class LocalCommandRunner implements CommandRunner {
@@ -34,31 +48,54 @@ export class LocalCommandRunner implements CommandRunner {
     return false;
   }
 
-  run(command: string, args: readonly string[]): Promise<CommandResult> {
+  run(
+    command: string,
+    args: readonly string[],
+    options: CommandRunOptions,
+  ): Promise<CommandResult> {
     return new Promise((resolve) => {
       const child = spawn(command, [...args], {
         stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, ...options.env },
       });
       let stdout = '';
       let stderr = '';
       let settled = false;
+      let timedOut = false;
+      const appendBounded = (current: string, chunk: string): string =>
+        `${current}${chunk}`.slice(-options.maxOutputBytes);
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
       child.stdout.on('data', (chunk: string) => {
-        stdout += chunk;
+        stdout = appendBounded(stdout, chunk);
       });
       child.stderr.on('data', (chunk: string) => {
-        stderr += chunk;
+        stderr = appendBounded(stderr, chunk);
       });
-      child.on('error', (error) => {
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGTERM');
+        setTimeout(() => {
+          if (!settled) child.kill('SIGKILL');
+        }, 500).unref();
+      }, options.timeoutMs);
+      timeout.unref();
+      const finish = (result: CommandResult): void => {
         if (settled) return;
         settled = true;
-        resolve({ exitCode: 127, stdout, stderr: `${stderr}${error.message}` });
+        clearTimeout(timeout);
+        resolve(result);
+      };
+      child.on('error', (error) => {
+        finish({
+          exitCode: 127,
+          stdout,
+          stderr: appendBounded(stderr, error.message),
+          timedOut,
+        });
       });
       child.on('close', (code) => {
-        if (settled) return;
-        settled = true;
-        resolve({ exitCode: code ?? 1, stdout, stderr });
+        finish({ exitCode: code ?? 1, stdout, stderr, timedOut });
       });
     });
   }
@@ -76,19 +113,44 @@ export interface RenderedPageComparator {
   ): Promise<readonly RenderedPageComparison[]>;
 }
 
-export class NonEmptyPageComparator implements RenderedPageComparator {
+export class PngPixelPageComparator implements RenderedPageComparator {
   async compare(pages: readonly { path: string; contents: Uint8Array }[]) {
-    return pages.map((page) => ({
-      path: page.path,
-      blank: page.contents.byteLength === 0,
-    }));
+    return pages.map((page) => {
+      const png = PNG.sync.read(Buffer.from(page.contents));
+      let minimum = 255;
+      let maximum = 0;
+      let sum = 0;
+      let samples = 0;
+      for (let offset = 0; offset < png.data.length; offset += 4) {
+        const alpha = png.data[offset + 3]! / 255;
+        for (let channel = 0; channel < 3; channel += 1) {
+          const composited = Math.round(
+            png.data[offset + channel]! * alpha + 255 * (1 - alpha),
+          );
+          minimum = Math.min(minimum, composited);
+          maximum = Math.max(maximum, composited);
+          sum += composited;
+          samples += 1;
+        }
+      }
+      const mean = samples === 0 ? 255 : sum / samples;
+      return {
+        path: page.path,
+        blank: mean >= 245 && maximum - minimum <= 16,
+      };
+    });
   }
 }
+
+/** @deprecated Use PngPixelPageComparator. */
+export class NonEmptyPageComparator extends PngPixelPageComparator {}
 
 export interface LibreOfficeQaOptions {
   configuredSoffice?: string;
   bundledSoffice?: readonly string[];
   pdfRenderers?: readonly string[];
+  commandTimeoutMs?: number;
+  maxCommandOutputBytes?: number;
 }
 
 export interface QaRunInput {
@@ -96,11 +158,19 @@ export interface QaRunInput {
   pptxPath: string;
   expectedPageCount: number;
   round: number;
+  exportSha256: string;
+  specVersionId: string;
+  visualVersionIds: Readonly<Record<string, string>>;
 }
 
 export interface LibreOfficeQaReport {
   status: 'passed' | 'failed' | 'blocked';
   round: number;
+  projectId: string;
+  exportPath: string;
+  exportSha256: string;
+  specVersionId: string;
+  visualVersionIds: Readonly<Record<string, string>>;
   sofficePath: string | null;
   rendererPath: string | null;
   pdfPath: string | null;
@@ -118,6 +188,12 @@ export interface QaRunner {
   run(input: QaRunInput): Promise<LibreOfficeQaReport>;
 }
 
+const authenticQaReports = new WeakSet<LibreOfficeQaReport>();
+
+export function isAuthenticQaReport(report: LibreOfficeQaReport): boolean {
+  return authenticQaReports.has(report);
+}
+
 const defaultBundledSoffice = [
   '/Applications/LibreOffice.app/Contents/MacOS/soffice',
   '/Applications/LibreOfficeDev.app/Contents/MacOS/soffice',
@@ -128,11 +204,72 @@ export class LibreOfficeQa implements QaRunner {
   constructor(
     private readonly commands: CommandRunner,
     private readonly artifacts: WorkspaceArtifactAccess,
-    private readonly comparator: RenderedPageComparator = new NonEmptyPageComparator(),
+    private readonly comparator: RenderedPageComparator = new PngPixelPageComparator(),
     private readonly options: LibreOfficeQaOptions = {},
   ) {}
 
   async run(input: QaRunInput): Promise<LibreOfficeQaReport> {
+    try {
+      return await this.runChecked(input);
+    } catch (error) {
+      return this.persist(
+        input,
+        await this.report(input, {
+          status: 'failed',
+          issues: [
+            `QA command or validation failed: ${error instanceof Error ? error.message : String(error)}`,
+          ],
+        }),
+      );
+    }
+  }
+
+  private async runChecked(input: QaRunInput): Promise<LibreOfficeQaReport> {
+    if (
+      isAbsolute(input.pptxPath) ||
+      input.pptxPath.includes('\\') ||
+      input.pptxPath.split('/').some((part) => part === '.' || part === '..') ||
+      !input.pptxPath.startsWith('exports/') ||
+      !/\.pptx$/i.test(input.pptxPath)
+    ) {
+      return this.persist(
+        input,
+        await this.report(input, {
+          issues: ['PPTX input must be inside project exports'],
+        }),
+      );
+    }
+    const pptxPath = await this.artifacts.resolvePath(
+      input.projectId,
+      input.pptxPath,
+    );
+    const pptxBytes = await this.artifacts.read(
+      input.projectId,
+      input.pptxPath,
+    );
+    const actualHash = createHash('sha256').update(pptxBytes).digest('hex');
+    if (actualHash !== input.exportSha256) {
+      return this.persist(
+        input,
+        await this.report(input, {
+          status: 'failed',
+          issues: ['PPTX input hash does not match validated export receipt'],
+        }),
+      );
+    }
+    const runDirectoryRelative = `qa/run-${input.round}`;
+    const qaDirectory = await this.artifacts.ensureDirectory(
+      input.projectId,
+      runDirectoryRelative,
+    );
+    const profileDirectory = await this.artifacts.ensureDirectory(
+      input.projectId,
+      `${runDirectoryRelative}/profile`,
+    );
+    const tempDirectory = await this.artifacts.ensureDirectory(
+      input.projectId,
+      `${runDirectoryRelative}/temp`,
+    );
     const soffice = await this.firstExecutable([
       this.options.configuredSoffice,
       ...(this.options.bundledSoffice ?? defaultBundledSoffice),
@@ -140,84 +277,88 @@ export class LibreOfficeQa implements QaRunner {
     if (!soffice) {
       return this.persist(
         input,
-        this.report(input, {
+        await this.report(input, {
           issues: ['LibreOffice soffice executable is unavailable'],
         }),
       );
     }
-
     const renderer = await this.firstExecutable(
       this.options.pdfRenderers ?? ['pdftoppm'],
     );
     if (!renderer) {
       return this.persist(
         input,
-        this.report(input, {
+        await this.report(input, {
           sofficePath: soffice,
           issues: ['A PDF page renderer is unavailable'],
         }),
       );
     }
-
-    const qaDirectory = this.artifacts.resolvePath(input.projectId, 'qa');
-    const conversion = await this.commands.run(soffice, [
-      '--headless',
-      '--convert-to',
-      'pdf',
-      '--outdir',
-      qaDirectory,
-      input.pptxPath,
-    ]);
-    const pdfPath = join(
-      qaDirectory,
-      `${basename(input.pptxPath, '.pptx')}.pdf`,
+    const commandOptions: CommandRunOptions = {
+      timeoutMs: this.options.commandTimeoutMs ?? 30_000,
+      maxOutputBytes: this.options.maxCommandOutputBytes ?? 64_000,
+      env: { TMPDIR: tempDirectory },
+    };
+    const conversion = await this.commands.run(
+      soffice,
+      [
+        `-env:UserInstallation=${pathToFileURL(profileDirectory).href}`,
+        '--headless',
+        '--convert-to',
+        'pdf',
+        '--outdir',
+        qaDirectory,
+        pptxPath,
+      ],
+      commandOptions,
     );
-    if (conversion.exitCode !== 0) {
+    const stem = basename(pptxPath, extname(pptxPath));
+    const pdfPath = join(qaDirectory, `${stem}.pdf`);
+    if (conversion.exitCode !== 0 || conversion.timedOut) {
       return this.persist(
         input,
-        this.report(input, {
+        await this.report(input, {
           sofficePath: soffice,
           rendererPath: renderer,
           pdfPath,
           status: 'failed',
-          issues: [
-            `LibreOffice conversion failed: ${conversion.stderr || conversion.stdout}`,
-          ],
+          issues: [commandFailure('LibreOffice conversion', conversion)],
         }),
       );
     }
-
-    const renderPrefix = join(qaDirectory, `rendered-round-${input.round}`);
-    const rendering = await this.commands.run(renderer, [
-      '-png',
-      '-r',
-      '144',
-      pdfPath,
-      renderPrefix,
-    ]);
-    if (rendering.exitCode !== 0) {
+    const renderPrefix = join(qaDirectory, 'rendered');
+    const rendering = await this.commands.run(
+      renderer,
+      ['-png', '-r', '144', pdfPath, renderPrefix],
+      commandOptions,
+    );
+    if (rendering.exitCode !== 0 || rendering.timedOut) {
       return this.persist(
         input,
-        this.report(input, {
+        await this.report(input, {
           sofficePath: soffice,
           rendererPath: renderer,
           pdfPath,
           status: 'failed',
-          issues: [
-            `PDF rendering failed: ${rendering.stderr || rendering.stdout}`,
-          ],
+          issues: [commandFailure('PDF rendering', rendering)],
         }),
       );
     }
-
-    const prefix = `rendered-round-${input.round}-`;
-    const pageNames = (await this.artifacts.list(input.projectId, 'qa'))
-      .filter((name) => name.startsWith(prefix) && name.endsWith('.png'))
+    const pageNames = (
+      await this.artifacts.list(input.projectId, runDirectoryRelative)
+    )
+      .filter((name) => /^rendered-\d+\.png$/.test(name))
       .sort(numericPageOrder);
     const pages = await Promise.all(
       pageNames.map(async (name) => ({
-        path: this.artifacts.resolvePath(input.projectId, `qa/${name}`),
-        contents: await this.artifacts.read(input.projectId, `qa/${name}`),
+        path: await this.artifacts.resolvePath(
+          input.projectId,
+          `${runDirectoryRelative}/${name}`,
+        ),
+        contents: await this.artifacts.read(
+          input.projectId,
+          `${runDirectoryRelative}/${name}`,
+        ),
       })),
     );
     const comparisons = await this.comparator.compare(pages);
@@ -241,7 +382,7 @@ export class LibreOfficeQa implements QaRunner {
     ];
     return this.persist(
       input,
-      this.report(input, {
+      await this.report(input, {
         status: issues.length === 0 ? 'passed' : 'failed',
         sofficePath: soffice,
         rendererPath: renderer,
@@ -266,13 +407,18 @@ export class LibreOfficeQa implements QaRunner {
     return null;
   }
 
-  private report(
+  private async report(
     input: QaRunInput,
     values: Partial<LibreOfficeQaReport>,
-  ): LibreOfficeQaReport {
+  ): Promise<LibreOfficeQaReport> {
     return {
       status: 'blocked',
       round: input.round,
+      projectId: input.projectId,
+      exportPath: input.pptxPath,
+      exportSha256: input.exportSha256,
+      specVersionId: input.specVersionId,
+      visualVersionIds: structuredClone(input.visualVersionIds),
       sofficePath: null,
       rendererPath: null,
       pdfPath: null,
@@ -282,11 +428,11 @@ export class LibreOfficeQa implements QaRunner {
       blankPages: [],
       comparisons: [],
       issues: [],
-      jsonReportPath: this.artifacts.resolvePath(
+      jsonReportPath: await this.artifacts.resolvePath(
         input.projectId,
         `qa/qa-round-${input.round}.json`,
       ),
-      textReportPath: this.artifacts.resolvePath(
+      textReportPath: await this.artifacts.resolvePath(
         input.projectId,
         `qa/qa-round-${input.round}.txt`,
       ),
@@ -308,8 +454,25 @@ export class LibreOfficeQa implements QaRunner {
       `qa/qa-round-${input.round}.txt`,
       textReport(report),
     );
-    return report;
+    const frozen = deepFreeze(report);
+    authenticQaReports.add(frozen);
+    return frozen;
   }
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      deepFreeze(child);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function commandFailure(label: string, result: CommandResult): string {
+  if (result.timedOut) return `${label} timed out`;
+  return `${label} failed: ${result.stderr || result.stdout || `exit ${result.exitCode}`}`;
 }
 
 function numericPageOrder(left: string, right: string): number {
@@ -321,6 +484,7 @@ function numericPageOrder(left: string, right: string): number {
 function textReport(report: LibreOfficeQaReport): string {
   return [
     `LibreOffice QA round ${report.round}: ${report.status}`,
+    `Export: ${report.exportPath} (${report.exportSha256})`,
     `Pages: ${report.actualPageCount}/${report.expectedPageCount}`,
     ...(report.blankPages.length > 0
       ? [`Blank rendered pages: ${report.blankPages.join(', ')}`]
@@ -335,7 +499,7 @@ export interface PptRepairer {
     pptxPath: string;
     round: number;
     qaReport: LibreOfficeQaReport;
-  }): Promise<string>;
+  }): Promise<{ pptxPath: string; exportSha256: string }>;
 }
 
 export interface QaRepairOutcome {
@@ -353,27 +517,34 @@ export class QaRepairOrchestrator {
 
   async run(input: Omit<QaRunInput, 'round'>): Promise<QaRepairOutcome> {
     let pptxPath = input.pptxPath;
+    let exportSha256 = input.exportSha256;
     const reports: LibreOfficeQaReport[] = [];
-    let report = await this.qa.run({ ...input, pptxPath, round: 1 });
+    let report = await this.qa.run({
+      ...input,
+      pptxPath,
+      exportSha256,
+      round: 1,
+    });
     reports.push(report);
     let repairRounds = 0;
-
     while (report.status === 'failed' && repairRounds < 2) {
       repairRounds += 1;
-      pptxPath = await this.repairer.repair({
+      const repaired = await this.repairer.repair({
         projectId: input.projectId,
         pptxPath,
         round: repairRounds,
         qaReport: report,
       });
+      pptxPath = repaired.pptxPath;
+      exportSha256 = repaired.exportSha256;
       report = await this.qa.run({
         ...input,
         pptxPath,
+        exportSha256,
         round: repairRounds + 1,
       });
       reports.push(report);
     }
-
     return { status: report.status, pptxPath, repairRounds, reports };
   }
 }

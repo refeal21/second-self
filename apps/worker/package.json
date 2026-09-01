@@ -12,10 +12,12 @@
   },
   "dependencies": {
     "@digital-twin/core": "workspace:*",
+    "pngjs": "7.0.0",
     "pptxgenjs": "4.0.1"
   },
   "devDependencies": {
     "@types/node": "^24.5.2",
+    "@types/pngjs": "6.0.5",
     "jszip": "3.10.1",
     "tsx": "^4.20.5"
   }

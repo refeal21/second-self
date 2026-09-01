@@ -1,6 +1,15 @@
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, sep } from 'node:path';
-import { resolveWorkspaceWritePath } from '@digital-twin/core';
+import {
+  constants,
+  link,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  unlink,
+} from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { assertStrictIdentifier } from './identifiers.js';
 
 export const PROJECT_ARTIFACT_DIRECTORIES = [
   'exports',
@@ -16,6 +25,7 @@ export type ProjectArtifactDirectory =
 
 export interface WorkspaceArtifacts {
   initializeProject(projectId: string): Promise<void>;
+  projectDirectory?(projectId: string): Promise<string>;
   write(
     projectId: string,
     relativePath: string,
@@ -25,8 +35,9 @@ export interface WorkspaceArtifacts {
 }
 
 export interface WorkspaceArtifactAccess extends WorkspaceArtifacts {
-  resolvePath(projectId: string, relativePath: string): string;
+  resolvePath(projectId: string, relativePath: string): Promise<string>;
   read(projectId: string, relativePath: string): Promise<Uint8Array>;
+  ensureDirectory(projectId: string, relativePath: string): Promise<string>;
   list(
     projectId: string,
     relativeDirectory: string,
@@ -34,17 +45,50 @@ export interface WorkspaceArtifactAccess extends WorkspaceArtifacts {
 }
 
 export class LocalWorkspaceArtifacts implements WorkspaceArtifactAccess {
-  constructor(private readonly workspaceRoot: string) {}
+  private readonly workspaceRoot: string;
+
+  constructor(workspaceRoot: string) {
+    this.workspaceRoot = resolve(workspaceRoot);
+  }
 
   async initializeProject(projectId: string): Promise<void> {
+    assertStrictIdentifier('project', projectId);
+    await mkdir(this.workspaceRoot, { recursive: true });
+    await this.assertDirectoryWithoutSymlink(this.workspaceRoot);
     const projectRoot = this.projectRoot(projectId);
-    await Promise.all(
-      PROJECT_ARTIFACT_DIRECTORIES.map((directory) =>
-        mkdir(resolveWorkspaceWritePath(projectRoot, directory), {
-          recursive: true,
-        }),
-      ),
+    await this.mkdirChecked(projectRoot);
+    for (const directory of PROJECT_ARTIFACT_DIRECTORIES) {
+      await this.mkdirChecked(join(projectRoot, directory));
+    }
+    const entries = (await readdir(projectRoot)).sort();
+    if (
+      entries.join('\0') !== [...PROJECT_ARTIFACT_DIRECTORIES].sort().join('\0')
+    ) {
+      throw new Error(
+        'Project must contain exactly the six artifact directories',
+      );
+    }
+  }
+
+  async projectDirectory(projectId: string): Promise<string> {
+    const projectRoot = this.projectRoot(projectId);
+    await this.assertDirectoryWithoutSymlink(this.workspaceRoot);
+    await this.assertDirectoryWithoutSymlink(projectRoot);
+    return projectRoot;
+  }
+
+  async ensureDirectory(
+    projectId: string,
+    relativePath: string,
+  ): Promise<string> {
+    const path = await this.checkedArtifactPath(projectId, relativePath, true);
+    await this.assertExistingComponentsWithoutSymlinks(
+      this.projectRoot(projectId),
+      path,
+      true,
     );
+    await this.assertDirectoryWithoutSymlink(path);
+    return path;
   }
 
   async write(
@@ -52,56 +96,184 @@ export class LocalWorkspaceArtifacts implements WorkspaceArtifactAccess {
     relativePath: string,
     contents: string | Uint8Array,
   ): Promise<string> {
-    const path = this.artifactPath(projectId, relativePath);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, contents);
+    const path = await this.checkedArtifactPath(projectId, relativePath, true);
+    const parent = dirname(path);
+    await this.assertExistingComponentsWithoutSymlinks(
+      this.projectRoot(projectId),
+      parent,
+      true,
+    );
+    const temporaryPath = join(parent, `.${randomUUID()}.tmp`);
+    let temporaryCreated = false;
+    try {
+      const handle = await open(
+        temporaryPath,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          constants.O_NOFOLLOW,
+        0o600,
+      );
+      temporaryCreated = true;
+      try {
+        await handle.writeFile(contents);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await this.assertExistingComponentsWithoutSymlinks(
+        this.projectRoot(projectId),
+        parent,
+        false,
+      );
+      await link(temporaryPath, path);
+      await unlink(temporaryPath);
+      temporaryCreated = false;
+    } catch (error) {
+      if (temporaryCreated) {
+        await unlink(temporaryPath).catch(() => undefined);
+      }
+      if (isNodeError(error) && error.code === 'EEXIST') {
+        throw new Error(`Artifact already exists: ${relativePath}`);
+      }
+      throw error;
+    }
     return path;
   }
 
   async read(projectId: string, relativePath: string): Promise<Uint8Array> {
-    return readFile(this.artifactPath(projectId, relativePath));
+    const path = await this.checkedArtifactPath(projectId, relativePath, false);
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      return await handle.readFile();
+    } finally {
+      await handle.close();
+    }
   }
 
-  resolvePath(projectId: string, relativePath: string): string {
-    return this.artifactPath(projectId, relativePath);
+  async resolvePath(projectId: string, relativePath: string): Promise<string> {
+    return this.checkedArtifactPath(projectId, relativePath, false);
   }
 
   async list(
     projectId: string,
     relativeDirectory: string,
   ): Promise<readonly string[]> {
-    return readdir(this.artifactPath(projectId, `${relativeDirectory}/.`));
+    const path = await this.checkedArtifactPath(
+      projectId,
+      relativeDirectory,
+      false,
+    );
+    await this.assertDirectoryWithoutSymlink(path);
+    return readdir(path);
   }
 
   private projectRoot(projectId: string): string {
-    if (
-      projectId.length === 0 ||
-      projectId.includes('/') ||
-      projectId.includes('\\')
-    ) {
-      throw new Error('Project path is outside the workspace');
-    }
-    return resolveWorkspaceWritePath(this.workspaceRoot, projectId);
+    assertStrictIdentifier('project', projectId);
+    return join(this.workspaceRoot, projectId);
   }
 
-  private artifactPath(projectId: string, candidatePath: string): string {
+  private async checkedArtifactPath(
+    projectId: string,
+    candidatePath: string,
+    createParents: boolean,
+  ): Promise<string> {
     const projectRoot = this.projectRoot(projectId);
-    let path: string;
-    try {
-      path = resolveWorkspaceWritePath(projectRoot, candidatePath);
-    } catch {
-      throw new Error('Artifact path is outside the project');
-    }
-    const relation = relative(projectRoot, path);
-    const directory = relation.split(sep)[0];
+    const components = candidatePath.split('/');
     if (
       isAbsolute(candidatePath) ||
+      candidatePath.includes('\\') ||
+      components.some(
+        (component) =>
+          component === '' || component === '.' || component === '..',
+      )
+    ) {
+      if (
+        components.some((component) => component === '.' || component === '..')
+      ) {
+        throw new Error('Artifact path contains dot path components');
+      }
+      throw new Error('Artifact path is outside the project');
+    }
+    const directory = components[0];
+    if (
       !PROJECT_ARTIFACT_DIRECTORIES.includes(
         directory as ProjectArtifactDirectory,
       )
     ) {
       throw new Error('Artifact path is outside the project');
     }
+    await this.assertDirectoryWithoutSymlink(this.workspaceRoot);
+    await this.assertDirectoryWithoutSymlink(projectRoot);
+    const path = join(projectRoot, ...components);
+    await this.assertExistingComponentsWithoutSymlinks(
+      projectRoot,
+      dirname(path),
+      createParents,
+    );
+    const existing = await lstat(path).catch((error: unknown) => {
+      if (isNodeError(error) && error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (existing?.isSymbolicLink()) {
+      throw new Error(
+        `Artifact path contains a symbolic link: ${candidatePath}`,
+      );
+    }
     return path;
   }
+
+  private async assertExistingComponentsWithoutSymlinks(
+    projectRoot: string,
+    targetDirectory: string,
+    createMissing: boolean,
+  ): Promise<void> {
+    const relation = targetDirectory.slice(projectRoot.length);
+    const components = relation.split('/').filter(Boolean);
+    let current = projectRoot;
+    for (const component of components) {
+      current = join(current, component);
+      const status = await lstat(current).catch((error: unknown) => {
+        if (isNodeError(error) && error.code === 'ENOENT') return undefined;
+        throw error;
+      });
+      if (!status && createMissing) {
+        await mkdir(current);
+        await this.assertDirectoryWithoutSymlink(current);
+        continue;
+      }
+      if (!status) {
+        throw new Error(`Artifact directory does not exist: ${current}`);
+      }
+      if (status.isSymbolicLink()) {
+        throw new Error(`Artifact path contains a symbolic link: ${current}`);
+      }
+      if (!status.isDirectory()) {
+        throw new Error(
+          `Artifact path component is not a directory: ${current}`,
+        );
+      }
+    }
+  }
+
+  private async mkdirChecked(path: string): Promise<void> {
+    await mkdir(path).catch((error: unknown) => {
+      if (!isNodeError(error) || error.code !== 'EEXIST') throw error;
+    });
+    await this.assertDirectoryWithoutSymlink(path);
+  }
+
+  private async assertDirectoryWithoutSymlink(path: string): Promise<void> {
+    const status = await lstat(path);
+    if (status.isSymbolicLink()) {
+      throw new Error(`Artifact path contains a symbolic link: ${path}`);
+    }
+    if (!status.isDirectory()) {
+      throw new Error(`Artifact path component is not a directory: ${path}`);
+    }
+  }
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error;
 }

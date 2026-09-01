@@ -1,97 +1,108 @@
-# Task 3 report — image-first PPT workflow and local artifacts
+# Task 3 report — image-first PPT workflow and fix round 1
 
-## Implementation
+## Outcome
 
-- Added a focused workspace-artifact boundary with the exact per-project folders `sources/`, `outline/`, `slide-specs/`, `visuals/`, `exports/`, and `qa/`. Project, source, structured-analysis, outline, page-spec, visual, export, and QA writes all pass through this boundary.
-- Added a PPT project/workflow service that reuses the core fixed-stage transition guard and `freezeVersion`:
-  - creates projects and attaches selected source material;
-  - stores structured material analysis with findings, data points, and `sourceMap` citations;
-  - freezes the whole outline on approval;
-  - freezes all page specifications together on detail approval;
-  - freezes each page visual independently;
-  - requires every current page visual to be approved before conversion;
-  - reopens only the current approved page into a new draft version;
-  - creates a new version for regeneration/replacement instead of mutating prior approved output;
-  - enforces `conversion → qa → completed`, with failed QA entering `blocked`.
-- Added a source-analysis service and gateway. A requested web search enters `awaiting_web_search_approval`; execution is rejected until the user explicitly approves it, and rejection remains non-executable.
-- Added `VisualGenerationGateway`, `VisualGenerationService`, and `CodexVisualGenerationGateway`:
-  - only one page visual may generate at a time per project;
-  - the request contains one page ID, its frozen spec version, the approved structured spec, and its page-specific image brief;
-  - the prompt states that structured spec text/data/citations are authoritative and OCR/image text may not overwrite them;
-  - missing ImageGen skill/tool capability returns `{ status: 'blocked', reason: 'capability_unavailable' }` without starting a turn;
-  - no API-key field, login, environment variable, or fallback path was added.
-- Added `PptxExporter` and a PptxGenJS 4.0.1 adapter. It rebuilds approved titles, body copy, tables, charts, and basic shapes as editable OOXML objects. A full-slide reference PNG or any image not explicitly marked text-free is not embedded beneath editable copy. Explicitly text-free backgrounds and complex visual layers are the only approved images eligible for embedding. Per-slide `sourceMap` entries are written to `[Sources]` speaker notes.
-- Added `PptExportService`, which writes `.pptx` bytes through the workspace-artifact boundary.
-- Added `CommandRunner`, `LocalCommandRunner`, `LibreOfficeQa`, a pluggable rendered-page comparator, and `QaRepairOrchestrator`:
-  - probes configured, bundled, and PATH `soffice` candidates;
-  - probes configurable PDF page renderers;
-  - runs `soffice --headless --convert-to pdf` and `pdftoppm -png -r 144` with paths resolved through the artifact boundary;
-  - checks rendered page count and comparator-reported blank pages;
-  - persists JSON and readable text reports under `qa/`;
-  - stops after at most two automated repair calls.
+Task 3 now has one evidence-bearing workflow from attached project sources through validated analysis, frozen outline/specs, individually approved visual artifact versions, editable PPTX export, authentic LibreOffice QA, and the final `completed`/`blocked` transition. Public arbitrary image/export/status mutation methods were removed. No API-key or model fallback path was added.
 
-## Files added or updated
+## Fix-round implementation
 
-- `apps/worker/src/workspace-artifacts.ts`
-- `apps/worker/src/workspace-artifacts.test.ts`
-- `apps/worker/src/source-analysis.ts`
-- `apps/worker/src/source-analysis.test.ts`
-- `apps/worker/src/ppt-project.ts`
-- `apps/worker/src/ppt-project.test.ts`
-- `apps/worker/src/visual-generation.ts`
-- `apps/worker/src/visual-generation.test.ts`
-- `apps/worker/src/pptx-exporter.ts`
-- `apps/worker/src/pptx-exporter.test.ts`
-- `apps/worker/src/libreoffice-qa.ts`
-- `apps/worker/src/libreoffice-qa.test.ts`
-- `apps/worker/src/index.ts`
-- `apps/worker/package.json`
-- `packages/core/package.json`
-- `packages/core/src/types.ts`
-- `pnpm-lock.yaml`
+### Artifact boundary
+
+- Added one conservative identifier validator for project, source, request, slide, and version/entity identifiers. Empty, dot, traversal, separator, uppercase, whitespace, and non-ASCII identifiers are rejected.
+- `LocalWorkspaceArtifacts` now rejects `.`/`..` path components before normalization and permits only the six fixed top-level directories: `sources/`, `outline/`, `slide-specs/`, `visuals/`, `exports/`, and `qa/`.
+- Every existing path component is checked with `lstat`; symlinks replacing a fixed directory or appearing in nested components are rejected.
+- Writes use a same-directory exclusive temporary file opened with `O_EXCL | O_NOFOLLOW`, `fsync`, and a create-only hard link to the final name. Existing frozen artifacts cannot be overwritten.
+- Slide specs and image briefs are persisted together in one authoritative `slide-specs/slide-specs-v1.json` bundle, so state commits after one atomic artifact write rather than a partial multi-file batch.
+- Read, list, project-directory, directory-creation, and path-resolution operations use the same checked boundary.
+
+### AI provenance, identity, and concurrency
+
+- Source analysis is now requested against an exact attached source set. Request records and explicit web-search decisions are persisted before state changes.
+- Analysis is marked `running` before awaiting the gateway. A store shared by all `SourceAnalysisService` instances for one project service prevents duplicate execution.
+- Gateway output is runtime-validated: findings, data points, citations, IDs, and all source references must match the requested attached source set. The resulting artifact/hash receipt binds project, request, source set, web-search decision, and output.
+- Removed public `recordSourceAnalysis`; outline generation consumes only completed analysis evidence through `OutlineGenerationGateway`, and SlideSpec generation consumes only a frozen outline through `SlideSpecGenerationGateway`.
+- Generated outline and SlideSpec schemas are checked at runtime. Outline slide IDs must be safe and unique; SlideSpec IDs must be an exact unique bijection with frozen outline IDs. Finding/data/source references must resolve.
+- Project-scoped operation locks are owned by `PptProjectService`, so separate visual service instances cannot race. Durable workflow state is updated only after artifact writes succeed.
+- Tests prove one page approval cannot satisfy a second page.
+
+### ImageGen boundary
+
+- Capability discovery now requires the exact `{ id: 'image_gen.imagegen', status: 'available' }` contract. Fuzzy names and `imagegen-disabled` are rejected.
+- The Codex gateway no longer accepts an arbitrary constructor CWD. `VisualGenerationService` obtains the project CWD from the validated workspace-artifact boundary and supplies it per request.
+- Capability absence is persisted as a recoverable project block containing the slide, reason, exact capability, and `resumeStage: 'visual_review'`. Resume succeeds only after exact capability restoration and preserves all earlier approvals.
+- Arbitrary public image-byte mutation methods were removed; generated bytes enter project state only through the visual-generation evidence path. No API fallback exists.
+
+### Export and QA evidence chain
+
+- Added `PptDeliveryCoordinator` as the only workflow-advancing delivery path. It reads the frozen specs and current frozen visual versions, validates each visual artifact path, reads the artifact bytes, and constructs the exporter input itself.
+- Editable copy, tables, chart data, shapes, and speaker-note citations come only from the frozen SlideSpecs. Approved full-slide reference PNGs are not embedded below editable content; only explicitly text-free background/complex assets are eligible.
+- Export is normalized to a local lowercase `.pptx` extension, written through the boundary, read back, and SHA-256 checked. The export receipt binds project, relative/absolute validated path, byte count/hash, SlideSpec version, and every current visual version.
+- Removed public `recordExport` and `recordQaResult`. An export receipt is re-read and re-hashed before `conversion → qa`.
+- A QA report can advance state only when it carries runtime execution proof issued after `LibreOfficeQa` has persisted both report artifacts. Self-reported/fake `passed` reports are rejected and leave the project in `qa`.
+- QA report bindings must exactly match the validated export receipt before `qa → completed` or `qa → blocked`.
+
+### LibreOffice and OOXML QA
+
+- Replaced zero-byte blank detection with decoded PNG RGBA pixel analysis. Pure-white and near-uniform white pages are blank; visibly colored pages are not.
+- Initial and repaired QA inputs must be relative paths under project `exports/`; each QA invocation validates the artifact path and SHA-256.
+- Each run uses `qa/run-N/profile` as the LibreOffice user profile and `qa/run-N/temp` as `TMPDIR`.
+- `LocalCommandRunner` now enforces configurable timeouts, sends `SIGTERM` then `SIGKILL`, and bounds captured stdout/stderr. Spawn errors and timeouts become persisted failed reports.
+- Mixed-case requested extensions are normalized by delivery; QA also handles `.pptx` case-insensitively when deriving the PDF name.
+- Automated repair remains capped at two repair calls, and every repaired path/hash is revalidated by the same QA boundary.
+- ZIP/XML tests inspect concrete editable text/table objects, `a:prstGeom`, chart relationships and numeric caches, notes relationships/content, and absence of a full-slide image relationship/media item.
 
 ## TDD RED/GREEN evidence
 
 | Behavior | RED command/result | GREEN command/result |
 | --- | --- | --- |
-| Exact project folders, artifact path boundary, attachments, source analysis, web-search approval, outline/detail freeze | `pnpm --filter @digital-twin/worker exec vitest run src/workspace-artifacts.test.ts src/ppt-project.test.ts src/source-analysis.test.ts` → exit 1; 3 test failures because `PptProjectService` was absent and 2 failed suites because the artifact and analysis modules were missing | Same command → exit 0; 7/7 tests passed |
-| One-page visual lock, page versions, per-page approval/reopen/replacement, ImageGen capability block, page-specific Codex request | `pnpm --filter @digital-twin/worker exec vitest run src/visual-generation.test.ts` → exit 1; 5/5 tests failed because the visual services/gateway and version operations were absent | Same command → exit 0; 5/5 tests passed; `pnpm --filter @digital-twin/worker typecheck` also exited 0 after the focused type corrections |
-| Editable PPTX OOXML, source notes, full-slide PNG exclusion, eligible complex-visual inclusion, artifact export | First `pnpm --filter @digital-twin/worker exec vitest run src/pptx-exporter.test.ts` → exit 1 because the required ZIP inspector dependency was absent; after adding the explicit test dependency, the same command → exit 1 with 3/3 focused failures because `PptxGenJsExporter` and `PptExportService` were absent | Same command → exit 0; 3/3 tests passed; ZIP/XML assertions found approved text once in editable slide XML, native table/chart/shape objects, `[Sources]` notes, zero media files for the baked full-slide reference, and one media file for an explicitly text-free complex visual |
-| LibreOffice detection/conversion/render/report and two-repair cap | `pnpm --filter @digital-twin/worker exec vitest run src/libreoffice-qa.test.ts` → exit 1; 3/3 tests failed because `LibreOfficeQa` and `QaRepairOrchestrator` were absent | Same command → exit 0; 3/3 tests passed with fake command runner and deterministic comparator |
-| Legal conversion/QA completion | `pnpm --filter @digital-twin/worker exec vitest run src/ppt-project.test.ts` → exit 1; 1 focused failure because `recordExport`/`recordQaResult` were absent | Same command → exit 0; 4/4 project-workflow tests passed and worker typecheck exited 0 |
+| Strict IDs, dot paths, create-only writes, fixed/nested symlink traversal | `pnpm --filter @digital-twin/worker exec vitest run src/identifiers.test.ts src/workspace-artifacts.test.ts` → exit 1; identifier module missing and 9/11 artifact tests failed | Same command → exit 0; 21/21 passed |
+| Unique outline IDs, exact SlideSpec mapping, write-before-state | `pnpm --filter @digital-twin/worker exec vitest run src/ppt-project.test.ts` → exit 1; 3/7 failed | Same focused file → exit 0; 7/7 passed; final expanded file 9/9 passed |
+| Request/source provenance, reference integrity, cross-instance running lock | `pnpm --filter @digital-twin/worker exec vitest run src/source-analysis.test.ts` → exit 1; 4/4 failed | Same command → exit 0; 4/4 passed |
+| Analysis-bound outline and frozen-outline-bound SlideSpec gateways | `pnpm --filter @digital-twin/worker exec vitest run src/structure-generation.test.ts` → exit 1; 3/3 failed because services were absent | Same file plus source analysis → exit 0; 7/7 passed |
+| Exact ImageGen capability/CWD, shared visual lock, persisted block/resume, no public image mutation | `pnpm --filter @digital-twin/worker exec vitest run src/visual-generation.test.ts` → exit 1; 5/7 failed, then the arbitrary-image surface counterexample remained RED | Same command → exit 0; final 8/8 passed |
+| Delivery receipt and removal of arbitrary export/status mutation | `pnpm --filter @digital-twin/worker exec vitest run src/delivery-coordinator.test.ts src/visual-generation.test.ts` → exit 1; 2/9 failed on exposed mutation methods | Same command → exit 0; 9/9 passed at that checkpoint |
+| Self-reported QA cannot complete a project | `pnpm --filter @digital-twin/worker exec vitest run src/delivery-coordinator.test.ts` → exit 1; forged QA test resolved instead of rejecting | Same file plus QA tests → exit 0; 8/8 passed |
+| Decoded PNG blank detection, exports restriction, run isolation, timeout/exception persistence | First QA run → exit 1 because `pngjs` was absent; after adding the explicit dependency, 4/6 behavior tests failed | `pnpm --filter @digital-twin/worker exec vitest run src/libreoffice-qa.test.ts` → exit 0; 6/6 passed |
+| Atomic authoritative SlideSpec bundle | `pnpm --filter @digital-twin/worker exec vitest run src/ppt-project.test.ts` → exit 1; 2/9 failed because the implementation still wrote per-page files | Same command → exit 0; 9/9 passed |
+| Concrete OOXML proof | Strengthened `src/pptx-exporter.test.ts`; first run was RED on the concrete chart relationship target assertion | Same command → exit 0; 3/3 passed with shape/chart/relationship/notes/no-image assertions |
 
-## Verification and QA evidence
+## Verification and real QA evidence
 
-- Clean baseline before Task 3: `pnpm test` → exit 0; core 8/8, worker 33/33, desktop 11/11, Rust 13/13 integration tests passed.
-- Focused Worker gate after implementation: `pnpm --filter @digital-twin/worker typecheck && pnpm --filter @digital-twin/worker test` → exit 0; Worker 51/51 at that checkpoint. The legal QA-stage regression then brought the final Worker total to 52/52.
-- Real local smoke QA used the bundled runtime executables reported by `command -v`: `soffice` and `pdftoppm` both resolved under the Codex primary runtime. A one-page editable PPTX was created through `PptxGenJsExporter`, written through `LocalWorkspaceArtifacts`, converted headlessly to PDF, rendered to PNG, and inspected by `LibreOfficeQa`. Result: `status: passed`, `actualPageCount: 1`, `blankPages: []`, `issues: []`; JSON report was written to the temporary project's `qa/qa-round-1.json`.
-- Task files were formatted with `pnpm dlx prettier@3.6.2 --single-quote --write ...`; the check command reported all selected Task 3 files matched Prettier style.
-- Fresh repository gate: `pnpm typecheck && pnpm lint && pnpm test && pnpm dlx prettier@3.6.2 --check ...` → exit 0.
-  - Core: 8/8 tests passed.
-  - Worker: 52/52 tests passed.
-  - Desktop TypeScript: 11/11 tests passed.
-  - Rust: 13/13 integration tests passed (7 process, 1 database, 5 path); unit/doc suites passed.
-  - All three TypeScript workspace projects passed typecheck.
-  - All three TypeScript workspace projects passed lint with zero warnings.
-  - All selected Task 3 files passed the formatting check.
-- `git diff --check` → exit 0.
-- Production boundary audit found no API-key symbol or fallback in new production code. The only existing `apikey` strings remain Task 2 tests that verify unsupported auth is rejected.
+- Focused final Worker suite: `pnpm --filter @digital-twin/worker test` → exit 0; 89/89 passed.
+- Real local LibreOffice counterexample used the bundled runtime `soffice` and `pdftoppm`, `LocalWorkspaceArtifacts`, the production command runner, and the PNG comparator:
+  - editable normal one-page PPTX: `status: passed`, `actualPageCount: 1`, `blankPages: []`, `issues: []`;
+  - empty one-page PPTX: `status: failed`, `actualPageCount: 1`, `blankPages: [1]`, issue `Blank rendered pages: 1`.
+- Fresh repository gate before final commit:
+  - `pnpm typecheck` → exit 0 for core, worker, and desktop;
+  - `pnpm lint` → exit 0 with zero warnings;
+  - `pnpm test` → exit 0: core 8/8, Worker 89/89, desktop 11/11, Rust 13/13 integration tests plus unit/doc suites;
+  - `pnpm dlx prettier@3.6.2 --single-quote --check <Task 3 files>` → exit 0;
+  - `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check` → exit 0;
+  - `git diff --check` → exit 0.
+- The full gate above was the final run after the atomic-bundle and report edits.
 
-## Design decisions and self-review
+## Files added or materially updated in fix round 1
 
-- The structured `SlideSpec` is passed directly from the frozen detail version to visual generation and to PPTX authoring. Generated image output has no channel for replacing slide text, numbers, tables, chart data, or citations.
-- Visual artifacts carry two explicit safeguards: `usage` and `textFree`. The exporter requires `textFree: true` and rejects `full_slide_reference` for embedding, even when image bytes are supplied.
-- Current visual approval is matched by both `slideId` and `versionId`; reopening leaves the historical frozen version intact and makes the new draft current, so stale approval cannot unlock conversion.
-- The visual-generation coordinator clears its active-project lock in `finally`, including capability blocks and gateway errors.
-- External source analysis, image generation, PPTX authoring, command execution, comparison, repair, and artifact IO are separate interfaces/classes rather than one worker controller.
-- PptxGenJS is isolated behind `PptxExporter`; ZIP/XML inspection tests assert outcomes in generated OOXML instead of implementation source text.
-- LibreOffice and PDF renderer calls are argument arrays with `shell: false` process spawning. No shell command construction is exposed through the QA API.
-- QA output paths are resolved within the project `qa/` boundary before external tools receive them, and QA reports themselves are written through the artifact writer.
+- `apps/worker/src/identifiers.ts` and test
+- `apps/worker/src/workspace-artifacts.ts` and test
+- `apps/worker/src/analysis-evidence.ts`
+- `apps/worker/src/source-analysis.ts` and test
+- `apps/worker/src/structure-generation.ts` and test
+- `apps/worker/src/visual-evidence.ts`
+- `apps/worker/src/visual-generation.ts` and test
+- `apps/worker/src/delivery-evidence.ts`
+- `apps/worker/src/delivery-coordinator.ts` and test
+- `apps/worker/src/ppt-project.ts` and test
+- `apps/worker/src/libreoffice-qa.ts` and test
+- `apps/worker/src/pptx-exporter.test.ts`
+- `apps/worker/src/index.ts`
+- `apps/worker/package.json`
+- `pnpm-lock.yaml`
 
-## Concerns / Task 5 boundaries
+## Self-review and residual risks
 
-- The production Tauri binding for `WorkspaceArtifacts` still belongs to Task 5. The Node `LocalWorkspaceArtifacts` adapter is suitable for Worker tests and the local smoke run, but the packaged app must bind the same interface to the existing Rust symlink-aware workspace commands so Rust remains the authority for production path safety and filesystem writes.
-- The Codex ImageGen adapter intentionally depends on `CodexImageGenTurnRunner`; Task 5 must connect that runner to the existing App Server/general-task turn lifecycle and capability discovery. No live model/image generation was attempted here.
-- The default page comparator treats a zero-byte rendered page as blank. More expensive white-page and visual-difference scoring is intentionally pluggable and should be supplied in Task 5; deterministic comparator behavior and report plumbing are covered now.
-- The real smoke run verifies LibreOffice compatibility in this environment. Microsoft PowerPoint and Keynote were not claimed or run; Task 5 retains the documented manual Keynote check.
-- Project/workflow state is intentionally in memory behind focused services. SQLite checkpoint persistence and restart restoration are Task 5 integration work.
+- The Node adapter closes lexical traversal, existing-component symlink traversal, final-file following, and accidental overwrite. There remains an unavoidable parent-directory TOCTOU window between `lstat` checks and a later Node filesystem operation. The production Rust workspace binding should use directory-handle-relative operations (`openat`/equivalent) where available; this is now a documented defense-in-depth follow-up, not a reason to weaken the Node boundary.
+- LibreOffice/Poppler behavior was verified on this macOS runtime. PowerPoint and Keynote were not run; editable compatibility still depends on the documented PptxGenJS/OOXML surface and should receive manual application smoke checks before release.
+- Project state is intentionally in memory for this task. Task 5 must persist the evidence receipts, frozen versions, blocked condition, and operation recovery in SQLite without introducing a parallel mutation path.
+- The authentic QA proof is process-local by design. After durable-state restoration is added, Task 5 must revalidate the persisted QA report bytes/hash and export receipt rather than attempting to serialize the in-memory proof marker.
+- No live model or ImageGen call was made; gateways use deterministic fakes in tests. The no-API-fallback invariant remains intact.

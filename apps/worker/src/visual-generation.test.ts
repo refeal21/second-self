@@ -9,6 +9,7 @@ import {
   type SlideSpec,
   type SourceAnalysis,
   type VisualGenerationGateway,
+  type VisualGenerationCapability,
   type VisualGenerationRequest,
   type WorkspaceArtifacts,
 } from './index.js';
@@ -17,6 +18,10 @@ class MemoryArtifacts implements WorkspaceArtifacts {
   readonly writes = new Map<string, string | Uint8Array>();
 
   async initializeProject(): Promise<void> {}
+
+  async projectDirectory(projectId: string): Promise<string> {
+    return `/workspace/${projectId}`;
+  }
 
   async write(
     projectId: string,
@@ -33,16 +38,28 @@ class DeferredVisualGateway implements VisualGenerationGateway {
   private resolveGeneration:
     | ((result: GeneratedVisualAsset) => void)
     | undefined;
+  private pending: GeneratedVisualAsset | undefined;
 
   generate(request: VisualGenerationRequest): Promise<GeneratedVisualAsset> {
     this.requests.push(request);
     return new Promise((resolve) => {
+      if (this.pending) {
+        const pending = this.pending;
+        this.pending = undefined;
+        resolve(pending);
+        return;
+      }
       this.resolveGeneration = resolve;
     });
   }
 
+  async capability(): Promise<VisualGenerationCapability> {
+    return { id: 'image_gen.imagegen', status: 'available' };
+  }
+
   resolve(result: GeneratedVisualAsset): void {
-    this.resolveGeneration?.(result);
+    if (this.resolveGeneration) this.resolveGeneration(result);
+    else this.pending = result;
   }
 }
 
@@ -74,8 +91,21 @@ async function projectAtVisualReview(artifacts: WorkspaceArtifacts) {
     name: 'Deck',
     createdAt: '2026-09-01T00:00:00.000Z',
   });
-  projects.beginSourceAnalysis('project-1');
-  await projects.recordSourceAnalysis('project-1', analysis);
+  await projects.attachSource('project-1', {
+    id: 'source-1',
+    fileName: 'report.pdf',
+    mediaType: 'application/pdf',
+    contents: new Uint8Array([1]),
+  });
+  const sourceAnalysis = new (
+    await import('./source-analysis.js')
+  ).SourceAnalysisService(projects, { analyze: async () => analysis });
+  await sourceAnalysis.request({
+    id: 'analysis-1',
+    projectId: 'project-1',
+    sourceIds: ['source-1'],
+  });
+  await sourceAnalysis.execute('analysis-1');
   await projects.submitOutline('project-1', {
     title: 'Deck',
     slides: [{ id: 'slide-1', title: spec.title, purpose: 'Explain growth.' }],
@@ -96,16 +126,29 @@ const generatedVisual = (byte = 7): GeneratedVisualAsset => ({
 });
 
 describe('slide visual generation and approval', () => {
+  it('does not expose a public arbitrary-image state mutation path', async () => {
+    const projects = await projectAtVisualReview(new MemoryArtifacts());
+    expect(
+      (projects as unknown as Record<string, unknown>)[
+        'recordGeneratedSlideVisual'
+      ],
+    ).toBeUndefined();
+    expect(
+      (projects as unknown as Record<string, unknown>)['replaceSlideVisual'],
+    ).toBeUndefined();
+  });
   it('generates exactly one page at a time from the approved structured spec', async () => {
     const artifacts = new MemoryArtifacts();
     const projects = await projectAtVisualReview(artifacts);
     const gateway = new DeferredVisualGateway();
     const visuals = new VisualGenerationService(projects, gateway);
+    const secondVisuals = new VisualGenerationService(projects, gateway);
 
     const first = visuals.generate('project-1', 'slide-1');
-    await expect(visuals.generate('project-1', 'slide-1')).rejects.toThrow(
-      'A slide visual is already being generated',
-    );
+    await expect(
+      secondVisuals.generate('project-1', 'slide-1'),
+    ).rejects.toThrow('already running');
+    await Promise.resolve();
     gateway.resolve(generatedVisual());
     const completed = await first;
 
@@ -120,6 +163,7 @@ describe('slide visual generation and approval', () => {
       specVersionId: 'project-1-slide-specs-v1',
       spec: { title: 'Approved title', body: ['Approved body'] },
       imageGenerationBrief: 'Text-free blue abstract growth bars.',
+      projectCwd: '/workspace/project-1',
     });
     expect(artifacts.writes.get('project-1/visuals/slide-1-v1.png')).toEqual(
       new Uint8Array([7]),
@@ -133,6 +177,7 @@ describe('slide visual generation and approval', () => {
     const visuals = new VisualGenerationService(projects, gateway);
 
     const first = visuals.generate('project-1', 'slide-1');
+    await Promise.resolve();
     gateway.resolve(generatedVisual(1));
     await first;
     const approved = projects.approveSlideVisual(
@@ -156,6 +201,7 @@ describe('slide visual generation and approval', () => {
     );
 
     const regenerated = visuals.generate('project-1', 'slide-1');
+    await Promise.resolve();
     gateway.resolve(generatedVisual(2));
     await expect(regenerated).resolves.toMatchObject({
       version: { sequence: 2 },
@@ -181,20 +227,21 @@ describe('slide visual generation and approval', () => {
   it('replacement creates another slide version instead of mutating the current visual', async () => {
     const artifacts = new MemoryArtifacts();
     const projects = await projectAtVisualReview(artifacts);
-    await projects.replaceSlideVisual(
-      'project-1',
-      'slide-1',
-      generatedVisual(1),
-    );
-    const replacement = await projects.replaceSlideVisual(
-      'project-1',
-      'slide-1',
-      {
-        ...generatedVisual(2),
-        usage: 'complex_visual',
-        textFree: true,
-      },
-    );
+    let byte = 0;
+    const visuals = new VisualGenerationService(projects, {
+      capability: async () => ({
+        id: 'image_gen.imagegen',
+        status: 'available',
+      }),
+      generate: async () => ({
+        ...generatedVisual(++byte),
+        ...(byte === 2
+          ? { usage: 'complex_visual' as const, textFree: true }
+          : {}),
+      }),
+    });
+    await visuals.generate('project-1', 'slide-1');
+    const replacement = await visuals.generate('project-1', 'slide-1');
 
     expect(replacement).toMatchObject({
       version: { sequence: 2 },
@@ -209,9 +256,11 @@ describe('slide visual generation and approval', () => {
 class FakeTurnRunner implements CodexImageGenTurnRunner {
   readonly requests: CodexImageGenTurnRequest[] = [];
 
-  constructor(private readonly capabilities: readonly string[]) {}
+  constructor(
+    private readonly capabilities: readonly VisualGenerationCapability[],
+  ) {}
 
-  async listCapabilities(): Promise<readonly string[]> {
+  async listCapabilities(): Promise<readonly VisualGenerationCapability[]> {
     return this.capabilities;
   }
 
@@ -226,6 +275,7 @@ class FakeTurnRunner implements CodexImageGenTurnRunner {
 describe('Codex ImageGen visual gateway', () => {
   const request: VisualGenerationRequest = {
     projectId: 'project-1',
+    projectCwd: '/workspace/project-1',
     slideId: 'slide-3',
     specVersionId: 'spec-v2',
     spec,
@@ -233,27 +283,26 @@ describe('Codex ImageGen visual gateway', () => {
   };
 
   it('returns an explicit blocked state when the ImageGen skill or tool is unavailable', async () => {
-    const runner = new FakeTurnRunner(['web', 'shell']);
-    const gateway = new CodexVisualGenerationGateway(
-      runner,
-      '/workspace/project-1',
-    );
+    const runner = new FakeTurnRunner([
+      { id: 'web', status: 'available' },
+      { id: 'shell', status: 'available' },
+    ]);
+    const gateway = new CodexVisualGenerationGateway(runner);
 
     await expect(gateway.generate(request)).resolves.toEqual({
       status: 'blocked',
       reason: 'capability_unavailable',
-      capability: 'imagegen',
+      capability: 'image_gen.imagegen',
       message: 'The Codex ImageGen skill/tool is unavailable.',
     });
     expect(runner.requests).toHaveLength(0);
   });
 
   it('builds a page-specific ImageGen turn with the approved spec as the only text authority', async () => {
-    const runner = new FakeTurnRunner(['image_gen']);
-    const gateway = new CodexVisualGenerationGateway(
-      runner,
-      '/workspace/project-1',
-    );
+    const runner = new FakeTurnRunner([
+      { id: 'image_gen.imagegen', status: 'available' },
+    ]);
+    const gateway = new CodexVisualGenerationGateway(runner);
 
     await gateway.generate(request);
 
@@ -271,6 +320,73 @@ describe('Codex ImageGen visual gateway', () => {
     );
     expect(runner.requests[0]?.prompt).toContain(
       'must never overwrite the structured slide spec',
+    );
+  });
+
+  it('does not accept fuzzy or disabled ImageGen capability names', async () => {
+    const runner = new FakeTurnRunner([
+      { id: 'imagegen-disabled', status: 'available' },
+      { id: 'image_gen.imagegen', status: 'disabled' },
+    ]);
+
+    await expect(
+      new CodexVisualGenerationGateway(runner).generate({
+        ...request,
+        projectCwd: '/workspace/project-1',
+      }),
+    ).resolves.toMatchObject({ status: 'blocked' });
+    expect(runner.requests).toHaveLength(0);
+  });
+});
+
+describe('recoverable ImageGen blocking', () => {
+  it('persists capability blocking and resumes visual review after exact capability restoration', async () => {
+    const projects = await projectAtVisualReview(new MemoryArtifacts());
+    let available = false;
+    const gateway: VisualGenerationGateway = {
+      capability: async () => ({
+        id: 'image_gen.imagegen',
+        status: available ? 'available' : 'unavailable',
+      }),
+      generate: async () => ({
+        status: 'blocked',
+        reason: 'capability_unavailable',
+        capability: 'image_gen.imagegen',
+        message: 'Unavailable',
+      }),
+    };
+    const service = new VisualGenerationService(projects, gateway);
+
+    await expect(
+      service.generate('project-1', 'slide-1'),
+    ).resolves.toMatchObject({
+      status: 'blocked',
+    });
+    expect(projects.getProjectSnapshot('project-1')).toMatchObject({
+      project: { workflowStatus: 'blocked' },
+      blockedCondition: {
+        recoverable: true,
+        resumeStage: 'visual_review',
+        capability: 'image_gen.imagegen',
+      },
+    });
+    await expect(service.resume('project-1')).rejects.toThrow(
+      'still unavailable',
+    );
+    available = true;
+    await service.resume('project-1');
+    const resumed = projects.getProjectSnapshot('project-1');
+    expect(resumed).toMatchObject({
+      project: { workflowStatus: 'visual_review' },
+      blockedCondition: null,
+    });
+    expect(resumed.approvals).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stage: 'detail_review',
+          status: 'approved',
+        }),
+      ]),
     );
   });
 });

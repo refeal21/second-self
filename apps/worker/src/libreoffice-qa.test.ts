@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
+import { PNG } from 'pngjs';
+import { createHash } from 'node:crypto';
 import {
   LibreOfficeQa,
+  PngPixelPageComparator,
   QaRepairOrchestrator,
   type CommandResult,
   type CommandRunner,
+  type CommandRunOptions,
   type LibreOfficeQaReport,
   type PptRepairer,
   type QaRunInput,
@@ -13,7 +17,11 @@ import {
 } from './index.js';
 
 class FakeCommandRunner implements CommandRunner {
-  readonly commands: Array<{ command: string; args: readonly string[] }> = [];
+  readonly commands: Array<{
+    command: string;
+    args: readonly string[];
+    options: CommandRunOptions;
+  }> = [];
 
   constructor(private readonly executable: readonly string[]) {}
 
@@ -21,8 +29,12 @@ class FakeCommandRunner implements CommandRunner {
     return this.executable.includes(command);
   }
 
-  async run(command: string, args: readonly string[]): Promise<CommandResult> {
-    this.commands.push({ command, args: [...args] });
+  async run(
+    command: string,
+    args: readonly string[],
+    options: CommandRunOptions,
+  ): Promise<CommandResult> {
+    this.commands.push({ command, args: [...args], options });
     return { exitCode: 0, stdout: '', stderr: '' };
   }
 }
@@ -33,8 +45,19 @@ class MemoryArtifactAccess implements WorkspaceArtifactAccess {
 
   async initializeProject(): Promise<void> {}
 
-  resolvePath(projectId: string, relativePath: string): string {
+  async resolvePath(projectId: string, relativePath: string): Promise<string> {
     return `/workspace/${projectId}/${relativePath}`;
+  }
+
+  async projectDirectory(projectId: string): Promise<string> {
+    return `/workspace/${projectId}`;
+  }
+
+  async ensureDirectory(
+    projectId: string,
+    relativePath: string,
+  ): Promise<string> {
+    return this.resolvePath(projectId, relativePath);
   }
 
   async write(
@@ -71,18 +94,55 @@ class DeterministicComparator implements RenderedPageComparator {
 }
 
 describe('LibreOffice presentation QA', () => {
+  const exportBytes = new Uint8Array([80, 75, 3, 4]);
+  const receipt = {
+    exportSha256: createHash('sha256').update(exportBytes).digest('hex'),
+    specVersionId: 'project-1-slide-specs-v1',
+    visualVersionIds: { 'slide-1': 'project-1-visual-slide-1-v1' },
+  } as const;
+
+  it('decodes PNG pixels and flags white/near-uniform pages while retaining visible pages', async () => {
+    const png = (pixels: readonly [number, number, number, number][]) => {
+      const image = new PNG({ width: 2, height: 2 });
+      pixels.forEach((pixel, index) => image.data.set(pixel, index * 4));
+      return PNG.sync.write(image);
+    };
+    const white: [number, number, number, number] = [255, 255, 255, 255];
+    const comparator = new PngPixelPageComparator();
+
+    const results = await comparator.compare([
+      { path: 'white.png', contents: png([white, white, white, white]) },
+      {
+        path: 'near.png',
+        contents: png([
+          [250, 250, 250, 255],
+          [252, 252, 252, 255],
+          [249, 249, 249, 255],
+          [251, 251, 251, 255],
+        ]),
+      },
+      {
+        path: 'visible.png',
+        contents: png([white, white, white, [10, 40, 180, 255]]),
+      },
+    ]);
+
+    expect(results.map(({ blank }) => blank)).toEqual([true, true, false]);
+  });
+
   it('detects bundled soffice, converts and renders headlessly, then writes JSON and text reports', async () => {
     const commands = new FakeCommandRunner([
       '/Applications/LibreOffice.app/Contents/MacOS/soffice',
       'pdftoppm',
     ]);
     const artifacts = new MemoryArtifactAccess();
+    artifacts.files.set('project-1/exports/deck.pptx', exportBytes);
     artifacts.files.set(
-      'project-1/qa/rendered-round-1-1.png',
+      'project-1/qa/run-1/rendered-1.png',
       new Uint8Array([1]),
     );
     artifacts.files.set(
-      'project-1/qa/rendered-round-1-2.png',
+      'project-1/qa/run-1/rendered-2.png',
       new Uint8Array([2]),
     );
     const qa = new LibreOfficeQa(
@@ -100,34 +160,32 @@ describe('LibreOffice presentation QA', () => {
 
     const report = await qa.run({
       projectId: 'project-1',
-      pptxPath: '/workspace/project-1/exports/deck.pptx',
+      pptxPath: 'exports/deck.pptx',
       expectedPageCount: 2,
       round: 1,
+      ...receipt,
     });
 
-    expect(commands.commands).toEqual([
-      {
-        command: '/Applications/LibreOffice.app/Contents/MacOS/soffice',
-        args: [
-          '--headless',
-          '--convert-to',
-          'pdf',
-          '--outdir',
-          '/workspace/project-1/qa',
-          '/workspace/project-1/exports/deck.pptx',
-        ],
+    expect(commands.commands[0]).toMatchObject({
+      command: '/Applications/LibreOffice.app/Contents/MacOS/soffice',
+      args: expect.arrayContaining([
+        '-env:UserInstallation=file:///workspace/project-1/qa/run-1/profile',
+        '--headless',
+        '/workspace/project-1/exports/deck.pptx',
+      ]),
+      options: {
+        timeoutMs: 30_000,
+        maxOutputBytes: 64_000,
+        env: { TMPDIR: '/workspace/project-1/qa/run-1/temp' },
       },
-      {
-        command: 'pdftoppm',
-        args: [
-          '-png',
-          '-r',
-          '144',
-          '/workspace/project-1/qa/deck.pdf',
-          '/workspace/project-1/qa/rendered-round-1',
-        ],
-      },
-    ]);
+    });
+    expect(commands.commands[1]).toMatchObject({
+      command: 'pdftoppm',
+      args: expect.arrayContaining([
+        '/workspace/project-1/qa/run-1/deck.pdf',
+        '/workspace/project-1/qa/run-1/rendered',
+      ]),
+    });
     expect(report).toMatchObject({
       status: 'failed',
       sofficePath: '/Applications/LibreOffice.app/Contents/MacOS/soffice',
@@ -146,6 +204,7 @@ describe('LibreOffice presentation QA', () => {
   it('returns a capability-unavailable report without attempting conversion when soffice is absent', async () => {
     const commands = new FakeCommandRunner(['pdftoppm']);
     const artifacts = new MemoryArtifactAccess();
+    artifacts.files.set('project-1/exports/deck.pptx', exportBytes);
     const qa = new LibreOfficeQa(
       commands,
       artifacts,
@@ -159,9 +218,10 @@ describe('LibreOffice presentation QA', () => {
 
     const report = await qa.run({
       projectId: 'project-1',
-      pptxPath: '/workspace/project-1/exports/deck.pptx',
+      pptxPath: 'exports/deck.pptx',
       expectedPageCount: 1,
       round: 1,
+      ...receipt,
     });
 
     expect(report).toMatchObject({
@@ -170,6 +230,63 @@ describe('LibreOffice presentation QA', () => {
     });
     expect(commands.commands).toHaveLength(0);
     expect(artifacts.writes.has('project-1/qa/qa-round-1.json')).toBe(true);
+  });
+
+  it('rejects initial PPTX paths outside project exports and persists the failure', async () => {
+    const commands = new FakeCommandRunner(['soffice', 'pdftoppm']);
+    const artifacts = new MemoryArtifactAccess();
+    const report = await new LibreOfficeQa(commands, artifacts).run({
+      projectId: 'project-1',
+      pptxPath: '/tmp/forged.pptx',
+      expectedPageCount: 1,
+      round: 1,
+      ...receipt,
+    });
+
+    expect(report).toMatchObject({ status: 'blocked' });
+    expect(report.issues.join(' ')).toContain('project exports');
+    expect(commands.commands).toHaveLength(0);
+    expect(artifacts.writes.has('project-1/qa/qa-round-1.json')).toBe(true);
+  });
+
+  it('turns command exceptions and timeouts into persisted failed reports', async () => {
+    const artifacts = new MemoryArtifactAccess();
+    artifacts.files.set('project-1/exports/deck.pptx', exportBytes);
+    const throwing: CommandRunner = {
+      canExecute: async () => true,
+      run: async () => {
+        throw new Error('spawn exploded');
+      },
+    };
+    const thrown = await new LibreOfficeQa(throwing, artifacts).run({
+      projectId: 'project-1',
+      pptxPath: 'exports/deck.pptx',
+      expectedPageCount: 1,
+      round: 1,
+      ...receipt,
+    });
+    expect(thrown).toMatchObject({ status: 'failed' });
+    expect(thrown.issues.join(' ')).toContain('spawn exploded');
+
+    const timedOut: CommandRunner = {
+      canExecute: async () => true,
+      run: async () => ({
+        exitCode: 124,
+        stdout: '',
+        stderr: 'timed out',
+        timedOut: true,
+      }),
+    };
+    artifacts.files.set('project-2/exports/deck.pptx', exportBytes);
+    const timeoutReport = await new LibreOfficeQa(timedOut, artifacts).run({
+      projectId: 'project-2',
+      pptxPath: 'exports/deck.pptx',
+      expectedPageCount: 1,
+      round: 1,
+      ...receipt,
+    });
+    expect(timeoutReport).toMatchObject({ status: 'failed' });
+    expect(timeoutReport.issues.join(' ')).toContain('timed out');
   });
 });
 
@@ -181,6 +298,11 @@ class AlwaysFailingQa implements QaRunner {
     return {
       status: 'failed',
       round: input.round,
+      projectId: input.projectId,
+      exportPath: input.pptxPath,
+      exportSha256: input.exportSha256,
+      specVersionId: input.specVersionId,
+      visualVersionIds: input.visualVersionIds,
       sofficePath: 'soffice',
       rendererPath: 'pdftoppm',
       pdfPath: `/qa/round-${input.round}.pdf`,
@@ -199,9 +321,12 @@ class AlwaysFailingQa implements QaRunner {
 class FakeRepairer implements PptRepairer {
   readonly rounds: number[] = [];
 
-  async repair(input: { round: number }): Promise<string> {
+  async repair(input: { round: number }) {
     this.rounds.push(input.round);
-    return `/workspace/project-1/exports/deck-repair-${input.round}.pptx`;
+    return {
+      pptxPath: `exports/deck-repair-${input.round}.pptx`,
+      exportSha256: `${input.round}`.repeat(64),
+    };
   }
 }
 
@@ -213,8 +338,11 @@ describe('QA repair orchestration', () => {
 
     const outcome = await orchestrator.run({
       projectId: 'project-1',
-      pptxPath: '/workspace/project-1/exports/deck.pptx',
+      pptxPath: 'exports/deck.pptx',
       expectedPageCount: 2,
+      exportSha256: 'a'.repeat(64),
+      specVersionId: 'project-1-slide-specs-v1',
+      visualVersionIds: { 'slide-1': 'project-1-visual-slide-1-v1' },
     });
 
     expect(outcome.status).toBe('failed');

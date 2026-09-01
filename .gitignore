@@ -1,0 +1,10 @@
+node_modules/
+dist/
+target/
+.DS_Store
+.vite/
+coverage/
+*.log
+.superpowers/
+artifacts/qa/
+

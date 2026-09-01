@@ -1,0 +1,14 @@
+{
+  "name": "@digital-twin/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "lint": "eslint src --max-warnings=0",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "digital-twin-workbench",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "dev": "pnpm --filter @digital-twin/desktop tauri dev",
+    "dev:web": "pnpm --parallel --filter @digital-twin/desktop --filter @digital-twin/worker dev",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "test": "pnpm run test:core && pnpm run test:rust",
+    "test:core": "pnpm --filter @digital-twin/core test",
+    "test:rust": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.36.0",
+    "eslint": "^9.36.0",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.44.1",
+    "vitest": "^3.2.4"
+  }
+}

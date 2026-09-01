@@ -4,6 +4,8 @@
 
 Task 3 now has one evidence-bearing workflow from attached project sources through validated analysis, frozen outline/specs, individually approved visual artifact versions, editable PPTX export, authentic LibreOffice QA, and the final `completed`/`blocked` transition. Public arbitrary image/export/status mutation methods were removed. No API-key or model fallback path was added.
 
+Fix implementation commit: `d9d887dbce850ac8574b5b2c03f56a496638672c` (`fix: harden PPT evidence chain`).
+
 ## Fix-round implementation
 
 ### Artifact boundary

@@ -7,8 +7,9 @@
     "dev:web": "pnpm --parallel --filter @digital-twin/desktop --filter @digital-twin/worker dev",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
-    "test": "pnpm run test:core && pnpm run test:desktop && pnpm run test:rust",
+    "test": "pnpm run test:core && pnpm run test:worker && pnpm run test:desktop && pnpm run test:rust",
     "test:core": "pnpm --filter @digital-twin/core test",
+    "test:worker": "pnpm --filter @digital-twin/worker test",
     "test:desktop": "pnpm --filter @digital-twin/desktop test",
     "test:rust": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml"
   },

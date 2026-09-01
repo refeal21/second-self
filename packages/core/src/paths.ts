@@ -6,7 +6,9 @@ export function defaultWorkspace(homeDirectory: string): string {
 
 export function resolveWorkspaceWritePath(workspaceRoot: string, candidatePath: string): string {
   const workspace = resolve(workspaceRoot);
-  const candidate = resolve(candidatePath);
+  const candidate = isAbsolute(candidatePath)
+    ? resolve(candidatePath)
+    : resolve(workspace, candidatePath);
   const relation = relative(workspace, candidate);
 
   if (relation.startsWith('..') || isAbsolute(relation)) {

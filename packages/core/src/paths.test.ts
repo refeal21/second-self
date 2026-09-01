@@ -8,4 +8,9 @@ describe('workspace write paths', () => {
     expect(() => resolveWorkspaceWritePath('/workspace', '/workspace/../secrets.txt'))
       .toThrow('outside the workspace');
   });
+
+  it('resolves relative artifact paths from the workspace root', () => {
+    expect(resolveWorkspaceWritePath('/workspace', 'projects/a/slide.png'))
+      .toBe('/workspace/projects/a/slide.png');
+  });
 });

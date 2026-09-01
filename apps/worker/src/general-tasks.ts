@@ -243,7 +243,7 @@ export class GeneralTaskManager {
   }
 
   private recordError(task: GeneralTask, params: Record<string, unknown>): void {
-    if (typeof params.turnId === 'string' && params.turnId !== task.turnId) return;
+    if (typeof params.turnId !== 'string' || params.turnId !== task.turnId) return;
     if (params.willRetry === true) return;
     const error = asRecord(params.error);
     task.status = 'failed';

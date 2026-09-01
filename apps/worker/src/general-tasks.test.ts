@@ -349,6 +349,52 @@ describe('general task transcript and lifecycle', () => {
     });
   });
 
+  it.each([
+    ['absent', {}],
+    ['null', { turnId: null }],
+    ['number', { turnId: 7 }],
+  ] as const)('ignores a terminal App Server error with an %s turn id', async (_label, turnId) => {
+    const { transport, manager } = await runningTask();
+    emitApproval(transport, 'approval-current');
+
+    transport.emit({
+      method: 'error',
+      params: {
+        threadId: 'thread-1',
+        ...turnId,
+        willRetry: false,
+        error: { message: 'Malformed notification', codexErrorInfo: null, additionalDetails: null, misalignment: null },
+      },
+    });
+
+    expect(manager.getTask('task-1')).toMatchObject({
+      status: 'waiting_for_approval',
+      error: null,
+      pendingInteraction: { requestId: 'approval-current' },
+    });
+  });
+
+  it('ignores a terminal App Server error for a stale turn', async () => {
+    const { transport, manager } = await runningTask();
+    emitApproval(transport, 'approval-current');
+
+    transport.emit({
+      method: 'error',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-old',
+        willRetry: false,
+        error: { message: 'Stale turn failed', codexErrorInfo: null, additionalDetails: null, misalignment: null },
+      },
+    });
+
+    expect(manager.getTask('task-1')).toMatchObject({
+      status: 'waiting_for_approval',
+      error: null,
+      pendingInteraction: { requestId: 'approval-current' },
+    });
+  });
+
   it('recovers from a process crash by reconnecting and resuming the durable thread', async () => {
     const { transport, manager } = await runningTask();
     transport.emit({

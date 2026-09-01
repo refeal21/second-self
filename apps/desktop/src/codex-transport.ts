@@ -25,6 +25,10 @@ interface CodexExitEvent extends CodexExit {
   generation: number;
 }
 
+type CodexProcessEvent =
+  | { type: 'line'; payload: CodexLineEvent }
+  | { type: 'exit'; payload: CodexExitEvent };
+
 const defaultBridge: TauriBridge = {
   invoke,
   listen: (event, handler) => listen(event, handler),
@@ -36,6 +40,8 @@ export class TauriCodexTransport {
   private binding: Promise<void> | null = null;
   private unlisteners: Array<() => void> = [];
   private activeGeneration: number | null = null;
+  private startAttempt = 0;
+  private pendingStartEvents: CodexProcessEvent[] | null = null;
 
   constructor(
     private readonly configuredPath: string | null,
@@ -43,12 +49,31 @@ export class TauriCodexTransport {
   ) {}
 
   async start(): Promise<void> {
+    const attempt = ++this.startAttempt;
     await this.bindEvents();
+    if (attempt !== this.startAttempt) return;
     this.activeGeneration = null;
-    const started = await this.bridge.invoke<CodexProcessStarted>('start_codex_app_server', {
-      configuredPath: this.configuredPath,
-    });
+    this.pendingStartEvents = [];
+    let started: CodexProcessStarted;
+    try {
+      started = await this.bridge.invoke<CodexProcessStarted>('start_codex_app_server', {
+        configuredPath: this.configuredPath,
+      });
+    } catch (error) {
+      if (attempt === this.startAttempt) this.pendingStartEvents = null;
+      throw error;
+    }
+    if (attempt !== this.startAttempt) {
+      await this.bridge.invoke<void>('stop_codex_app_server', { generation: started.generation });
+      return;
+    }
+
+    const bufferedEvents = this.pendingStartEvents ?? [];
+    this.pendingStartEvents = null;
     this.activeGeneration = started.generation;
+    for (const event of bufferedEvents) {
+      if (event.payload.generation === started.generation) this.dispatch(event);
+    }
   }
 
   async send(line: string): Promise<void> {
@@ -60,8 +85,10 @@ export class TauriCodexTransport {
   }
 
   async stop(): Promise<void> {
+    this.startAttempt += 1;
     const generation = this.activeGeneration;
     this.activeGeneration = null;
+    this.pendingStartEvents = null;
     try {
       if (generation !== null) {
         await this.bridge.invoke<void>('stop_codex_app_server', { generation });
@@ -91,19 +118,33 @@ export class TauriCodexTransport {
     if (!this.binding) {
       this.binding = Promise.all([
         this.bridge.listen<CodexLineEvent>('codex-app-server://stdout', ({ payload }) => {
-          if (payload.generation !== this.activeGeneration) return;
-          for (const listener of this.lineListeners) listener(payload.line);
+          this.receive({ type: 'line', payload });
         }),
         this.bridge.listen<CodexExitEvent>('codex-app-server://exit', ({ payload }) => {
-          if (payload.generation !== this.activeGeneration) return;
-          const { code, signal } = payload;
-          for (const listener of this.exitListeners) listener({ code, signal });
+          this.receive({ type: 'exit', payload });
         }),
       ]).then((unlisteners) => {
         this.unlisteners = unlisteners;
       });
     }
     return this.binding;
+  }
+
+  private receive(event: CodexProcessEvent): void {
+    if (event.payload.generation === this.activeGeneration) {
+      this.dispatch(event);
+    } else if (this.pendingStartEvents !== null) {
+      this.pendingStartEvents.push(event);
+    }
+  }
+
+  private dispatch(event: CodexProcessEvent): void {
+    if (event.type === 'line') {
+      for (const listener of this.lineListeners) listener(event.payload.line);
+      return;
+    }
+    const { code, signal } = event.payload;
+    for (const listener of this.exitListeners) listener({ code, signal });
   }
 
   private async unbindEvents(): Promise<void> {

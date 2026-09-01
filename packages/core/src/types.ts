@@ -37,6 +37,7 @@ export interface Approval {
   projectId: string;
   versionId: string;
   stage: PptWorkflowStage;
+  slideId?: string;
   status: ApprovalStatus;
   decidedAt: string | null;
 }

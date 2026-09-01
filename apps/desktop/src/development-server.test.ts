@@ -12,4 +12,10 @@ describe('development server boundary', () => {
 
     expect(tauriConfig.build.frontendDist).toBe('../dist');
   });
+
+  it('uses the same loopback address for Tauri development', () => {
+    const tauriConfig = JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+
+    expect(tauriConfig.build.devUrl).toBe('http://127.0.0.1:1420');
+  });
 });

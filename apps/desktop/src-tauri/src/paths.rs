@@ -1,6 +1,6 @@
 use std::{
-    ffi::OsString,
     fs,
+    io::ErrorKind,
     path::{Component, Path, PathBuf},
 };
 
@@ -16,59 +16,49 @@ pub fn resolve_workspace_write_path(
 ) -> Result<PathBuf, String> {
     let workspace = fs::canonicalize(workspace_root)
         .map_err(|_| "Workspace root does not exist".to_string())?;
-    let target = if candidate.is_absolute() {
-        normalize(candidate)
+    let mut current = if candidate.is_absolute() {
+        PathBuf::new()
     } else {
-        normalize(&workspace.join(candidate))
+        workspace.clone()
     };
+    let mut entered_workspace = !candidate.is_absolute();
 
-    let (existing_ancestor, missing_path) = nearest_existing_ancestor(&target)?;
-    let resolved_ancestor = fs::canonicalize(existing_ancestor)
-        .map_err(|_| "Write path cannot be resolved".to_string())?;
-
-    if !resolved_ancestor.starts_with(&workspace) {
-        return Err("Write path is outside the workspace".to_string());
-    }
-
-    let resolved_target = missing_path
-        .iter()
-        .rev()
-        .fold(resolved_ancestor, |path, component| path.join(component));
-
-    if resolved_target.starts_with(&workspace) {
-        Ok(resolved_target)
-    } else {
-        Err("Write path is outside the workspace".to_string())
-    }
-}
-
-fn nearest_existing_ancestor(path: &Path) -> Result<(&Path, Vec<OsString>), String> {
-    let mut current = path;
-    let mut missing_path = Vec::new();
-
-    while !current.exists() {
-        let name = current
-            .file_name()
-            .ok_or_else(|| "Write path cannot be resolved".to_string())?;
-        missing_path.push(name.to_os_string());
-        current = current
-            .parent()
-            .ok_or_else(|| "Write path cannot be resolved".to_string())?;
-    }
-
-    Ok((current, missing_path))
-}
-
-fn normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
+    for component in candidate.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                current.pop();
             }
-            _ => normalized.push(component.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::Normal(name) => {
+                current.push(name);
+                current = resolve_existing_symlink(current)?;
+            }
+        }
+
+        if current.starts_with(&workspace) {
+            entered_workspace = true;
+        }
+
+        if entered_workspace && !current.starts_with(&workspace) {
+            return Err("Write path is outside the workspace".to_string());
         }
     }
-    normalized
+
+    current
+        .starts_with(&workspace)
+        .then_some(current)
+        .ok_or_else(|| "Write path is outside the workspace".to_string())
+}
+
+fn resolve_existing_symlink(path: PathBuf) -> Result<PathBuf, String> {
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::canonicalize(&path).map_err(|_| "Write path cannot be resolved".to_string())
+        }
+        Ok(_) => Ok(path),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(path),
+        Err(_) => Err("Write path cannot be resolved".to_string()),
+    }
 }

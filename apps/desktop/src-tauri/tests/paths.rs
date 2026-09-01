@@ -67,3 +67,43 @@ fn rejects_a_symlink_inside_workspace_that_targets_outside() {
     );
     fs::remove_dir_all(root).expect("temporary directory removed");
 }
+
+#[cfg(unix)]
+#[test]
+fn rejects_parent_traversal_after_an_external_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = temporary_directory("symlink-parent");
+    let workspace = root.join("workspace");
+    let outside = root.join("outside");
+    fs::create_dir_all(&workspace).expect("workspace created");
+    fs::create_dir_all(&outside).expect("outside directory created");
+    symlink(&outside, workspace.join("escaped")).expect("symlink created");
+
+    let result =
+        resolve_workspace_write_path(&workspace, std::path::Path::new("escaped/../secret.txt"));
+
+    assert_eq!(
+        result.expect_err("symlink parent escape rejected"),
+        "Write path is outside the workspace"
+    );
+    fs::remove_dir_all(root).expect("temporary directory removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_broken_symlink_write_target() {
+    use std::os::unix::fs::symlink;
+
+    let root = temporary_directory("broken-symlink");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace created");
+    symlink(root.join("outside-missing"), workspace.join("broken"))
+        .expect("broken symlink created");
+
+    let result =
+        resolve_workspace_write_path(&workspace, std::path::Path::new("broken/stolen.txt"));
+
+    assert!(result.is_err(), "broken symlink write target rejected");
+    fs::remove_dir_all(root).expect("temporary directory removed");
+}

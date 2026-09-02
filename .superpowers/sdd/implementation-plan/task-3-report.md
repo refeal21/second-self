@@ -1,4 +1,4 @@
-# Task 3 report — image-first PPT workflow and fix rounds 1–4
+# Task 3 report — image-first PPT workflow and fix rounds 1–5
 
 ## Outcome
 
@@ -189,3 +189,17 @@ Fix commits:
 - Worker gate: `pnpm --filter @digital-twin/worker test` → exit 0; 14 files, 139 tests passed.
 - Fresh repository gate: `pnpm typecheck`, `pnpm lint`, `pnpm test`, `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check`, `npx --yes prettier@3.6.2 --single-quote --check apps/worker/src/delivery-coordinator.ts apps/worker/src/delivery-coordinator.test.ts`, and `git diff --check` all exited 0.
 - Real local LibreOffice smoke used the bundled runtime `soffice` and `pdftoppm`, `LocalWorkspaceArtifacts`, `LocalCommandRunner`, `PngPixelPageComparator`, and actual PptxGenJS bytes: normal one-page deck passed with no blanks; empty one-page deck failed with `blankPages: [1]`; a durable-QA interruption recovered by replaying the saved bundle to passed with exactly one real QA execution.
+
+## Fix-round 5 implementation
+
+- Replay now resolves the authoritative `qa/run-N` directory through the workspace-artifact boundary before reissuing the factory-local QA proof. It derives the one expected PDF from the bound export filename and the exact ordered rendered-page paths `rendered-1.png` through `rendered-N.png` from the persisted actual count.
+- Persisted passed reports require those exact absolute PDF, rendered-page, and comparison paths in order. Empty, relative, different-run, duplicated, skipped, or reordered page paths therefore cannot be signed or advance the workflow.
+- Failed and blocked reports retain their valid early-failure form with zero rendered output, but any non-null executable path must be non-empty; a non-null PDF must be the exact QA-run output; and any rendered/comparison paths use the same exact sequence. Rejected reports do not execute QA, invoke the local reissuer, or change the retryable checkpoint.
+
+## Fix-round 5 TDD and verification
+
+- RED: `pnpm --filter @digital-twin/worker exec vitest run src/delivery-coordinator.test.ts` initially failed 5/24 new path-boundary counterexamples: passed empty/outside-run paths were accepted; failed empty executable and outside-run rendered paths advanced to repair; and a blocked empty PDF path completed. The additional GREEN set covers relative, skipped-page, and outside-run PDF forms.
+- GREEN focused suite: the same command → exit 0; 27/27 passed. Every rejected bundle proves zero QA commands and zero replay-signing calls, with the checkpoint remaining at `qa`/`nextAction: qa`.
+- Worker gate: `pnpm --filter @digital-twin/worker test` → exit 0; 14 files, 147 tests passed.
+- Fresh repository gate: `pnpm typecheck`, `pnpm lint`, `pnpm test`, `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check`, `npx --yes prettier@3.6.2 --single-quote --check apps/worker/src/delivery-coordinator.ts apps/worker/src/delivery-coordinator.test.ts`, and `git diff --check` all exited 0.
+- Real local LibreOffice smoke again used bundled `soffice`/`pdftoppm`, `LocalWorkspaceArtifacts`, `LocalCommandRunner`, `PngPixelPageComparator`, and real PptxGenJS files: normal one-page passed; empty one-page failed with `blankPages: [1]`; a simulated post-persistence interruption replayed the exact run-one report to passed with only one actual QA execution.

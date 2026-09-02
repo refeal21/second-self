@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { basename, isAbsolute } from 'node:path';
+import { basename, extname, isAbsolute, join } from 'node:path';
 import type {
   PptRepairer,
   QaRunner,
@@ -216,7 +216,16 @@ export class PptDeliveryCoordinator {
       input.projectId,
       relativePath,
     );
-    const report = validateQaBundle(bundle, input, expectedPath);
+    const qaRunDirectory = await this.#artifacts.resolvePath(
+      input.projectId,
+      `qa/run-${input.round}`,
+    );
+    const report = validateQaBundle(
+      bundle,
+      input,
+      expectedPath,
+      qaRunDirectory,
+    );
     const reissue = this.#qa.reissueValidatedReport;
     if (!reissue) {
       throw new Error(
@@ -314,6 +323,7 @@ function validateQaBundle(
     visualVersionIds: Readonly<Record<string, string>>;
   },
   expectedPath: string,
+  qaRunDirectory: string,
 ): LibreOfficeQaReport {
   if (!isRecord(bundle) || typeof bundle.readableSummary !== 'string') {
     throw new Error('Existing QA bundle does not match the runtime schema');
@@ -343,7 +353,7 @@ function validateQaBundle(
     throw new Error('Existing QA bundle does not match the runtime schema');
   }
   const report = candidate as unknown as LibreOfficeQaReport;
-  if (!hasCoherentQaSemantics(report)) {
+  if (!hasCoherentQaSemantics(report, qaRunDirectory)) {
     throw new Error('Existing QA bundle violates semantic invariants');
   }
   if (readableSummary !== formatQaReadableSummary(report)) {
@@ -354,9 +364,18 @@ function validateQaBundle(
   return report;
 }
 
-function hasCoherentQaSemantics(report: LibreOfficeQaReport): boolean {
-  const renderedPaths = new Set(report.renderedPages);
-  const comparisonPaths = new Set(report.comparisons.map(({ path }) => path));
+function hasCoherentQaSemantics(
+  report: LibreOfficeQaReport,
+  qaRunDirectory: string,
+): boolean {
+  const expectedPdfPath = join(
+    qaRunDirectory,
+    `${basename(report.exportPath, extname(report.exportPath))}.pdf`,
+  );
+  const expectedRenderedPaths = Array.from(
+    { length: report.actualPageCount },
+    (_unused, index) => join(qaRunDirectory, `rendered-${index + 1}.png`),
+  );
   const derivedBlankPages = report.comparisons.flatMap((comparison, index) =>
     comparison.blank ? [index + 1] : [],
   );
@@ -366,13 +385,20 @@ function hasCoherentQaSemantics(report: LibreOfficeQaReport): boolean {
   const arraysAreCoherent =
     report.actualPageCount === report.renderedPages.length &&
     report.comparisons.length === report.renderedPages.length &&
-    renderedPaths.size === report.renderedPages.length &&
-    comparisonPaths.size === report.comparisons.length &&
-    [...comparisonPaths].every((path) => renderedPaths.has(path)) &&
+    report.renderedPages.every(
+      (path, index) => path === expectedRenderedPaths[index],
+    ) &&
+    report.comparisons.every(
+      (comparison, index) => comparison.path === expectedRenderedPaths[index],
+    ) &&
     report.blankPages.length === new Set(report.blankPages).size &&
     report.blankPages.every((page) => page <= report.actualPageCount) &&
     JSON.stringify(report.blankPages) === JSON.stringify(derivedBlankPages);
-  if (!arraysAreCoherent) return false;
+  const executionPathsAreCoherent =
+    isNullableNonEmptyString(report.sofficePath) &&
+    isNullableNonEmptyString(report.rendererPath) &&
+    (report.pdfPath === null || report.pdfPath === expectedPdfPath);
+  if (!arraysAreCoherent || !executionPathsAreCoherent) return false;
   if (report.status !== 'passed') return issuesAreCoherent;
   return (
     report.actualPageCount === report.expectedPageCount &&
@@ -389,6 +415,10 @@ function hasCoherentQaSemantics(report: LibreOfficeQaReport): boolean {
 
 function isNonEmptyString(value: string | null): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isNullableNonEmptyString(value: string | null): boolean {
+  return value === null || isNonEmptyString(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

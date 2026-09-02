@@ -620,6 +620,121 @@ describe('project delivery evidence coordinator', () => {
     },
   );
 
+  it.each([
+    [
+      'a passed report with empty rendered and comparison paths',
+      qaBundle({
+        renderedPages: [''],
+        comparisons: [{ path: '', blank: false }],
+      }),
+    ],
+    [
+      'a passed report with rendered and comparison paths outside its QA run',
+      qaBundle({
+        renderedPages: ['/workspace/project-1/qa/run-2/rendered-1.png'],
+        comparisons: [
+          {
+            path: '/workspace/project-1/qa/run-2/rendered-1.png',
+            blank: false,
+          },
+        ],
+      }),
+    ],
+    [
+      'a passed report with relative rendered and comparison paths',
+      qaBundle({
+        renderedPages: ['rendered-1.png'],
+        comparisons: [{ path: 'rendered-1.png', blank: false }],
+      }),
+    ],
+    [
+      'a passed report with a skipped rendered page number',
+      qaBundle({
+        renderedPages: ['/workspace/project-1/qa/run-1/rendered-2.png'],
+        comparisons: [
+          {
+            path: '/workspace/project-1/qa/run-1/rendered-2.png',
+            blank: false,
+          },
+        ],
+      }),
+    ],
+    [
+      'a passed report with a PDF path outside its QA run',
+      qaBundle({ pdfPath: '/workspace/project-1/qa/run-2/deck.pdf' }),
+    ],
+    [
+      'a failed report with an empty executable path',
+      qaBundle({
+        status: 'failed',
+        sofficePath: '',
+        issues: ['LibreOffice conversion timed out'],
+      }),
+    ],
+    [
+      'a blocked report with an empty output path',
+      qaBundle({
+        status: 'blocked',
+        pdfPath: '',
+        issues: ['LibreOffice soffice executable is unavailable'],
+      }),
+    ],
+    [
+      'a failed report with a rendered path outside its QA run',
+      qaBundle({
+        status: 'failed',
+        renderedPages: ['/workspace/project-1/qa/run-2/rendered-1.png'],
+        comparisons: [
+          {
+            path: '/workspace/project-1/qa/run-2/rendered-1.png',
+            blank: false,
+          },
+        ],
+        issues: ['Blank rendered pages: 1'],
+      }),
+    ],
+  ])(
+    'rejects %s before replay signing or workflow advancement',
+    async (_label, bundle) => {
+      const artifacts = new MemoryArtifacts();
+      artifacts.files.set(
+        'project-1/qa/qa-round-1.json',
+        new TextEncoder().encode(JSON.stringify(bundle, null, 2)),
+      );
+      const projects = await conversionProject(artifacts);
+      const commands = new RoundQaCommands(artifacts);
+      const qa = new LibreOfficeQa(
+        commands,
+        artifacts,
+        new RoundComparator([]),
+        { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'] },
+      );
+      let reissueCalls = 0;
+      const signingQa: QaRunner = {
+        run: qa.run,
+        reissueValidatedReport: (report) => {
+          reissueCalls += 1;
+          return qa.reissueValidatedReport(report);
+        },
+      };
+
+      await expect(
+        deliveryCoordinator(
+          projects,
+          artifacts,
+          new CapturingExporter(),
+          signingQa,
+        ).deliver('project-1', 'deck.pptx'),
+      ).rejects.toThrow('semantic invariants');
+      expect(commands.calls).toEqual([]);
+      expect(reissueCalls).toBe(0);
+      expect(projects.getProjectSnapshot('project-1')).toMatchObject({
+        project: { workflowStatus: 'qa' },
+        qaCheckpoint: { nextAction: 'qa', reports: [] },
+      });
+    },
+  );
+
   it('rejects a persisted QA bundle when its current export receipt changed before replay', async () => {
     const artifacts = new MemoryArtifacts();
     const projects = await conversionProject(artifacts);

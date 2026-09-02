@@ -1,10 +1,10 @@
-# Task 4 report — production desktop UI, fix rounds 1–2
+# Task 4 report — production desktop UI, fix rounds 1–3
 
 ## Outcome
 
 Task 4 now provides the six required React/Tauri views plus a complete PPT review workspace without allowing browser demo state to masquerade as native state. Browser builds use a visibly labelled deterministic demo adapter. Tauri builds start with unavailable account/runtime and empty project/approval/memory collections until a native capability returns data or an explicit error.
 
-The rejected-review blockers were addressed in two coherent adapter/store passes:
+The rejected-review blockers were addressed in three coherent adapter/store passes:
 
 - Native general tasks reuse the existing worker `CodexAppServerClient` and `GeneralTaskManager`. The UI receives App Server assistant deltas, completion, terminal error, token usage, approval, and user-input updates through a task subscription.
 - Approval and input responses use the actual App Server JSON-RPC request ID. UI `approve` maps to protocol `accept`, UI `decline` maps to `decline`, and no code path sends request ID `0`.
@@ -18,6 +18,7 @@ The rejected-review blockers were addressed in two coherent adapter/store passes
 - The HTML document declares `lang="zh-CN"` and the Chinese title `分身工作台`.
 - App Server user-input requests render every question header, prompt, option, and description, then submit one answer map covering every question. Empty native projects, approvals, and memories carry explicit unavailable/loading/loaded metadata, so they are never presented as successfully loaded empty results.
 - Workspace and Codex paths live in the top-level reducer state, survive route navigation, and are sent to the adapter only on an explicit save.
+- A loaded but empty memory collection renders `当前没有偏好记忆。`; unavailable and loading collections retain their distinct status messages.
 
 ## TDD evidence
 
@@ -29,8 +30,9 @@ The rejected-review blockers were addressed in two coherent adapter/store passes
 | Fix round 2 workflow invariants | focused suite rejected reopening a pending future page and direct approval with incomplete predecessors | reducer now rejects both mutations, never auto-approves prior pages, and preserves an intentionally non-approved predecessor |
 | Fix round 2 input/collections/settings | focused UI suite failed because only one App Server question was handled, native empty collections looked successful, and settings remounted from local defaults | all questions are rendered/submitted together; collection availability is explicit; settings survive save → away → back |
 | Fix round 2 responsive boundary | CSS contract failed because 956px still entered the three-column shell | compact mode includes 956px; 957px starts an exact-fit three-column shell |
+| Fix round 3 memory empty state | focused rendered test found a blank section for a loaded collection with zero memories | loaded-empty now renders an explicit success-empty message without changing unavailable/loading copy |
 
-Fix round 2 RED: 7 failures across the workflow reducer, rendered UI, and responsive CSS contract. Focused GREEN: 27/27. Final desktop suite: 42/42 across transport, native adapter, reducer, development server, responsive CSS, and rendered UI tests.
+Fix round 2 RED: 7 failures across the workflow reducer, rendered UI, and responsive CSS contract. Focused GREEN: 27/27. Fix round 3 RED: the focused loaded-empty memory test failed against a blank section; focused GREEN: 1/1. Final desktop suite: 43/43 across transport, native adapter, reducer, development server, responsive CSS, and rendered UI tests.
 
 ## Browser QA
 
@@ -49,9 +51,9 @@ Flow: `#/workspace` → inspect responsive shell → switch to the review tab �
 
 ## Fresh verification
 
-- Desktop: `pnpm --filter @digital-twin/desktop test` → 42/42; `lint` → zero warnings; `typecheck` and Vite production build → exit 0.
+- Desktop: `pnpm --filter @digital-twin/desktop test` → 43/43; `lint` → zero warnings; `typecheck` and Vite production build → exit 0.
 - Repository: `pnpm typecheck` and `pnpm lint` → exit 0 for core, worker, and desktop.
-- Repository tests: core 8/8, worker 147/147, desktop 42/42, Rust integration 13/13 plus unit/doc suites.
+- Repository tests (fix round 2): core 8/8, worker 147/147, desktop 42/42, Rust integration 13/13 plus unit/doc suites. Fix round 3 is scoped to desktop and re-verifies that package at 43/43.
 - `git diff --check` → exit 0.
 
 ## Boundary

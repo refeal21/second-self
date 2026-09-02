@@ -1565,6 +1565,10 @@ function MemoryPage({
         <div className="empty-inline" role="status">
           {collectionMessage(availability, '', '偏好记忆数据')}
         </div>
+      ) : memory.length === 0 ? (
+        <div className="empty-inline" role="status">
+          当前没有偏好记忆。
+        </div>
       ) : (
       <section className="memory-list">
         {memory.map((item) => (

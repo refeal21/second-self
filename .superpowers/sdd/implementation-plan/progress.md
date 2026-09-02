@@ -126,3 +126,9 @@ Task 4: Ruling: workspace/Codex settings belong to the app-level store and survi
 Task 4: Ruling: compact panel mode includes 956px and the full shell starts at 957px with exact-fit `169 + 400 + 310` columns — browser measurements require both document and workspace scroll widths to equal client widths at the boundary.
 
 Task 4: fix round 2 implementation complete pending review (RED 7 failures → focused GREEN 27/27; desktop 42/42 plus lint/typecheck/build green; Browser QA 956 compact and 957 exact-fit three-column with no horizontal overflow; pending page 5 reopen disabled; repository typecheck/lint green; core 8/8, worker 147/147, desktop 42/42, Rust integration 13/13 plus unit/doc suites; `git diff --check` green).
+
+Task 4: fix round 3 review found one scoped loaded-empty rendering defect: `MemoryPage` distinguished unavailable/loading from loaded, but the loaded collection with zero entries rendered a blank section.
+
+Task 4: Ruling: collection availability and collection cardinality are independent UI states — `loaded + []` renders the explicit successful empty state `当前没有偏好记忆。`, while unavailable/loading retain their honest status messages.
+
+Task 4: fix round 3 implementation complete pending review (focused RED 1 failure → GREEN 1/1; desktop 43/43; desktop lint/typecheck/build and `git diff --check` green).

@@ -398,6 +398,23 @@ describe('desktop workbench interactions', () => {
     expect(screen.getByText('偏好记忆数据不可用')).toBeInTheDocument();
   });
 
+  it('shows an explicit empty state when the loaded memory collection is empty', () => {
+    const demo = createDemoDesktopAdapter();
+    const adapter = {
+      ...demo,
+      initialState: {
+        ...demo.initialState,
+        memories: [],
+        collections: { ...demo.initialState.collections, memories: 'loaded' },
+      },
+    } as DesktopAdapter;
+
+    render(<App adapter={adapter} initialRoute="memory" />);
+
+    expect(screen.getByText('当前没有偏好记忆。')).toBeInTheDocument();
+    expect(screen.queryByText('偏好记忆数据不可用')).not.toBeInTheDocument();
+  });
+
   it('persists settings across route navigation after saving', async () => {
     const user = userEvent.setup();
     const adapter = createDemoDesktopAdapter();

@@ -67,6 +67,10 @@ export class LocalCommandRunner implements CommandRunner {
       let timedOut = false;
       let killTimer: NodeJS.Timeout | undefined;
       let settleTimer: NodeJS.Timeout | undefined;
+      let timeoutKillIssued = false;
+      let pendingTimeoutResult:
+        | Pick<CommandResult, 'exitCode' | 'timedOut'>
+        | undefined;
       const appendBounded = (
         current: Buffer<ArrayBufferLike>,
         chunk: Buffer<ArrayBufferLike>,
@@ -90,17 +94,26 @@ export class LocalCommandRunner implements CommandRunner {
       });
       const terminate = (signal: NodeJS.Signals): void => {
         try {
-          if (useProcessGroup && child.pid) process.kill(-child.pid, signal);
-          else child.kill(signal);
-        } catch {
+          if (useProcessGroup && child.pid) {
+            process.kill(-child.pid, signal);
+            return;
+          }
           child.kill(signal);
+        } catch {
+          try {
+            child.kill(signal);
+          } catch {
+            // The root child may already have closed while its process group remains.
+          }
         }
       };
       const timeout = setTimeout(() => {
         timedOut = true;
         terminate('SIGTERM');
         killTimer = setTimeout(() => {
-          if (!settled) terminate('SIGKILL');
+          timeoutKillIssued = true;
+          terminate('SIGKILL');
+          if (pendingTimeoutResult) finish(pendingTimeoutResult);
         }, 200);
         killTimer.unref();
         settleTimer = setTimeout(() => {
@@ -116,6 +129,10 @@ export class LocalCommandRunner implements CommandRunner {
         result: Pick<CommandResult, 'exitCode' | 'timedOut'>,
       ): void => {
         if (settled) return;
+        if (timedOut && useProcessGroup && !timeoutKillIssued) {
+          pendingTimeoutResult = result;
+          return;
+        }
         settled = true;
         clearTimeout(timeout);
         if (killTimer) clearTimeout(killTimer);
@@ -221,6 +238,7 @@ export interface LibreOfficeQaReport {
 
 export interface QaRunner {
   run(input: QaRunInput): Promise<LibreOfficeQaReport>;
+  reissueValidatedReport?(report: LibreOfficeQaReport): LibreOfficeQaReport;
 }
 
 const authenticQaReports = new WeakSet<LibreOfficeQaReport>();
@@ -253,7 +271,7 @@ export class LibreOfficeQa implements QaRunner {
     this.#options = options;
   }
 
-  async run(input: QaRunInput): Promise<LibreOfficeQaReport> {
+  readonly run = async (input: QaRunInput): Promise<LibreOfficeQaReport> => {
     try {
       return await this.#runChecked(input);
     } catch (error) {
@@ -267,7 +285,15 @@ export class LibreOfficeQa implements QaRunner {
         }),
       );
     }
-  }
+  };
+
+  readonly reissueValidatedReport = (
+    report: LibreOfficeQaReport,
+  ): LibreOfficeQaReport => {
+    const reissued = deepFreeze(structuredClone(report));
+    authenticQaReports.add(reissued);
+    return reissued;
+  };
 
   async #runChecked(input: QaRunInput): Promise<LibreOfficeQaReport> {
     if (
@@ -489,7 +515,7 @@ export class LibreOfficeQa implements QaRunner {
     input: QaRunInput,
     report: LibreOfficeQaReport,
   ): Promise<LibreOfficeQaReport> {
-    const readableSummary = textReport(report);
+    const readableSummary = formatQaReadableSummary(report);
     const relativePath = `qa/qa-round-${input.round}.json`;
     const serialized = JSON.stringify({ ...report, readableSummary }, null, 2);
     try {
@@ -532,7 +558,7 @@ function numericPageOrder(left: string, right: string): number {
   return page(left) - page(right);
 }
 
-function textReport(report: LibreOfficeQaReport): string {
+export function formatQaReadableSummary(report: LibreOfficeQaReport): string {
   return [
     `LibreOffice QA round ${report.round}: ${report.status}`,
     `Export: ${report.exportPath} (${report.exportSha256})`,

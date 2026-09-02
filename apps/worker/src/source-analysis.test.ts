@@ -80,6 +80,39 @@ class FailOncePathArtifacts extends MemoryArtifacts {
   }
 }
 
+class PostCommitFailureArtifacts extends MemoryArtifacts {
+  private readonly failedPaths = new Set<string>();
+
+  constructor(private readonly failAfterCommitPath: string) {
+    super();
+  }
+
+  override async write(
+    projectId: string,
+    path: string,
+    contents: string | Uint8Array,
+  ) {
+    const artifactPath = await super.write(projectId, path, contents);
+    if (path === this.failAfterCommitPath && !this.failedPaths.has(path)) {
+      this.failedPaths.add(path);
+      throw new Error(`simulated post-commit failure for ${path}`);
+    }
+    return artifactPath;
+  }
+
+  async read(projectId: string, path: string): Promise<Uint8Array> {
+    const contents = this.writes.get(`${projectId}/${path}`);
+    if (contents === undefined) throw new Error(`missing ${path}`);
+    return typeof contents === 'string'
+      ? new TextEncoder().encode(contents)
+      : contents;
+  }
+
+  async resolvePath(projectId: string, path: string): Promise<string> {
+    return `/workspace/${projectId}/${path}`;
+  }
+}
+
 const validAnalysis: SourceAnalysis = {
   findings: [
     { id: 'finding-1', text: 'A sourced finding.', sourceIds: ['source-1'] },
@@ -224,6 +257,32 @@ describe('source analysis approval and provenance', () => {
     expect(projects.getProjectSnapshot('project-1').sourceAnalysis).toBeNull();
   });
 
+  it.each([
+    ['a non-string unit', { ...validAnalysis.dataPoints[0], unit: 12 }],
+    [
+      'non-array source ids',
+      { ...validAnalysis.dataPoints[0], sourceIds: 'source-1' },
+    ],
+  ])('rejects source data points with %s', async (_label, dataPoint) => {
+    const { projects, workflow } = await createProject();
+    const service = workflow.sourceAnalysis(
+      new FakeSourceAnalysisGateway({
+        ...validAnalysis,
+        dataPoints: [dataPoint as never],
+      }),
+    );
+    await service.request({
+      id: 'analysis-1',
+      projectId: 'project-1',
+      sourceIds: ['source-1'],
+    });
+
+    await expect(service.execute('analysis-1')).rejects.toThrow(
+      'Source data point does not match the runtime schema',
+    );
+    expect(projects.getProjectSnapshot('project-1').sourceAnalysis).toBeNull();
+  });
+
   it('shares a project lock across service instances and marks running before awaiting the gateway', async () => {
     const { workflow } = await createProject();
     let resolveOutput: ((output: SourceAnalysis) => void) | undefined;
@@ -359,4 +418,42 @@ describe('source analysis approval and provenance', () => {
       status: 'completed',
     });
   });
+
+  it.each([
+    ['request staging', 'sources/analysis-1-request.json'],
+    ['web-search decision', 'sources/analysis-1-web-search-approval.json'],
+    ['analysis evidence', 'sources/analysis-1-analysis.json'],
+  ] as const)(
+    'adopts byte-identical %s after an adapter reports a post-commit failure',
+    async (_label, failedPath) => {
+      const artifacts = new PostCommitFailureArtifacts(failedPath);
+      const { projects, workflow } = await createProject(artifacts);
+      const service = workflow.sourceAnalysis(new FakeSourceAnalysisGateway());
+      const request = await service.request({
+        id: 'analysis-1',
+        projectId: 'project-1',
+        sourceIds: ['source-1'],
+        ...(failedPath.includes('web-search')
+          ? { webSearchQuery: 'approved query' }
+          : {}),
+      });
+
+      if (failedPath.includes('request')) {
+        expect(request.status).toBe('ready');
+      } else if (failedPath.includes('web-search')) {
+        await service.decideWebSearch(
+          'analysis-1',
+          true,
+          '2026-09-01T01:00:00.000Z',
+        );
+      }
+      await service.execute('analysis-1');
+
+      expect(projects.getProjectSnapshot('project-1')).toMatchObject({
+        project: { workflowStatus: 'source_analysis' },
+        sourceAnalysis: validAnalysis,
+      });
+      expect(artifacts.writes.has(`project-1/${failedPath}`)).toBe(true);
+    },
+  );
 });

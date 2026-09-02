@@ -5,6 +5,7 @@ import type {
   QaRunner,
   LibreOfficeQaReport,
 } from './libreoffice-qa.js';
+import { formatQaReadableSummary } from './libreoffice-qa.js';
 import {
   type ExportReceipt,
   type ProjectMutationPort,
@@ -139,7 +140,7 @@ export class PptDeliveryCoordinator {
       const checkpoint = this.#mutations.getQaCheckpoint(projectId);
       if (checkpoint.nextAction === 'qa') {
         const receipt = checkpoint.currentReceipt;
-        const report = await this.#qa.run({
+        const input = {
           projectId,
           pptxPath: receipt.relativePath,
           expectedPageCount: checkpoint.expectedPageCount,
@@ -147,7 +148,9 @@ export class PptDeliveryCoordinator {
           exportSha256: receipt.sha256,
           specVersionId: receipt.specVersionId,
           visualVersionIds: receipt.visualVersionIds,
-        });
+        };
+        const report =
+          (await this.#recoverQaBundle(input)) ?? (await this.#qa.run(input));
         this.#mutations.commitQaReport({
           receipt,
           report,
@@ -181,10 +184,50 @@ export class PptDeliveryCoordinator {
     }
   }
 
+  async #recoverQaBundle(input: {
+    projectId: string;
+    pptxPath: string;
+    expectedPageCount: number;
+    round: number;
+    exportSha256: string;
+    specVersionId: string;
+    visualVersionIds: Readonly<Record<string, string>>;
+  }): Promise<LibreOfficeQaReport | undefined> {
+    const relativePath = `qa/qa-round-${input.round}.json`;
+    const contents = await this.#artifacts
+      .read(input.projectId, relativePath)
+      .catch((error: unknown) => {
+        if (isMissingArtifact(error)) return undefined;
+        throw error;
+      });
+    if (!contents) return undefined;
+    let bundle: unknown;
+    try {
+      bundle = JSON.parse(new TextDecoder().decode(contents));
+    } catch {
+      throw new Error('Existing QA bundle is not valid JSON');
+    }
+    const expectedPath = await this.#artifacts.resolvePath(
+      input.projectId,
+      relativePath,
+    );
+    const report = validateQaBundle(bundle, input, expectedPath);
+    const reissue = this.#qa.reissueValidatedReport;
+    if (!reissue) {
+      throw new Error(
+        'Existing QA bundle cannot be reissued by this QA runner',
+      );
+    }
+    return reissue(report);
+  }
+
   async #validateRepairedReceipt(
     current: ExportReceipt,
     repaired: { pptxPath: string; exportSha256: string },
   ): Promise<ExportReceipt> {
+    if (repaired.pptxPath === current.relativePath) {
+      throw new Error('Repair must use a new relative path');
+    }
     if (
       isAbsolute(repaired.pptxPath) ||
       repaired.pptxPath.includes('\\') ||
@@ -195,6 +238,26 @@ export class PptDeliveryCoordinator {
       !/\.pptx$/i.test(repaired.pptxPath)
     ) {
       throw new Error('Repaired PPTX must be inside project exports');
+    }
+    const currentPath = await this.#artifacts.resolvePath(
+      current.projectId,
+      current.relativePath,
+    );
+    const currentBytes = await this.#artifacts.read(
+      current.projectId,
+      current.relativePath,
+    );
+    const currentSha256 = createHash('sha256')
+      .update(currentBytes)
+      .digest('hex');
+    if (
+      currentPath !== current.artifactPath ||
+      currentBytes.byteLength !== current.byteLength ||
+      currentSha256 !== current.sha256
+    ) {
+      throw new Error(
+        'current export receipt hash does not match validated artifact bytes',
+      );
     }
     const artifactPath = await this.#artifacts.resolvePath(
       current.projectId,
@@ -219,6 +282,116 @@ export class PptDeliveryCoordinator {
       byteLength: bytes.byteLength,
     };
   }
+}
+
+function validateQaBundle(
+  bundle: unknown,
+  input: {
+    projectId: string;
+    pptxPath: string;
+    expectedPageCount: number;
+    round: number;
+    exportSha256: string;
+    specVersionId: string;
+    visualVersionIds: Readonly<Record<string, string>>;
+  },
+  expectedPath: string,
+): LibreOfficeQaReport {
+  if (!isRecord(bundle) || typeof bundle.readableSummary !== 'string') {
+    throw new Error('Existing QA bundle does not match the runtime schema');
+  }
+  const { readableSummary, ...candidate } = bundle;
+  if (
+    !isRecord(candidate) ||
+    !['passed', 'failed', 'blocked'].includes(candidate.status as string) ||
+    candidate.round !== input.round ||
+    candidate.projectId !== input.projectId ||
+    candidate.exportPath !== input.pptxPath ||
+    candidate.exportSha256 !== input.exportSha256 ||
+    candidate.specVersionId !== input.specVersionId ||
+    !sameStringRecord(candidate.visualVersionIds, input.visualVersionIds) ||
+    candidate.expectedPageCount !== input.expectedPageCount ||
+    candidate.jsonReportPath !== expectedPath ||
+    candidate.textReportPath !== expectedPath ||
+    !isNullableString(candidate.sofficePath) ||
+    !isNullableString(candidate.rendererPath) ||
+    !isNullableString(candidate.pdfPath) ||
+    !isStringArray(candidate.renderedPages) ||
+    !isNonNegativeSafeInteger(candidate.actualPageCount) ||
+    !isPositiveSafeIntegerArray(candidate.blankPages) ||
+    !isQaComparisons(candidate.comparisons) ||
+    !isStringArray(candidate.issues)
+  ) {
+    throw new Error('Existing QA bundle does not match the runtime schema');
+  }
+  const report = candidate as unknown as LibreOfficeQaReport;
+  if (readableSummary !== formatQaReadableSummary(report)) {
+    throw new Error(
+      'Existing QA bundle readable summary does not match report',
+    );
+  }
+  return report;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string';
+}
+
+function isStringArray(value: unknown): value is readonly string[] {
+  return (
+    Array.isArray(value) && value.every((item) => typeof item === 'string')
+  );
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPositiveSafeIntegerArray(
+  value: unknown,
+): value is readonly number[] {
+  return (
+    Array.isArray(value) &&
+    value.every((item) => Number.isSafeInteger(item) && item > 0)
+  );
+}
+
+function isQaComparisons(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (comparison) =>
+        isRecord(comparison) &&
+        typeof comparison.path === 'string' &&
+        typeof comparison.blank === 'boolean' &&
+        (comparison.differenceScore === undefined ||
+          (typeof comparison.differenceScore === 'number' &&
+            Number.isFinite(comparison.differenceScore))),
+    )
+  );
+}
+
+function sameStringRecord(
+  candidate: unknown,
+  expected: Readonly<Record<string, string>>,
+): boolean {
+  return (
+    isRecord(candidate) &&
+    Object.values(candidate).every((value) => typeof value === 'string') &&
+    JSON.stringify(candidate) === JSON.stringify(expected)
+  );
+}
+
+function isMissingArtifact(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (('code' in error && error.code === 'ENOENT') ||
+      error.message.startsWith('missing '))
+  );
 }
 
 function normalizePptxFileName(fileName: string): string {

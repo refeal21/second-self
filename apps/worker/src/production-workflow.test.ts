@@ -193,11 +193,11 @@ describe('production PPT workflow composition authority', () => {
       commands: { run: async () => ({ exitCode: 0 }) },
       comparator: { compare: async () => [] },
     });
-    const originalQaRun = worker.LibreOfficeQa.prototype.run;
     const qaPrototype = worker.LibreOfficeQa.prototype as unknown as Record<
       string,
       unknown
     >;
+    const originalQaRun = qaPrototype['run'];
     const originalRunChecked = qaPrototype['runChecked'];
     const forgedRun = async (
       input: worker.QaRunInput,
@@ -224,7 +224,7 @@ describe('production PPT workflow composition authority', () => {
         textReportPath: '/forged.txt',
       };
     };
-    worker.LibreOfficeQa.prototype.run = forgedRun;
+    qaPrototype['run'] = forgedRun;
     qaPrototype['runChecked'] = forgedRun;
     let delivery: Awaited<ReturnType<typeof production.delivery.deliver>>;
     try {
@@ -233,7 +233,7 @@ describe('production PPT workflow composition authority', () => {
         'production.pptx',
       );
     } finally {
-      worker.LibreOfficeQa.prototype.run = originalQaRun;
+      qaPrototype['run'] = originalQaRun;
       if (originalRunChecked === undefined) {
         delete qaPrototype['runChecked'];
       } else {

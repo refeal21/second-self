@@ -1,4 +1,5 @@
 import type { Version } from '@digital-twin/core';
+import { PNG } from 'pngjs';
 import {
   type ApprovedVisualAsset,
   type ProjectMutationPort,
@@ -96,6 +97,7 @@ export class VisualGenerationService {
         spec,
         imageGenerationBrief: spec.imageGenerationBrief,
       });
+      assertVisualGenerationResult(result);
       if (result.status === 'blocked') {
         this.#mutations.blockVisualGeneration(
           projectId,
@@ -130,6 +132,50 @@ export class VisualGenerationService {
       throw new Error('The ImageGen capability is still unavailable');
     }
     this.#mutations.resumeVisualReview(projectId);
+  }
+}
+
+function assertVisualGenerationResult(
+  result: unknown,
+): asserts result is GeneratedSlideVisual {
+  if (!result || typeof result !== 'object') {
+    throw new Error(
+      'visual generation result does not match the runtime schema',
+    );
+  }
+  const candidate = result as Record<string, unknown>;
+  if (candidate.status === 'blocked') {
+    if (
+      candidate.reason !== 'capability_unavailable' ||
+      candidate.capability !== 'image_gen.imagegen' ||
+      typeof candidate.message !== 'string'
+    ) {
+      throw new Error(
+        'visual generation result does not match the runtime schema',
+      );
+    }
+    return;
+  }
+  if (
+    candidate.status !== 'generated' ||
+    !(candidate.image instanceof Uint8Array) ||
+    candidate.mediaType !== 'image/png' ||
+    ![
+      'full_slide_reference',
+      'text_free_background',
+      'complex_visual',
+    ].includes(candidate.usage as VisualAssetUsage) ||
+    typeof candidate.textFree !== 'boolean' ||
+    typeof candidate.altText !== 'string'
+  ) {
+    throw new Error(
+      'visual generation result does not match the runtime schema',
+    );
+  }
+  try {
+    PNG.sync.read(Buffer.from(candidate.image));
+  } catch {
+    throw new Error('visual generation result must contain a decodable PNG');
   }
 }
 

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { createIsolatedPptWorkflow } from './ppt-project.js';
 import {
   LibreOfficeQa,
+  formatQaReadableSummary,
   type PptProjectService,
   type ApprovedPptDeck,
   type LibreOfficeQaReport,
@@ -120,6 +121,8 @@ class SuccessfulQaCommands implements CommandRunner {
 }
 
 class RoundQaCommands implements CommandRunner {
+  readonly calls: string[] = [];
+
   constructor(private readonly artifacts: MemoryArtifacts) {}
 
   async canExecute(): Promise<boolean> {
@@ -127,6 +130,7 @@ class RoundQaCommands implements CommandRunner {
   }
 
   async run(command: string, args: readonly string[]) {
+    this.calls.push(command);
     if (command === 'pdftoppm') {
       const prefix = args.at(-1);
       if (!prefix) throw new Error('Missing render prefix');
@@ -157,16 +161,34 @@ class WritingRepairer implements PptRepairer {
 
   constructor(
     private readonly artifacts: MemoryArtifacts,
-    private readonly forged?: 'path' | 'hash' | 'stale',
+    private readonly forged?:
+      | 'path'
+      | 'hash'
+      | 'stale'
+      | 'same-path'
+      | 'mutated-current',
   ) {}
 
-  async repair(input: { projectId: string; round: number }) {
+  async repair(input: Parameters<PptRepairer['repair']>[0]) {
     this.rounds.push(input.round);
     if (this.forged === 'path') {
       return {
         pptxPath: 'sources/forged.pptx',
         exportSha256: 'f'.repeat(64),
       };
+    }
+    if (this.forged === 'same-path') {
+      const bytes = await this.artifacts.read(input.projectId, input.pptxPath);
+      return {
+        pptxPath: input.pptxPath,
+        exportSha256: createHash('sha256').update(bytes).digest('hex'),
+      };
+    }
+    if (this.forged === 'mutated-current') {
+      this.artifacts.files.set(
+        `${input.projectId}/${input.pptxPath}`,
+        new Uint8Array([99]),
+      );
     }
     const pptxPath = `exports/deck-repair-${input.round}.pptx`;
     const bytes =
@@ -425,7 +447,13 @@ describe('project delivery evidence coordinator', () => {
     const artifacts = new MemoryArtifacts();
     const projects = await conversionProject(artifacts);
     const exporter = new CapturingExporter();
-    const realQa = authenticQa(artifacts, []);
+    const commands = new RoundQaCommands(artifacts);
+    const realQa = new LibreOfficeQa(
+      commands,
+      artifacts,
+      new RoundComparator([]),
+      { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'] },
+    );
     let interrupt = true;
     const interruptedQa: QaRunner = {
       run: async (input) => {
@@ -436,6 +464,14 @@ describe('project delivery evidence coordinator', () => {
         }
         return report;
       },
+      reissueValidatedReport: (report) =>
+        (
+          realQa as unknown as {
+            reissueValidatedReport(
+              candidate: LibreOfficeQaReport,
+            ): LibreOfficeQaReport;
+          }
+        ).reissueValidatedReport(report),
     };
     const delivery = deliveryCoordinator(
       projects,
@@ -455,6 +491,7 @@ describe('project delivery evidence coordinator', () => {
     const resumed = await delivery.deliver('project-1', 'deck.pptx');
 
     expect(exporter.calls).toBe(1);
+    expect(commands.calls).toEqual(['soffice', 'pdftoppm']);
     expect(resumed.qaReports).toHaveLength(1);
     expect(resumed.qaReport.status).toBe('passed');
     expect(
@@ -463,9 +500,54 @@ describe('project delivery evidence coordinator', () => {
   });
 
   it.each([
+    [
+      'a corrupt QA bundle',
+      new TextEncoder().encode('{not-json'),
+      'not valid JSON',
+    ],
+    [
+      'a QA bundle bound to a different export hash',
+      new TextEncoder().encode(
+        JSON.stringify(qaBundle({ exportSha256: 'f'.repeat(64) }), null, 2),
+      ),
+      'runtime schema',
+    ],
+  ])(
+    'rejects %s before rerunning QA commands',
+    async (_label, bundle, message) => {
+      const artifacts = new MemoryArtifacts();
+      artifacts.files.set('project-1/qa/qa-round-1.json', bundle);
+      const projects = await conversionProject(artifacts);
+      const commands = new RoundQaCommands(artifacts);
+      const qa = new LibreOfficeQa(
+        commands,
+        artifacts,
+        new RoundComparator([]),
+        { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'] },
+      );
+
+      await expect(
+        deliveryCoordinator(
+          projects,
+          artifacts,
+          new CapturingExporter(),
+          qa,
+        ).deliver('project-1', 'deck.pptx'),
+      ).rejects.toThrow(message);
+      expect(commands.calls).toEqual([]);
+      expect(projects.getProjectSnapshot('project-1')).toMatchObject({
+        project: { workflowStatus: 'qa' },
+        qaCheckpoint: { nextAction: 'qa', reports: [] },
+      });
+    },
+  );
+
+  it.each([
     ['path', 'inside project exports'],
     ['hash', 'hash'],
     ['stale', 'new artifact hash'],
+    ['same-path', 'new relative path'],
+    ['mutated-current', 'current export receipt hash'],
   ] as const)(
     'rejects a repaired artifact with a forged %s while retaining a retryable repair checkpoint',
     async (forged, message) => {
@@ -493,3 +575,37 @@ describe('project delivery evidence coordinator', () => {
     },
   );
 });
+
+function qaBundle(
+  values: Partial<LibreOfficeQaReport> = {},
+): LibreOfficeQaReport & { readableSummary: string } {
+  const report: LibreOfficeQaReport = {
+    status: 'passed',
+    round: 1,
+    projectId: 'project-1',
+    exportPath: 'exports/deck.pptx',
+    exportSha256: createHash('sha256')
+      .update(new Uint8Array([80, 75, 3, 4]))
+      .digest('hex'),
+    specVersionId: 'project-1-slide-specs-v1',
+    visualVersionIds: { 'slide-1': 'project-1-visual-slide-1-v1' },
+    sofficePath: 'soffice',
+    rendererPath: 'pdftoppm',
+    pdfPath: '/workspace/project-1/qa/run-1/deck.pdf',
+    renderedPages: ['/workspace/project-1/qa/run-1/rendered-1.png'],
+    expectedPageCount: 1,
+    actualPageCount: 1,
+    blankPages: [],
+    comparisons: [
+      {
+        path: '/workspace/project-1/qa/run-1/rendered-1.png',
+        blank: false,
+      },
+    ],
+    issues: [],
+    jsonReportPath: '/workspace/project-1/qa/qa-round-1.json',
+    textReportPath: '/workspace/project-1/qa/qa-round-1.json',
+    ...values,
+  };
+  return { ...report, readableSummary: formatQaReadableSummary(report) };
+}

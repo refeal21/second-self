@@ -1,4 +1,5 @@
 import { assertStrictIdentifier } from './identifiers.js';
+import { writeArtifactOrAdoptExact } from './workspace-artifacts.js';
 import {
   type ProjectMutationPort,
   type PptProjectService,
@@ -117,7 +118,8 @@ export class SourceAnalysisService {
     try {
       this.#mutations.beginSourceAnalysis(input.projectId);
       workflowReserved = true;
-      await this.#mutations.artifacts.write(
+      await writeArtifactOrAdoptExact(
+        this.#mutations.artifacts,
         input.projectId,
         `sources/${input.id}-request.json`,
         JSON.stringify(request, null, 2),
@@ -148,7 +150,8 @@ export class SourceAnalysisService {
       throw new Error('Analysis request is not awaiting web-search approval');
     }
     const decision = { approved, decidedAt };
-    await this.#mutations.artifacts.write(
+    await writeArtifactOrAdoptExact(
+      this.#mutations.artifacts,
       request.projectId,
       `sources/${request.id}-web-search-approval.json`,
       JSON.stringify(
@@ -290,7 +293,13 @@ function validateSourceAnalysis(
       !point ||
       typeof point.label !== 'string' ||
       (typeof point.value !== 'string' && typeof point.value !== 'number') ||
-      (typeof point.value === 'number' && !Number.isFinite(point.value))
+      (typeof point.value === 'number' && !Number.isFinite(point.value)) ||
+      (point.unit !== undefined && typeof point.unit !== 'string') ||
+      (point.sourceIds !== undefined &&
+        (!Array.isArray(point.sourceIds) ||
+          !point.sourceIds.every(
+            (sourceId: unknown) => typeof sourceId === 'string',
+          )))
     ) {
       throw new Error('Source data point does not match the runtime schema');
     }

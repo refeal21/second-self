@@ -1,4 +1,4 @@
-# Task 3 report — image-first PPT workflow and fix rounds 1–2
+# Task 3 report — image-first PPT workflow and fix rounds 1–3
 
 ## Outcome
 
@@ -149,3 +149,29 @@ Fix commits:
 - The authentic QA proof is factory-local by design. Durable restoration must revalidate the persisted atomic QA bundle and bound export receipt rather than attempting to serialize the in-memory proof marker.
 - A production repairer is an injected business capability and must have its own validated means to create the returned `exports/*.pptx` artifact. Regardless of its implementation, the coordinator independently reads the bytes and rejects stale paths, hashes, or version bindings before replacing the authoritative receipt.
 - No live model or ImageGen call was made; gateways use deterministic fakes in tests. The no-API-fallback invariant remains intact.
+
+## Fix-round 3 implementation
+
+- Production LibreOffice QA no longer captures a prototype method at module load. Its execution entry is an instance-own closure that calls private state, and the factory keeps that instance behind its own closure. A fresh module-graph test first patches `LibreOfficeQa.prototype.run`, then imports the production factory; the patch is not called and genuine QA produces the expected unavailable-capability report.
+- POSIX timeouts now defer settlement until the scheduled process-group `SIGKILL` fallback is issued. The regression starts a root that exits on `SIGTERM` plus a descendant that ignores it and owns no output pipe; after the runner returns the descendant is no longer active, with deterministic test cleanup retained.
+- Visual generation validates the full runtime discriminated union before any block/state/artifact mutation: only exact generated/blocked discriminants, PNG media/bytes, allowed usage, boolean `textFree`, and string `altText`/block message are accepted. Project storage retains its independent generated-asset and PNG checks. Source analysis now validates optional data-point `unit` and `sourceIds` before provenance traversal.
+- QA delivery checks `qa/qa-round-N.json` before re-running a round. It parses and validates the authoritative bundle’s full report shape, receipt/project/spec/visual/page/round binding, report paths, and canonical readable summary; a validated report is reissued by the factory-local signer. Corrupt or differently bound bundles reject without executing QA commands.
+- `LocalWorkspaceArtifacts.write` now treats a completed create-only hard link as committed even if best-effort temporary cleanup fails. Request staging, web-search decision, and analysis-evidence writes read back and adopt only byte-identical committed artifacts after adapter-reported failure; non-identical/missing artifacts retain the original rollback behavior.
+- Repairs must use a new relative artifact path. Before accepting a replacement, delivery re-resolves, reads, length-checks, and hashes the current receipt; a current-artifact mutation or stale checkpoint cannot advance recovery state.
+
+## Fix-round 3 TDD and verification
+
+- RED/GREEN focused coverage:
+  - `source-analysis.test.ts` and `visual-generation.test.ts`: 5 initial RED assertions (malformed source points and ImageGen statuses/results) → 22/22 GREEN.
+  - `production-load-order.test.ts`: prototype patch was invoked once before the instance-own QA entry → GREEN with zero patch calls.
+  - `libreoffice-qa.test.ts`: TERM-ignoring descendant outlived the root close → GREEN after mandatory group-KILL-before-settlement.
+  - `delivery-coordinator.test.ts`: persisted bundle reran `soffice`/`pdftoppm`, same-path repair reported only a duplicate hash, and current-receipt mutation completed → GREEN bundle replay/rejection and repair invariants.
+  - `workspace-artifacts-post-commit.test.ts` plus source-analysis post-commit parametrization: final-link cleanup and each of request/decision/evidence post-commit errors initially rejected → GREEN only for exact read-back adoption.
+- Focused round-3 suite: 8 files, 64 tests passed.
+- Worker suite: `pnpm --filter @digital-twin/worker test` → 14 files, 132 tests passed.
+- Fresh repository gate: `pnpm typecheck`, `pnpm lint`, `pnpm test`, `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check`, `npx --yes prettier@3.6.2 --single-quote --check <changed TypeScript files>`, and `git diff --check` all exited 0.
+- Real local LibreOffice smoke (bundled runtime `soffice` and `pdftoppm`, `LocalWorkspaceArtifacts`, `LocalCommandRunner`, and actual PptxGenJS files):
+  - normal deck: `passed`, one rendered page, no blank pages;
+  - blank deck: `failed`, one rendered page, `blankPages: [1]`;
+  - repair: blank initial QA then `exports/repaired.pptx` passed, with one repair round;
+  - recovery: an injected interruption after the durable round-1 bundle left the checkpoint resumable; replay passed with exactly the original two QA commands (one conversion and one render), not a second QA execution.

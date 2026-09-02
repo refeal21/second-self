@@ -1,3 +1,8 @@
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { PNG } from 'pngjs';
 import { createHash } from 'node:crypto';
@@ -357,6 +362,53 @@ describe('local command runner process boundaries', () => {
 
     expect(result.timedOut).toBe(true);
     expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  it('kills a TERM-ignoring detached-group descendant before resolving a timed-out root close', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qa-timeout-group-'));
+    const pidPath = join(directory, 'descendant.pid');
+    let descendantPid: number | undefined;
+    try {
+      const result = await new LocalCommandRunner().run(
+        process.execPath,
+        [
+          '-e',
+          [
+            'const { spawn } = require("node:child_process");',
+            'const { writeFileSync } = require("node:fs");',
+            'const child = spawn(process.execPath, ["-e", "process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+            'writeFileSync(process.env.DESCENDANT_PID_PATH, String(child.pid));',
+            'process.on("SIGTERM", () => process.exit(0));',
+            'setInterval(() => {}, 1000);',
+          ].join(''),
+        ],
+        {
+          timeoutMs: 100,
+          maxOutputBytes: 1024,
+          env: { DESCENDANT_PID_PATH: pidPath },
+        },
+      );
+      descendantPid = Number(await readFile(pidPath, 'utf8'));
+
+      expect(result.timedOut).toBe(true);
+      expect(Number.isInteger(descendantPid)).toBe(true);
+      const ps = await promisify(execFile)('ps', [
+        '-o',
+        'stat=',
+        '-p',
+        String(descendantPid),
+      ]).catch(() => ({ stdout: '' }));
+      expect(ps.stdout.trim()).toBe('');
+    } finally {
+      if (descendantPid) {
+        try {
+          process.kill(descendantPid, 'SIGKILL');
+        } catch {
+          // The expected path has already reaped the descendant.
+        }
+      }
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });
 

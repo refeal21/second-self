@@ -44,6 +44,42 @@ export interface WorkspaceArtifactAccess extends WorkspaceArtifacts {
   ): Promise<readonly string[]>;
 }
 
+/**
+ * Accept a create-only write that reached durable storage before its adapter
+ * reported failure, but only when the stored bytes exactly match the request.
+ */
+export async function writeArtifactOrAdoptExact(
+  artifacts: WorkspaceArtifacts,
+  projectId: string,
+  relativePath: string,
+  contents: string | Uint8Array,
+): Promise<string | undefined> {
+  try {
+    return await artifacts.write(projectId, relativePath, contents);
+  } catch (error) {
+    if (!artifacts.read) throw error;
+    const persisted = await artifacts
+      .read(projectId, relativePath)
+      .catch(() => undefined);
+    const expected =
+      typeof contents === 'string'
+        ? new TextEncoder().encode(contents)
+        : contents;
+    if (!persisted || !Buffer.from(persisted).equals(Buffer.from(expected))) {
+      throw error;
+    }
+    const access = artifacts as WorkspaceArtifacts & {
+      resolvePath?: (
+        projectId: string,
+        relativePath: string,
+      ) => Promise<string>;
+    };
+    return access.resolvePath
+      ? access.resolvePath(projectId, relativePath)
+      : undefined;
+  }
+}
+
 export class LocalWorkspaceArtifacts implements WorkspaceArtifactAccess {
   private readonly workspaceRoot: string;
 
@@ -104,6 +140,7 @@ export class LocalWorkspaceArtifacts implements WorkspaceArtifactAccess {
     );
     const temporaryPath = join(parent, `.${randomUUID()}.tmp`);
     let temporaryCreated = false;
+    let committed = false;
     try {
       const handle = await open(
         temporaryPath,
@@ -126,10 +163,11 @@ export class LocalWorkspaceArtifacts implements WorkspaceArtifactAccess {
         false,
       );
       await link(temporaryPath, path);
-      await unlink(temporaryPath);
+      committed = true;
+      await unlink(temporaryPath).catch(() => undefined);
       temporaryCreated = false;
     } catch (error) {
-      if (temporaryCreated) {
+      if (temporaryCreated && !committed) {
         await unlink(temporaryPath).catch(() => undefined);
       }
       if (isNodeError(error) && error.code === 'EEXIST') {

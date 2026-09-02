@@ -213,6 +213,42 @@ describe('slide visual generation and approval', () => {
     expect(projects.getProjectSnapshot('project-1').visuals).toEqual({});
   });
 
+  it.each([
+    ['an unknown success status', { ...generatedVisual(), status: 'success' }],
+    [
+      'a malformed blocked result',
+      {
+        status: 'blocked',
+        reason: 'model_refusal',
+        capability: 'image_gen.imagegen',
+        message: 'Unavailable',
+      },
+    ],
+    ['a malformed generated result', { ...generatedVisual(), altText: 42 }],
+  ])('rejects %s before mutating project state', async (_label, result) => {
+    const artifacts = new MemoryArtifacts();
+    const projects = await projectAtVisualReview(artifacts);
+    const visuals = visualService(projects, {
+      capability: async () => ({
+        id: 'image_gen.imagegen',
+        status: 'available',
+      }),
+      generate: async () => result as never,
+    });
+
+    await expect(visuals.generate('project-1', 'slide-1')).rejects.toThrow(
+      'visual generation result',
+    );
+    expect(projects.getProjectSnapshot('project-1')).toMatchObject({
+      project: { workflowStatus: 'visual_review' },
+      visuals: {},
+      blockedCondition: null,
+    });
+    expect(artifacts.writes.has('project-1/visuals/slide-1-v1.png')).toBe(
+      false,
+    );
+  });
+
   it('freezes each approved page and reopening it creates a new current version', async () => {
     const artifacts = new MemoryArtifacts();
     const projects = await projectAtVisualReview(artifacts);

@@ -8,7 +8,10 @@ import {
   type WorkflowTransitionContext,
 } from '@digital-twin/core';
 import { basename } from 'node:path';
-import type { WorkspaceArtifacts } from './workspace-artifacts.js';
+import {
+  type WorkspaceArtifacts,
+  writeArtifactOrAdoptExact,
+} from './workspace-artifacts.js';
 import type {
   GeneratedVisualAsset,
   VisualAssetUsage,
@@ -47,8 +50,6 @@ import {
   type OutlineGenerationGateway,
   type SlideSpecGenerationGateway,
 } from './structure-generation.js';
-
-const runFactoryLibreOfficeQa = LibreOfficeQa.prototype.run;
 
 export interface SourceAttachment {
   id: string;
@@ -415,11 +416,15 @@ export class PptProjectService {
         2,
       ),
     );
-    const artifactPath = await this.#artifacts.write(
+    const artifactPath = await writeArtifactOrAdoptExact(
+      this.#artifacts,
       evidence.projectId,
       `sources/${evidence.requestId}-analysis.json`,
       bytes,
     );
+    if (!artifactPath) {
+      throw new Error('Analysis evidence requires a resolved artifact path');
+    }
     const receipt: SourceAnalysisEvidence = {
       projectId: evidence.projectId,
       requestId: evidence.requestId,
@@ -1029,6 +1034,7 @@ export class PptProjectService {
       );
     }
     if (
+      generated.status !== 'generated' ||
       generated.mediaType !== 'image/png' ||
       !(generated.image instanceof Uint8Array) ||
       ![
@@ -1188,9 +1194,14 @@ export function createProductionPptWorkflow(
   );
   const qa: QaRunner = Object.freeze({
     run: async (runInput: QaRunInput) => {
-      const report = await runFactoryLibreOfficeQa.call(localQa, runInput);
+      const report = await localQa.run(runInput);
       productionQaReports.add(report);
       return report;
+    },
+    reissueValidatedReport: (report: LibreOfficeQaReport) => {
+      const reissued = localQa.reissueValidatedReport(report);
+      productionQaReports.add(reissued);
+      return reissued;
     },
   });
   const delivery = new PptDeliveryCoordinator(

@@ -1,10 +1,9 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-
-function App() {
-  return <main>Digital Twin Workbench</main>;
-}
+import { App } from './App.js';
 
 createRoot(document.getElementById('root')!).render(
-  <StrictMode><App /></StrictMode>,
+  <StrictMode>
+    <App />
+  </StrictMode>,
 );

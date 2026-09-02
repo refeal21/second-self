@@ -1,66 +1,53 @@
-# Task 4 report — production desktop UI
+# Task 4 report — production desktop UI, fix round 1
 
 ## Outcome
 
-Task 4 delivers the React/Tauri desktop workbench for the six required product views: dashboard, general tasks, PPT projects, approval center, preference memory, and settings. The PPT project opens a complete workspace with the fixed seven-stage workflow, five-slide navigator, code-native 16:9 preview, source/progress inspector, review comment, reopen, regenerate, approve-next, and export actions.
+Task 4 now provides the six required React/Tauri views plus a complete PPT review workspace without allowing browser demo state to masquerade as native state. Browser builds use a visibly labelled deterministic demo adapter. Tauri builds start with unavailable account/runtime and empty project/approval/memory collections until a native capability returns data or an explicit error.
 
-Every primary navigation item, button, and form now reaches typed local state, the desktop adapter, or a visible error/status response. Browser builds select an explicitly labeled deterministic demo adapter. Tauri builds use the existing Codex App Server transport for account and general-task operations; future PPT/memory/settings commands pass through the adapter boundary and surface Tauri command errors instead of silently succeeding.
+The rejected-review blockers were addressed in one coherent adapter/store pass:
 
-## Implementation
-
-- `App.tsx` composes the six views and PPT workspace, state-based hash navigation, browser-history behavior, live status/error feedback, semantic landmarks, labeled controls, and a small consistent outline icon set.
-- `desktop-adapter.ts` defines typed account, task, project, review, export, memory, and settings contracts. It provides deterministic demo behavior and a Tauri implementation backed by the existing JSONL Codex transport plus explicit command calls.
-- `styles.css` implements the approved white/cool-neutral design system, 240px dashboard shell, dashboard activity rail, concept-driven rows/tables, PPT workflow/canvas/inspector columns, visible focus, reduced motion, and Chinese typography.
-- At 900–1279px the primary navigation collapses while the PPT inspector remains usable. Below 900px the PPT workflow, canvas, and review inspector become three keyboard-accessible tabs with one visible panel and no page-level horizontal overflow.
-- General-task approval changes the local run out of `waiting_for_approval`; approval-center decisions remove handled rows; memory decisions persist visible state; project creation opens the named project; settings/export/review actions all acknowledge completion or display adapter errors.
+- Native general tasks reuse the existing worker `CodexAppServerClient` and `GeneralTaskManager`. The UI receives App Server assistant deltas, completion, terminal error, token usage, approval, and user-input updates through a task subscription.
+- Approval and input responses use the actual App Server JSON-RPC request ID. UI `approve` maps to protocol `accept`, UI `decline` maps to `decline`, and no code path sends request ID `0`.
+- Adapter-owned initial state supplies account, runtime, projects, approvals, and memories. Native missing capabilities render unavailable/empty states; demo content and successful demo mutations are explicitly labelled.
+- A single reducer owns selected project ID, project goal/name, workflow stage, five page states, approval list, memory decisions, and mutation tokens. This state survives route remounts.
+- Page approval updates the approved/current/pending sequence. Page 5 remains page 5 and enters `conversion`/export-ready. Reopening an earlier page clears impossible later completion. Stage history clicks do not mutate the authoritative current stage.
+- Project creation requires and preserves both name and goal; project rows select by ID; rename calls the adapter and updates the store.
+- PPT approve/regenerate/reopen, export, rename, approval-center, and memory mutations expose pending state. Reducer tokens reject stale PPT/memory responses.
+- The workspace skip link resolves to `main#main-content`. Compact tabs use tablist/tab/tabpanel relationships, roving `tabIndex`, ArrowLeft/ArrowRight/Home/End selection, and focus movement.
+- The compact workspace breakpoint is `<=955px`; `>=956px` retains the three-column shell. This removes the 900–955px minimum-column clipping while preserving the mid-size desktop layout where it fits.
+- The HTML document declares `lang="zh-CN"` and the Chinese title `分身工作台`.
 
 ## TDD evidence
 
-The inherited worktree already contained an uncommitted partial UI when this task was resumed. Its first focused run was green (17/17), while baseline commit `4ab5433` contains only the placeholder `Digital Twin Workbench` entry and no `App.tsx`, so the supplied UI suite is absent/failing against the baseline.
-
-New behavior was then developed with fresh RED/GREEN cycles:
-
-| Behavior | RED evidence | GREEN evidence |
+| Cycle | RED | GREEN |
 | --- | --- | --- |
-| General-task approval advances real UI state | focused desktop run: 1/20 failed because the `批准继续` control remained present | focused run: 20/20 passed after updating task status/transcript and visible notice |
-| Compact PPT panel tabs | focused desktop run: 1/21 failed because no `幻灯片画布` tab existed | focused run: 21/21 passed after workflow/canvas/review tab state was added |
-| Navigation, project creation, regenerate/approve, memory decision, adapter error, export acknowledgement, approval center, and settings | component suite exercises the real `App` and demo adapter | final desktop suite: 21/21 passed across 3 files |
+| Native App Server bridge | 4/4 scripted native tests failed because `createTauriDesktopAdapter` and the event bridge did not exist | 4/4 pass for streaming/completion/usage/error, real string and number request IDs, accept/decline mapping, and user-input answers |
+| Single PPT/store state machine | focused suite failed to load the absent `workbench-store` module | 4/4 reducer tests pass for page-5 conversion, reopen rollback, stale PPT/memory tokens, goal preservation, and project-ID selection |
+| UI integration | existing project tests failed after goal became required, exposing the outdated test path | updated integration suite is 16/16 and covers required goal, route persistence, real rename, page-5 conversion, pending deduplication, ARIA tabs, skip target, and native unavailable state |
 
-## Browser visual and interaction QA
+Final desktop suite: 35/35 across transport, native adapter, reducer, development server, and rendered UI tests.
 
-Target flow: app loads → dashboard renders → PPT project opens → regenerate and approve advance the slide → narrow-window tabs expose workflow/canvas/review without overflow.
+## Browser QA
 
-- Browser path: Codex in-app Browser at `http://127.0.0.1:1420/`; no Playwright fallback.
-- Viewports: 1536×1024 concept-native, 1440×960 desktop baseline, 820×900 compact workspace, and 390×844 mobile dashboard.
-- Page identity and non-blank content passed. No framework overlay or console warning/error was observed.
-- 1440px PPT column widths measured `190 / 740 / 310`; document `scrollWidth` equaled `clientWidth`.
-- 1536px and 1440px checks confirmed both the slide business content and approve-next button fit their visible regions.
-- 820px confirmed only the selected workflow/canvas/review panel is displayed and the document has no horizontal overflow.
-- 390px confirmed stacked dashboard activity content and no page-level horizontal overflow.
-- Keyboard proof: the skip link received a solid 3px focus outline; mobile icon-only navigation retains accessible names.
-- Interaction proof: regenerate produced `已生成候选版本`; approve-next produced `已批准，进入第 4 页` and changed the pager to `04 / 05`.
+Flow: `#/workspace` → inspect responsive shell → switch to the review tab → approve page 3 → observe page 4.
 
-### Fidelity ledger
-
-| Comparison point | Result |
-| --- | --- |
-| Dashboard shell, navigation order, hero copy, quick rows, recent-work table, and right activity rail | Matches the accepted dashboard concept and allowed copy |
-| Palette, borders, typography, button hierarchy, and outline icon treatment | Matches the design system; no gradients, glow, emoji, or component-library language |
-| PPT header, fixed workflow stages, slide list, selected states, sources, progress timeline, comment field, and actions | Matches the accepted workspace concept |
-| Slide preview | Kept strictly 16:9 per the task brief; code-native metrics, insights, bars, and trend line remain editable UI rather than a baked screenshot |
-| Responsive behavior | Adds the required compact three-tab presentation while retaining the desktop three-column concept |
-
-Material browser findings fixed during QA: the mobile workspace sidebar was incorrectly held at `100vh`; hidden mobile navigation labels removed accessible names; route changes retained stale scroll; desktop slide content and approve-next initially clipped; and compact PPT panels initially stacked into one long page.
+- Browser path: Browser plugin controlling the available Chromium session at `http://127.0.0.1:1420/`; no fallback.
+- Page identity: URL and Chinese title matched; meaningful PPT content rendered; no framework overlay.
+- Console: zero relevant warnings/errors.
+- Viewports: 1440×900, 955×900, 900×900, 820×900, and 390×900; extra boundary probes at 901 and 1279.
+- Horizontal overflow: at every measured width, `documentElement.scrollWidth === clientWidth`.
+- 1440: full `190 / flexible canvas / 310`-style three-column workspace; all panel bounds remain within the viewport.
+- 955/900/820/390: compact tabs render and only the selected panel is visible; canvas and review remain usable.
+- 901 uses compact mode without clipping. 1279 uses the full three-column mode without overflow.
+- Interaction: review tab became selected/visible; approve-next returned `已批准，进入第 4 页`; the console remained clean.
 
 ## Fresh verification
 
-- Desktop gate: `pnpm --filter @digital-twin/desktop typecheck && pnpm --filter @digital-twin/desktop lint && pnpm --filter @digital-twin/desktop test && pnpm --filter @digital-twin/desktop build` → exit 0; 21/21 tests and Vite production build passed.
-- Repository typecheck: `pnpm typecheck` → exit 0 for core, worker, and desktop.
-- Repository lint: `pnpm lint` → exit 0 with zero warnings.
-- Repository tests: `pnpm test` → exit 0; core 8/8, worker 147/147, desktop 21/21, Rust integration tests 13/13 plus unit/doc suites.
-- Browser console at all tested viewports: zero relevant warnings/errors.
-- `git diff --check` → exit 0 before report creation and is rerun before commit.
+- Desktop: `pnpm --filter @digital-twin/desktop test` → 35/35; `lint` → zero warnings; `build` → Vite production build exit 0.
+- Repository: `pnpm typecheck` and `pnpm lint` → exit 0 for core, worker, and desktop.
+- Repository tests: core 8/8, worker 147/147, desktop 35/35, Rust integration 13/13 plus unit/doc suites.
+- `git diff --check` → exit 0.
 
-## Residual boundary
+## Boundary
 
-Browser QA intentionally uses labeled demo data and does not claim that future PPT/memory/settings Tauri commands already exist. In a Tauri build, an unavailable command is reported to the user as an error through the adapter boundary. Account and general-task transport use the existing Codex App Server command surface. Native macOS visual smoke and final controller screenshots remain release-level follow-ups; the full browser-rendered UI and repository code gates are complete here.
+Native PPT/approval/memory/settings commands remain explicit future Tauri command surfaces. When a command or native data-loading capability is absent, the production UI shows unavailable/empty state or the propagated command error; it does not substitute demo success. Browser QA intentionally exercises the labelled demo adapter and does not claim native IPC persistence.

@@ -1,6 +1,14 @@
 import { invoke } from '@tauri-apps/api/core';
+import {
+  CodexAppServerClient,
+  type AppServerTransport,
+  type JsonRpcMessage,
+} from '../../worker/src/app-server.js';
+import { GeneralTaskManager, type GeneralTask } from '../../worker/src/general-tasks.js';
 import { TauriCodexTransport } from './codex-transport.js';
 
+export type NativeAppServerTransport = AppServerTransport;
+export type NativeJsonRpcMessage = JsonRpcMessage;
 export type DesktopAdapterMode = 'demo' | 'tauri';
 
 export interface AccountSummary {
@@ -8,363 +16,328 @@ export interface AccountSummary {
   plan: string | null;
   status: 'connected' | 'logged_out' | 'unavailable';
 }
-
 export interface ProjectSummary {
   id: string;
   name: string;
+  goal: string;
   stage: string;
   progress: number;
   updatedAt: string;
 }
-
+export interface ApprovalSummary {
+  id: string;
+  title: string;
+  detail: string;
+  author: string;
+  time: string;
+}
+export interface MemorySummary {
+  id: string;
+  title: string;
+  content: string;
+  status: string;
+}
+export interface RuntimeSummary {
+  status: 'connected' | 'unavailable';
+  detail: string;
+  model: string | null;
+  address: string | null;
+  uptime: string | null;
+  queue: number | null;
+}
+export interface DesktopInitialState {
+  account: AccountSummary;
+  projects: ProjectSummary[];
+  approvals: ApprovalSummary[];
+  memories: MemorySummary[];
+  runtime: RuntimeSummary;
+}
+export interface PendingTaskInteraction {
+  requestId: number | string;
+  kind: 'command_approval' | 'file_change_approval' | 'user_input';
+  params: unknown;
+}
 export interface TaskSummary {
   id: string;
   prompt: string;
-  status:
-    | 'running'
-    | 'waiting_for_approval'
-    | 'waiting_for_input'
-    | 'completed'
-    | 'failed';
+  status: 'running' | 'waiting_for_approval' | 'waiting_for_input' | 'completed' | 'failed' | 'interrupted';
   transcript: Array<{ role: 'user' | 'assistant'; text: string }>;
   usage: string;
+  pendingInteraction: PendingTaskInteraction | null;
+  error: string | null;
 }
-
-export interface RegenerateResult {
-  status: string;
-  selectedSlide: number;
-}
-
+export interface RegenerateResult { status: string; selectedSlide: number }
 export interface ApprovalResult {
   status: string;
   nextSlide: number;
+  stage?: string;
+  exportReady?: boolean;
 }
+export interface CreateProjectInput { name: string; goal: string }
 
 export interface DesktopAdapter {
   readonly mode: DesktopAdapterMode;
+  readonly initialState: DesktopInitialState;
   connectAccount(): Promise<AccountSummary>;
   startLogin(): Promise<{ message: string }>;
   startTask(prompt: string): Promise<TaskSummary>;
-  respondToTask(decision: 'approve' | 'decline'): Promise<{ status: string }>;
-  createProject(name: string): Promise<ProjectSummary>;
-  regenerateSlide(
-    projectId: string,
-    slide: number,
-    comment: string,
-  ): Promise<RegenerateResult>;
-  approveSlide(
-    projectId: string,
-    slide: number,
-    comment: string,
-  ): Promise<ApprovalResult>;
+  subscribeTask(taskId: string, listener: (task: TaskSummary) => void): () => void;
+  respondToTask(taskId: string, decision: 'approve' | 'decline'): Promise<{ status: string }>;
+  respondToTaskInput(taskId: string, answers: Record<string, string[]>): Promise<{ status: string }>;
+  createProject(input: CreateProjectInput): Promise<ProjectSummary>;
+  renameProject(projectId: string, name: string): Promise<{ status: string }>;
+  regenerateSlide(projectId: string, slide: number, comment: string): Promise<RegenerateResult>;
+  approveSlide(projectId: string, slide: number, comment: string): Promise<ApprovalResult>;
   reopenSlide(projectId: string, slide: number): Promise<{ status: string }>;
   exportProject(projectId: string, name: string): Promise<{ message: string }>;
-  decideMemory(
-    proposalId: string,
-    decision: 'approved' | 'rejected',
-  ): Promise<{ status: string }>;
-  saveSettings(input: {
-    workspacePath: string;
-    codexPath: string;
-  }): Promise<{ status: string }>;
+  decideApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }>;
+  decideMemory(proposalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }>;
+  saveSettings(input: { workspacePath: string; codexPath: string }): Promise<{ status: string }>;
 }
 
 export interface DemoAdapterOptions {
   createProjectError?: string;
+  delays?: Partial<Record<'approveSlide' | 'regenerateSlide' | 'decideMemory', number>>;
 }
 
-export function createDemoDesktopAdapter(
-  options: DemoAdapterOptions = {},
-): DesktopAdapter {
-  let counter = 1;
+const demoInitialState: DesktopInitialState = {
+  account: { email: 'demo@workbench.local', plan: 'Plus', status: 'connected' },
+  runtime: {
+    status: 'connected', detail: '演示服务（非本地 Codex）', model: 'demo-codex',
+    address: '演示数据', uptime: '当前会话', queue: 0,
+  },
+  projects: [
+    {
+      id: 'ppt-demo-001', name: '年度经营复盘与增长计划',
+      goal: '向管理层复盘年度经营结果并说明下一年度增长计划。',
+      stage: '视觉审批', progress: 60, updatedAt: '今天 14:29',
+    },
+    {
+      id: 'ppt-demo-002', name: '智能家居产品发布会',
+      goal: '向媒体和渠道伙伴介绍智能家居新品与上市计划。',
+      stage: '视觉审批', progress: 42, updatedAt: '昨天 16:43',
+    },
+  ],
+  approvals: [
+    { id: 'approval-1', title: '智能家居产品发布会', detail: '内容大纲待审批', author: '张三', time: '10 分钟前' },
+    { id: 'approval-2', title: '年度工作总结汇报', detail: '最终稿待审批', author: '李四', time: '2 小时前' },
+    { id: 'approval-3', title: '市场推广方案', detail: '内容修改待审批', author: '王五', time: '昨天 18:32' },
+  ],
+  memories: [
+    { id: 'memory-chart', title: '图表优先', content: '在经营复盘类 PPT 中，优先使用趋势图和对比图呈现关键数据。', status: '待决定' },
+    { id: 'memory-tone', title: '中文简洁表述', content: '报告文本采用简洁、直接的中文表达，并保留关键事实来源。', status: '待决定' },
+  ],
+};
 
+const nativeInitialState: DesktopInitialState = {
+  account: { email: null, plan: null, status: 'unavailable' },
+  runtime: { status: 'unavailable', detail: '尚未从本地服务读取', model: null, address: null, uptime: null, queue: null },
+  projects: [], approvals: [], memories: [],
+};
+
+export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): DesktopAdapter {
+  let counter = 1;
+  const tasks = new Map<string, TaskSummary>();
+  const listeners = new Map<string, Set<(task: TaskSummary) => void>>();
+  const delay = async (key: keyof NonNullable<DemoAdapterOptions['delays']>) => {
+    const milliseconds = options.delays?.[key] ?? 0;
+    if (milliseconds > 0) await new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+  };
   return {
     mode: 'demo',
-    async connectAccount() {
-      return {
-        email: 'demo@workbench.local',
-        plan: 'Plus',
-        status: 'connected',
-      };
-    },
-    async startLogin() {
-      return { message: '演示数据：浏览器登录流程已准备好。' };
-    },
+    initialState: structuredClone(demoInitialState),
+    async connectAccount() { return structuredClone(demoInitialState.account); },
+    async startLogin() { return { message: '演示数据：浏览器登录流程已准备好。' }; },
     async startTask(prompt) {
-      return {
-        id: `demo-task-${counter++}`,
-        prompt,
-        status: 'waiting_for_approval',
+      const task: TaskSummary = {
+        id: `demo-task-${counter++}`, prompt, status: 'waiting_for_approval',
         transcript: [
           { role: 'user', text: prompt },
-          {
-            role: 'assistant',
-            text: '我已分析任务范围，准备写入项目说明，等待你的批准。',
-          },
+          { role: 'assistant', text: '演示响应：已分析任务范围，等待你的批准。' },
         ],
         usage: '2.6K / 5.0K tokens',
+        pendingInteraction: { requestId: `demo-approval-${counter}`, kind: 'command_approval', params: {} },
+        error: null,
       };
+      tasks.set(task.id, task);
+      return cloneTask(task);
     },
-    async respondToTask(decision) {
-      return {
-        status:
-          decision === 'approve'
-            ? '已批准，Codex 正在继续执行。'
-            : '已拒绝，任务保持为草稿。',
-      };
+    subscribeTask(taskId, listener) {
+      const taskListeners = listeners.get(taskId) ?? new Set();
+      taskListeners.add(listener);
+      listeners.set(taskId, taskListeners);
+      const current = tasks.get(taskId);
+      if (current) listener(cloneTask(current));
+      return () => taskListeners.delete(listener);
     },
-    async createProject(name) {
-      if (options.createProjectError)
-        throw new Error(options.createProjectError);
-      return {
-        id: `ppt-demo-${counter++}`,
-        name,
-        stage: '材料',
-        progress: 10,
-        updatedAt: '刚刚',
-      };
+    async respondToTask(taskId, decision) {
+      const task = tasks.get(taskId);
+      if (!task?.pendingInteraction || task.pendingInteraction.kind === 'user_input') throw new Error('Task is not waiting for an approval');
+      task.pendingInteraction = null;
+      task.status = decision === 'approve' ? 'running' : 'failed';
+      const status = decision === 'approve'
+        ? '演示数据：已批准，Codex 正在继续执行。'
+        : '演示数据：已拒绝，任务保持为草稿。';
+      task.transcript.push({ role: 'assistant', text: status });
+      for (const listener of listeners.get(taskId) ?? []) listener(cloneTask(task));
+      return { status };
     },
+    async respondToTaskInput(taskId) {
+      const task = tasks.get(taskId);
+      if (task?.pendingInteraction?.kind !== 'user_input') throw new Error('Task is not waiting for user input');
+      task.pendingInteraction = null;
+      task.status = 'running';
+      return { status: '演示数据：已提交补充信息。' };
+    },
+    async createProject(input) {
+      if (options.createProjectError) throw new Error(options.createProjectError);
+      return { id: `ppt-demo-${counter++}`, name: input.name, goal: input.goal, stage: '材料', progress: 10, updatedAt: '刚刚' };
+    },
+    async renameProject(_projectId, name) { return { status: `演示数据：项目已重命名为“${name}”。` }; },
     async regenerateSlide(_projectId, slide) {
+      await delay('regenerateSlide');
       return { status: '已生成候选版本', selectedSlide: slide };
     },
     async approveSlide(_projectId, slide) {
-      return { status: `已批准，进入第 ${slide + 1} 页`, nextSlide: slide + 1 };
+      await delay('approveSlide');
+      return slide >= 5
+        ? { status: '第 5 页已批准，进入可编辑转换。', nextSlide: 5, stage: 'conversion', exportReady: true }
+        : { status: `已批准，进入第 ${slide + 1} 页`, nextSlide: slide + 1 };
     },
-    async reopenSlide(_projectId, slide) {
-      return { status: `第 ${slide} 页已重新打开，等待修改。` };
-    },
-    async exportProject(_projectId, name) {
-      return { message: `演示数据：已准备好“${name}.pptx”导出。` };
-    },
+    async reopenSlide(_projectId, slide) { return { status: `第 ${slide} 页已重新打开，等待修改。` }; },
+    async exportProject(_projectId, name) { return { message: `演示数据：已准备好“${name}.pptx”导出。` }; },
+    async decideApproval(_approvalId, decision) { return { status: `演示数据：${decision === 'approved' ? '已批准' : '已驳回'}已记录。` }; },
     async decideMemory(_proposalId, decision) {
+      await delay('decideMemory');
       return { status: decision === 'approved' ? '已批准' : '已拒绝' };
     },
-    async saveSettings() {
-      return { status: '演示数据：设置已保存在当前浏览器会话。' };
-    },
+    async saveSettings() { return { status: '演示数据：设置已保存在当前浏览器会话。' }; },
   };
 }
 
-interface JsonRpcMessage {
-  id?: number;
-  result?: unknown;
-  error?: { message?: string };
-}
-
-class TauriAppServerSession {
-  private readonly transport = new TauriCodexTransport(null);
-  private readonly pending = new Map<
-    number,
-    { resolve: (value: unknown) => void; reject: (reason: Error) => void }
-  >();
-  private nextId = 1;
-  private started = false;
-  private unlisten: (() => void) | null = null;
-
-  async connect(): Promise<void> {
-    if (this.started) return;
-    this.unlisten = this.transport.onLine((line) => this.receive(line));
-    await this.transport.start();
-    await this.request('initialize', {
-      clientInfo: {
-        name: 'digital-twin-workbench',
-        title: 'Digital Twin Workbench',
-        version: '0.1.0',
-      },
-      capabilities: { experimentalApi: false, requestAttestation: false },
-    });
-    await this.transport.send(JSON.stringify({ method: 'initialized' }));
-    this.started = true;
-  }
-
-  async request<T>(
-    method: string,
-    params: Record<string, unknown>,
-  ): Promise<T> {
-    const id = this.nextId++;
-    const response = new Promise<T>((resolve, reject) => {
-      this.pending.set(id, {
-        resolve: (value) => resolve(value as T),
-        reject,
-      });
-    });
-    await this.transport.send(JSON.stringify({ id, method, params }));
-    return response;
-  }
-
-  async respond(id: number, result: unknown): Promise<void> {
-    await this.transport.send(JSON.stringify({ id, result }));
-  }
-
-  dispose(): void {
-    this.unlisten?.();
-    this.unlisten = null;
-    for (const pending of this.pending.values())
-      pending.reject(new Error('Codex App Server connection closed'));
-    this.pending.clear();
-    void this.transport.dispose();
-  }
-
-  private receive(line: string): void {
-    let message: JsonRpcMessage;
-    try {
-      message = JSON.parse(line) as JsonRpcMessage;
-    } catch {
-      return;
-    }
-    if (message.id === undefined) return;
-    const pending = this.pending.get(message.id);
-    if (!pending) return;
-    this.pending.delete(message.id);
-    if (message.error)
-      pending.reject(
-        new Error(message.error.message ?? 'Codex App Server request failed'),
-      );
-    else pending.resolve(message.result);
-  }
-}
+type NativeCommandInvoker = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 
 class TauriDesktopAdapter implements DesktopAdapter {
   readonly mode = 'tauri' as const;
-  private readonly session = new TauriAppServerSession();
+  readonly initialState = structuredClone(nativeInitialState);
+  private readonly client: CodexAppServerClient;
+  private readonly tasks: GeneralTaskManager;
+  private readonly taskIds = new Set<string>();
+  private readonly taskPrompts = new Map<string, string>();
+  private readonly listeners = new Map<string, Set<(task: TaskSummary) => void>>();
+  private taskCounter = 1;
+
+  constructor(transport: NativeAppServerTransport, private readonly nativeInvoke: NativeCommandInvoker) {
+    this.client = new CodexAppServerClient(transport);
+    this.tasks = new GeneralTaskManager(this.client);
+    this.client.onServerMessage((message) => {
+      const params = asRecord(message.params);
+      const threadId = typeof params?.threadId === 'string' ? params.threadId : null;
+      if (threadId) this.publishThread(threadId);
+    });
+    this.client.onExit(() => this.publishAll());
+  }
 
   async connectAccount(): Promise<AccountSummary> {
-    await this.session.connect();
-    const response = await this.session.request<{
-      account: {
-        type?: string;
-        email?: string | null;
-        planType?: string;
-      } | null;
-    }>('account/read', {
-      refreshToken: false,
-    });
-    if (response.account?.type === 'chatgpt') {
-      return {
-        email: response.account.email ?? null,
-        plan: response.account.planType ?? null,
-        status: 'connected',
-      };
-    }
-    return { email: null, plan: null, status: 'logged_out' };
+    await this.client.connect();
+    const account = await this.client.readAccount();
+    return account
+      ? { email: account.email, plan: account.planType, status: 'connected' }
+      : { email: null, plan: null, status: 'logged_out' };
   }
-
   async startLogin(): Promise<{ message: string }> {
-    await this.session.connect();
-    const response = await this.session.request<{ authUrl?: string }>(
-      'account/login/start',
-      {
-        type: 'chatgpt',
-        useHostedLoginSuccessPage: true,
-        appBrand: 'chatgpt',
-      },
-    );
-    return {
-      message: response.authUrl
-        ? `已发起登录，请在浏览器中继续：${response.authUrl}`
-        : '已发起 Codex 登录流程。',
-    };
+    await this.client.connect();
+    const response = await this.client.startChatGptLogin();
+    return { message: `已发起登录，请在浏览器中继续：${response.authUrl}` };
   }
-
   async startTask(prompt: string): Promise<TaskSummary> {
-    await this.session.connect();
-    const thread = await this.session.request<{ thread: { id: string } }>(
-      'thread/start',
-      {
-        cwd: '.',
-        approvalPolicy: 'on-request',
-        sandbox: 'workspace-write',
-      },
-    );
-    await this.session.request<{ turn: { id: string } }>('turn/start', {
-      threadId: thread.thread.id,
-      input: [{ type: 'text', text: prompt, text_elements: [] }],
-    });
+    await this.client.connect();
+    const id = `desktop-task-${this.taskCounter++}`;
+    const task = await this.tasks.startTask({ id, cwd: '.', prompt, createdAt: new Date().toISOString() });
+    this.taskIds.add(id);
+    this.taskPrompts.set(id, prompt);
+    return this.toTaskSummary(task);
+  }
+  subscribeTask(taskId: string, listener: (task: TaskSummary) => void): () => void {
+    const taskListeners = this.listeners.get(taskId) ?? new Set();
+    taskListeners.add(listener);
+    this.listeners.set(taskId, taskListeners);
+    const current = this.tasks.getTask(taskId);
+    if (current) listener(this.toTaskSummary(current));
+    return () => taskListeners.delete(listener);
+  }
+  async respondToTask(taskId: string, decision: 'approve' | 'decline'): Promise<{ status: string }> {
+    await this.tasks.respondToApproval(taskId, decision === 'approve' ? 'accept' : 'decline');
+    this.publish(taskId);
+    return { status: decision === 'approve' ? '已批准，Codex 正在继续执行。' : '已拒绝该执行请求。' };
+  }
+  async respondToTaskInput(taskId: string, answers: Record<string, string[]>): Promise<{ status: string }> {
+    await this.tasks.respondToUserInput(taskId, answers);
+    this.publish(taskId);
+    return { status: '已提交补充信息，Codex 正在继续执行。' };
+  }
+  createProject(input: CreateProjectInput): Promise<ProjectSummary> { return this.callNative('ppt_create_project', { input }); }
+  renameProject(projectId: string, name: string): Promise<{ status: string }> { return this.callNative('ppt_rename_project', { projectId, name }); }
+  regenerateSlide(projectId: string, slide: number, comment: string): Promise<RegenerateResult> { return this.callNative('ppt_regenerate_slide', { projectId, slide, comment }); }
+  approveSlide(projectId: string, slide: number, comment: string): Promise<ApprovalResult> { return this.callNative('ppt_approve_slide', { projectId, slide, comment }); }
+  reopenSlide(projectId: string, slide: number): Promise<{ status: string }> { return this.callNative('ppt_reopen_slide', { projectId, slide }); }
+  exportProject(projectId: string, name: string): Promise<{ message: string }> { return this.callNative('ppt_export_project', { projectId, name }); }
+  decideApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }> { return this.callNative('approval_decide', { approvalId, decision }); }
+  decideMemory(proposalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }> { return this.callNative('memory_decide', { proposalId, decision }); }
+  saveSettings(input: { workspacePath: string; codexPath: string }): Promise<{ status: string }> { return this.callNative('save_desktop_settings', input); }
+
+  private callNative<T>(command: string, args: Record<string, unknown>): Promise<T> { return this.nativeInvoke(command, args) as Promise<T>; }
+  private publishThread(threadId: string): void {
+    for (const taskId of this.taskIds) if (this.tasks.getTask(taskId)?.threadId === threadId) this.publish(taskId);
+  }
+  private publishAll(): void { for (const taskId of this.taskIds) this.publish(taskId); }
+  private publish(taskId: string): void {
+    const task = this.tasks.getTask(taskId);
+    if (!task) return;
+    const summary = this.toTaskSummary(task);
+    for (const listener of this.listeners.get(taskId) ?? []) listener(summary);
+  }
+  private toTaskSummary(task: GeneralTask): TaskSummary {
+    const status: TaskSummary['status'] =
+      task.status === 'queued' ||
+      task.status === 'ready' ||
+      task.status === 'recovering'
+        ? 'running'
+        : task.status === 'cancelled'
+          ? 'failed'
+          : task.status;
     return {
-      id: thread.thread.id,
-      prompt,
-      status: 'running',
-      transcript: [
-        { role: 'user', text: prompt },
-        { role: 'assistant', text: '任务已发送至本地 Codex App Server。' },
-      ],
-      usage: '等待 App Server 使用量更新',
+      id: task.id,
+      prompt: this.taskPrompts.get(task.id) ?? task.transcript[0]?.text ?? '',
+      status,
+      transcript: task.transcript.map(({ role, text }) => ({ role, text })),
+      usage: formatUsage(task.tokenUsage),
+      pendingInteraction: task.pendingInteraction ? { ...task.pendingInteraction } : null,
+      error: task.error,
     };
-  }
-
-  async respondToTask(
-    decision: 'approve' | 'decline',
-  ): Promise<{ status: string }> {
-    await this.session.respond(0, { decision });
-    return { status: '已将任务决定发送到 Codex App Server。' };
-  }
-
-  async createProject(name: string): Promise<ProjectSummary> {
-    return this.callPptCommand('ppt_create_project', { name });
-  }
-
-  async regenerateSlide(
-    projectId: string,
-    slide: number,
-    comment: string,
-  ): Promise<RegenerateResult> {
-    return this.callPptCommand('ppt_regenerate_slide', {
-      projectId,
-      slide,
-      comment,
-    });
-  }
-
-  async approveSlide(
-    projectId: string,
-    slide: number,
-    comment: string,
-  ): Promise<ApprovalResult> {
-    return this.callPptCommand('ppt_approve_slide', {
-      projectId,
-      slide,
-      comment,
-    });
-  }
-
-  async reopenSlide(
-    projectId: string,
-    slide: number,
-  ): Promise<{ status: string }> {
-    return this.callPptCommand('ppt_reopen_slide', { projectId, slide });
-  }
-
-  async exportProject(
-    projectId: string,
-    name: string,
-  ): Promise<{ message: string }> {
-    return this.callPptCommand('ppt_export_project', { projectId, name });
-  }
-
-  async decideMemory(
-    proposalId: string,
-    decision: 'approved' | 'rejected',
-  ): Promise<{ status: string }> {
-    return this.callPptCommand('memory_decide', { proposalId, decision });
-  }
-
-  async saveSettings(input: {
-    workspacePath: string;
-    codexPath: string;
-  }): Promise<{ status: string }> {
-    return this.callPptCommand('save_desktop_settings', input);
-  }
-
-  private callPptCommand<T>(
-    command: string,
-    args: Record<string, unknown>,
-  ): Promise<T> {
-    return invoke<T>(command, args);
   }
 }
 
+export function createTauriDesktopAdapter(
+  transport: NativeAppServerTransport = new TauriCodexTransport(null),
+  nativeInvoke: NativeCommandInvoker = (command, args) => invoke(command, args),
+): DesktopAdapter {
+  return new TauriDesktopAdapter(transport, nativeInvoke);
+}
 export function createDesktopAdapter(): DesktopAdapter {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
-    ? new TauriDesktopAdapter()
+    ? createTauriDesktopAdapter()
     : createDemoDesktopAdapter();
+}
+
+function formatUsage(usage: Record<string, unknown> | null): string {
+  const total = asRecord(usage?.total);
+  const tokens = typeof total?.totalTokens === 'number' ? total.totalTokens : null;
+  const context = typeof usage?.modelContextWindow === 'number' ? usage.modelContextWindow : null;
+  if (tokens === null) return '等待 App Server 使用量更新';
+  return context === null ? `${tokens} tokens` : `${tokens} / ${context} tokens`;
+}
+function cloneTask(task: TaskSummary): TaskSummary { return structuredClone(task); }
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;
 }

@@ -1,10 +1,26 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
+import {
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent,
+  type ReactNode,
+} from 'react';
 import {
   createDesktopAdapter,
+  type ApprovalSummary,
   type DesktopAdapter,
-  type ProjectSummary,
   type TaskSummary,
 } from './desktop-adapter.js';
+import {
+  createWorkbenchState,
+  workbenchReducer,
+  type WorkbenchAction,
+  type WorkbenchMemory,
+  type WorkbenchProject,
+  type WorkbenchState,
+} from './workbench-store.js';
 import './styles.css';
 
 type Route =
@@ -40,71 +56,6 @@ const workspaceStages = [
   ['qa', '质量检查'],
 ] as const;
 
-const recentWork = [
-  {
-    icon: 'sparkle' as const,
-    name: '市场调研分析报告',
-    subtitle: '生成 2024 年智能硬件行业市场调研分析',
-    type: '通用任务',
-    stage: '生成结果',
-    status: '进行中',
-    progress: 65,
-    updatedAt: '今天 09:18',
-  },
-  {
-    icon: 'file' as const,
-    name: '智能家居产品发布会',
-    subtitle: '新品发布会演示文稿',
-    type: 'PPT 项目',
-    stage: '内容生成',
-    status: '进行中',
-    progress: 42,
-    updatedAt: '昨天 16:43',
-  },
-  {
-    icon: 'file' as const,
-    name: '年度工作总结汇报',
-    subtitle: '2024 年度工作总结与 2025 年计划',
-    type: 'PPT 项目',
-    stage: '设计排版',
-    status: '排版中',
-    progress: 78,
-    updatedAt: '昨天 11:07',
-  },
-];
-
-const approvalItems = [
-  {
-    id: 'approval-1',
-    title: '智能家居产品发布会',
-    detail: '内容大纲待审批',
-    author: '张三',
-    time: '10 分钟前',
-  },
-  {
-    id: 'approval-2',
-    title: '年度工作总结汇报',
-    detail: '最终稿待审批',
-    author: '李四',
-    time: '2 小时前',
-  },
-  {
-    id: 'approval-3',
-    title: '市场推广方案',
-    detail: '内容修改待审批',
-    author: '王五',
-    time: '昨天 18:32',
-  },
-];
-
-const defaultProject: ProjectSummary = {
-  id: 'ppt-demo-001',
-  name: '年度经营复盘与增长计划',
-  stage: '视觉审批',
-  progress: 60,
-  updatedAt: '今天 14:29',
-};
-
 export function App({
   adapter = createDesktopAdapter(),
   initialRoute,
@@ -115,15 +66,29 @@ export function App({
   const [route, setRoute] = useState<Route>(
     () => initialRoute ?? routeFromHash() ?? 'dashboard',
   );
-  const [project, setProject] = useState<ProjectSummary>(defaultProject);
+  const [workbench, dispatch] = useReducer(
+    workbenchReducer,
+    adapter.initialState,
+    createWorkbenchState,
+  );
   const [task, setTask] = useState<TaskSummary | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
+  const mutationCounter = useRef(0);
+  const selectedProject =
+    workbench.projects.find(
+      (project) => project.id === workbench.selectedProjectId,
+    ) ?? null;
 
   useEffect(() => {
     const onPopState = () => setRoute(routeFromHash() ?? 'dashboard');
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
+
+  useEffect(() => {
+    if (!task) return;
+    return adapter.subscribeTask(task.id, setTask);
+  }, [adapter, task?.id]);
 
   const navigate = (next: Route) => {
     setNotice(null);
@@ -150,37 +115,75 @@ export function App({
     route === 'workspace' ? (
       <div className="workspace-app">
         <Sidebar adapter={adapter} route="projects" navigate={navigate} />
-        <WorkspacePage
-          adapter={adapter}
-          project={project}
-          navigate={navigate}
-          report={report}
-        />
+        {selectedProject ? (
+          <WorkspacePage
+            adapter={adapter}
+            project={selectedProject}
+            dispatch={dispatch}
+            nextMutationToken={() => ++mutationCounter.current}
+            navigate={navigate}
+            report={report}
+          />
+        ) : (
+          <main id="main-content" className="workspace-unavailable">
+            <h1>项目工作台不可用</h1>
+            <p>本地适配器尚未提供任何项目，请返回项目列表重试。</p>
+            <button className="button button-primary" onClick={() => navigate('projects')}>
+              返回 PPT 项目
+            </button>
+          </main>
+        )}
       </div>
     ) : (
       <AppShell adapter={adapter} route={route} navigate={navigate}>
-        {route === 'dashboard' && <DashboardPage navigate={navigate} />}
+        {route === 'dashboard' && (
+          <DashboardPage workbench={workbench} navigate={navigate} />
+        )}
         {route === 'tasks' && (
           <TasksPage
             adapter={adapter}
             task={task}
             setTask={setTask}
+            account={workbench.account}
+            dispatch={dispatch}
             report={report}
           />
         )}
         {route === 'projects' && (
           <ProjectsPage
             adapter={adapter}
-            project={project}
-            setProject={setProject}
+            projects={workbench.projects}
+            dispatch={dispatch}
             navigate={navigate}
             report={report}
           />
         )}
-        {route === 'approvals' && <ApprovalsPage report={report} />}
-        {route === 'memory' && <MemoryPage adapter={adapter} report={report} />}
+        {route === 'approvals' && (
+          <ApprovalsPage
+            adapter={adapter}
+            items={workbench.approvals}
+            pending={workbench.pendingApprovals}
+            dispatch={dispatch}
+            nextMutationToken={() => ++mutationCounter.current}
+            report={report}
+          />
+        )}
+        {route === 'memory' && (
+          <MemoryPage
+            adapter={adapter}
+            memory={workbench.memories}
+            dispatch={dispatch}
+            nextMutationToken={() => ++mutationCounter.current}
+            report={report}
+          />
+        )}
         {route === 'settings' && (
-          <SettingsPage adapter={adapter} report={report} />
+          <SettingsPage
+            adapter={adapter}
+            account={workbench.account}
+            runtime={workbench.runtime}
+            report={report}
+          />
         )}
       </AppShell>
     );
@@ -275,7 +278,13 @@ function Sidebar({
   );
 }
 
-function DashboardPage({ navigate }: { navigate: (route: Route) => void }) {
+function DashboardPage({
+  workbench,
+  navigate,
+}: {
+  workbench: WorkbenchState;
+  navigate: (route: Route) => void;
+}) {
   return (
     <div className="dashboard-layout">
       <section className="dashboard-content">
@@ -329,20 +338,22 @@ function DashboardPage({ navigate }: { navigate: (route: Route) => void }) {
               <span>进度</span>
               <span>更新时间</span>
             </div>
-            {recentWork.map((item) => (
-              <div className="work-row" role="row" key={item.name}>
+            {workbench.projects.map((item) => (
+              <div className="work-row" role="row" key={item.id}>
                 <div className="work-name">
-                  <span className={`work-icon ${item.icon}`}>
-                    <Icon name={item.icon} />
+                  <span className="work-icon file">
+                    <Icon name="file" />
                   </span>
                   <span>
                     <strong>{item.name}</strong>
-                    <small>{item.subtitle}</small>
+                    <small>{item.goal}</small>
                   </span>
                 </div>
-                <span>{item.type}</span>
+                <span>PPT 项目</span>
                 <span>{item.stage}</span>
-                <span className="text-accent">{item.status}</span>
+                <span className="text-accent">
+                  {item.pendingMutation ? '处理中' : '进行中'}
+                </span>
                 <span className="progress-cell">
                   <Progress value={item.progress} />
                   <em>{item.progress}%</em>
@@ -350,6 +361,11 @@ function DashboardPage({ navigate }: { navigate: (route: Route) => void }) {
                 <span>{item.updatedAt}</span>
               </div>
             ))}
+            {!workbench.projects.length && (
+              <div className="empty-inline" role="row">
+                本地适配器尚未提供项目数据。
+              </div>
+            )}
           </div>
           <button
             className="text-action center-action"
@@ -359,12 +375,18 @@ function DashboardPage({ navigate }: { navigate: (route: Route) => void }) {
           </button>
         </section>
       </section>
-      <DashboardAside navigate={navigate} />
+      <DashboardAside workbench={workbench} navigate={navigate} />
     </div>
   );
 }
 
-function DashboardAside({ navigate }: { navigate: (route: Route) => void }) {
+function DashboardAside({
+  workbench,
+  navigate,
+}: {
+  workbench: WorkbenchState;
+  navigate: (route: Route) => void;
+}) {
   return (
     <aside className="dashboard-aside" aria-label="活动状态">
       <section aria-labelledby="pending-heading">
@@ -375,18 +397,21 @@ function DashboardAside({ navigate }: { navigate: (route: Route) => void }) {
           </button>
         </div>
         <div className="pending-list">
-          {approvalItems.map((item) => (
+          {workbench.approvals.map((item) => (
             <ApprovalRow key={item.id} item={item} />
           ))}
+          {!workbench.approvals.length && (
+            <p className="muted">当前没有从适配器加载到待处理审批。</p>
+          )}
         </div>
       </section>
       <section className="codex-status" aria-labelledby="codex-heading">
         <h2 id="codex-heading">Codex 连接状态</h2>
-        <p className="connected">
+        <p className={workbench.runtime.status === 'connected' ? 'connected' : 'muted'}>
           <span className="connection-dot" />
-          已连接
+          {workbench.runtime.status === 'connected' ? '已连接' : '不可用'}
         </p>
-        <p className="muted">Codex 本地服务运行中</p>
+        <p className="muted">{workbench.runtime.detail}</p>
         <button className="text-action" onClick={() => navigate('settings')}>
           查看详情
         </button>
@@ -396,28 +421,28 @@ function DashboardAside({ navigate }: { navigate: (route: Route) => void }) {
               <Icon name="cube" />
               模型
             </dt>
-            <dd>codex-1.0-local</dd>
+            <dd>{workbench.runtime.model ?? '未提供'}</dd>
           </div>
           <div>
             <dt>
               <Icon name="monitor" />
               服务地址
             </dt>
-            <dd>http://127.0.0.1:8080</dd>
+            <dd>{workbench.runtime.address ?? '未提供'}</dd>
           </div>
           <div>
             <dt>
               <Icon name="clock" />
               运行时间
             </dt>
-            <dd>2 天 4 小时</dd>
+            <dd>{workbench.runtime.uptime ?? '未提供'}</dd>
           </div>
           <div>
             <dt>
               <Icon name="queue" />
               队列任务
             </dt>
-            <dd>2</dd>
+            <dd>{workbench.runtime.queue ?? '未提供'}</dd>
           </div>
         </dl>
         <button
@@ -431,7 +456,7 @@ function DashboardAside({ navigate }: { navigate: (route: Route) => void }) {
   );
 }
 
-function ApprovalRow({ item }: { item: (typeof approvalItems)[number] }) {
+function ApprovalRow({ item }: { item: ApprovalSummary }) {
   return (
     <div className="approval-row">
       <Icon name="file" />
@@ -449,11 +474,15 @@ function TasksPage({
   adapter,
   task,
   setTask,
+  account,
+  dispatch,
   report,
 }: {
   adapter: DesktopAdapter;
   task: TaskSummary | null;
   setTask: (task: TaskSummary) => void;
+  account: WorkbenchState['account'];
+  dispatch: (action: WorkbenchAction) => void;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
@@ -461,8 +490,9 @@ function TasksPage({
   const [prompt, setPrompt] = useState(
     '请整理本周产品评审的结论，并输出行动清单。',
   );
-  const [account, setAccount] = useState('未检测');
+  const [inputAnswer, setInputAnswer] = useState('');
   const [isStarting, setIsStarting] = useState(false);
+  const [isResponding, setIsResponding] = useState(false);
 
   const start = async (event: FormEvent) => {
     event.preventDefault();
@@ -482,11 +512,7 @@ function TasksPage({
   const connect = async () => {
     try {
       const next = await adapter.connectAccount();
-      setAccount(
-        next.status === 'connected'
-          ? `${next.email ?? '已连接'} · ${next.plan ?? 'ChatGPT'}`
-          : '尚未登录',
-      );
+      dispatch({ type: 'account-updated', account: next });
     } catch (error) {
       await report(async () => {
         throw error;
@@ -495,21 +521,37 @@ function TasksPage({
   };
   const respond = async (decision: 'approve' | 'decline') => {
     if (!task) return;
+    setIsResponding(true);
     try {
-      const result = await adapter.respondToTask(decision);
-      setTask({
-        ...task,
-        status: decision === 'approve' ? 'running' : 'failed',
-        transcript: [
-          ...task.transcript,
-          { role: 'assistant', text: result.status },
-        ],
-      });
+      const result = await adapter.respondToTask(task.id, decision);
       await report(async () => result);
     } catch (error) {
       await report(async () => {
         throw error;
       });
+    } finally {
+      setIsResponding(false);
+    }
+  };
+  const answerInput = async () => {
+    if (!task?.pendingInteraction || !inputAnswer.trim()) return;
+    const params = asRecord(task.pendingInteraction.params);
+    const questions = Array.isArray(params?.questions) ? params.questions : [];
+    const first = asRecord(questions[0]);
+    const questionId = typeof first?.id === 'string' ? first.id : 'answer';
+    setIsResponding(true);
+    try {
+      const result = await adapter.respondToTaskInput(task.id, {
+        [questionId]: [inputAnswer.trim()],
+      });
+      setInputAnswer('');
+      await report(async () => result);
+    } catch (error) {
+      await report(async () => {
+        throw error;
+      });
+    } finally {
+      setIsResponding(false);
     }
   };
 
@@ -546,7 +588,11 @@ function TasksPage({
           <h2>Codex 账户</h2>
           <p className="connected">
             <span className="connection-dot" />
-            {account}
+            {account.status === 'connected'
+              ? `${account.email ?? '已连接'} · ${account.plan ?? 'ChatGPT'}`
+              : account.status === 'logged_out'
+                ? '尚未登录'
+                : '尚未从本地服务读取'}
           </p>
           <button
             className="button button-secondary"
@@ -570,6 +616,10 @@ function TasksPage({
               <p className="muted">
                 {task.status === 'waiting_for_approval'
                   ? '等待你的批准'
+                  : task.status === 'waiting_for_input'
+                    ? '等待你的补充信息'
+                    : task.status === 'completed'
+                      ? '任务已完成'
                   : task.status === 'failed'
                     ? '任务已停止'
                     : 'Codex 正在处理'}
@@ -599,19 +649,39 @@ function TasksPage({
               <div>
                 <button
                   className="button button-secondary"
+                  disabled={isResponding}
                   onClick={() => void respond('decline')}
                 >
                   拒绝
                 </button>
                 <button
                   className="button button-primary"
+                  disabled={isResponding}
                   onClick={() => void respond('approve')}
                 >
                   批准继续
                 </button>
               </div>
             )}
+            {task.status === 'waiting_for_input' && (
+              <div className="task-input-response">
+                <label htmlFor="task-input-answer">Codex 需要补充信息</label>
+                <input
+                  id="task-input-answer"
+                  value={inputAnswer}
+                  onChange={(event) => setInputAnswer(event.target.value)}
+                />
+                <button
+                  className="button button-primary"
+                  disabled={isResponding || !inputAnswer.trim()}
+                  onClick={() => void answerInput()}
+                >
+                  提交回答
+                </button>
+              </div>
+            )}
           </div>
+          {task.error && <p role="alert">{task.error}</p>}
         </section>
       ) : (
         <section className="empty-state">
@@ -628,28 +698,32 @@ function TasksPage({
 
 function ProjectsPage({
   adapter,
-  project,
-  setProject,
+  projects,
+  dispatch,
   navigate,
   report,
 }: {
   adapter: DesktopAdapter;
-  project: ProjectSummary;
-  setProject: (project: ProjectSummary) => void;
+  projects: WorkbenchProject[];
+  dispatch: (action: WorkbenchAction) => void;
   navigate: (route: Route) => void;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
 }) {
   const [name, setName] = useState('');
+  const [goal, setGoal] = useState('');
   const [isCreating, setIsCreating] = useState(false);
   const create = async (event: FormEvent) => {
     event.preventDefault();
-    if (!name.trim()) return;
+    if (!name.trim() || !goal.trim()) return;
     setIsCreating(true);
     try {
-      const created = await adapter.createProject(name.trim());
-      setProject(created);
+      const created = await adapter.createProject({
+        name: name.trim(),
+        goal: goal.trim(),
+      });
+      dispatch({ type: 'project-created', project: created });
       navigate('workspace');
     } catch (error) {
       await report(async () => {
@@ -669,38 +743,31 @@ function ProjectsPage({
         <section className="project-list">
           <div className="section-heading">
             <h2>项目列表</h2>
-            <span className="muted">2 个进行中</span>
+            <span className="muted">{projects.length} 个进行中</span>
           </div>
-          <button className="project-row" onClick={() => navigate('workspace')}>
-            <span className="file-avatar">
-              <Icon name="file" />
-            </span>
-            <span>
-              <strong>{project.name}</strong>
-              <small>
-                {project.stage} · 更新于 {project.updatedAt}
-              </small>
-            </span>
-            <span className="project-progress">
-              <Progress value={project.progress} />
-              {project.progress}%
-            </span>
-            <Icon name="arrowRight" />
-          </button>
-          <button className="project-row" onClick={() => navigate('workspace')}>
-            <span className="file-avatar">
-              <Icon name="file" />
-            </span>
-            <span>
-              <strong>智能家居产品发布会</strong>
-              <small>内容生成 · 更新于 昨天 16:43</small>
-            </span>
-            <span className="project-progress">
-              <Progress value={42} />
-              42%
-            </span>
-            <Icon name="arrowRight" />
-          </button>
+          {projects.map((project) => (
+            <button
+              className="project-row"
+              key={project.id}
+              onClick={() => {
+                dispatch({ type: 'project-selected', projectId: project.id });
+                navigate('workspace');
+              }}
+            >
+              <span className="file-avatar"><Icon name="file" /></span>
+              <span>
+                <strong>{project.name}</strong>
+                <small>{project.stage} · 更新于 {project.updatedAt}</small>
+              </span>
+              <span className="project-progress">
+                <Progress value={project.progress} />{project.progress}%
+              </span>
+              <Icon name="arrowRight" />
+            </button>
+          ))}
+          {!projects.length && (
+            <div className="empty-inline">本地适配器尚未提供项目。</div>
+          )}
         </section>
         <section className="project-create">
           <h2>创建 PPT 项目</h2>
@@ -715,12 +782,15 @@ function ProjectsPage({
             <label htmlFor="project-goal">项目目标</label>
             <textarea
               id="project-goal"
+              value={goal}
+              onChange={(event) => setGoal(event.target.value)}
               placeholder="说明受众、场景与希望传达的信息"
+              required
               rows={4}
             />
             <button
               className="button button-primary full-width"
-              disabled={isCreating || !name.trim()}
+              disabled={isCreating || !name.trim() || !goal.trim()}
             >
               {isCreating ? '正在创建…' : '创建并进入工作台'}
               <Icon name="arrowRight" />
@@ -735,44 +805,145 @@ function ProjectsPage({
 function WorkspacePage({
   adapter,
   project,
+  dispatch,
+  nextMutationToken,
   navigate,
   report,
 }: {
   adapter: DesktopAdapter;
-  project: ProjectSummary;
+  project: WorkbenchProject;
+  dispatch: (action: WorkbenchAction) => void;
+  nextMutationToken: () => number;
   navigate: (route: Route) => void;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
 }) {
-  const [selectedSlide, setSelectedSlide] = useState(3);
   const [comment, setComment] = useState('');
-  const [slideStatus, setSlideStatus] = useState('等待审批');
-  const [stage, setStage] = useState('visual');
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName] = useState(project.name);
+  const [isRenaming, setIsRenaming] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<
     'workflow' | 'canvas' | 'review'
   >('canvas');
-  const action = async (
-    operation: () => Promise<{
-      status: string;
-      selectedSlide?: number;
-      nextSlide?: number;
-    }>,
-  ) => {
+  const currentSlide = project.selectedSlide;
+  const currentSlideState = project.slides[currentSlide - 1];
+  const currentStageIndex = workspaceStages.findIndex(
+    ([id]) => id === project.workflowStage,
+  );
+  const runSlideMutation = async (kind: 'approve' | 'regenerate') => {
+    if (project.pendingMutation) return;
+    const token = nextMutationToken();
+    const projectId = project.id;
+    const slide = currentSlide;
+    dispatch({
+      type: 'slide-mutation-started',
+      projectId,
+      token,
+      kind,
+      slide,
+    });
     try {
-      const result = await operation();
-      setSlideStatus(result.status);
-      if (result.selectedSlide) setSelectedSlide(result.selectedSlide);
-      if (result.nextSlide) setSelectedSlide(result.nextSlide);
+      const result =
+        kind === 'approve'
+          ? await adapter.approveSlide(projectId, slide, comment)
+          : await adapter.regenerateSlide(projectId, slide, comment);
+      dispatch({ type: 'slide-mutation-resolved', projectId, token, result });
     } catch (error) {
+      dispatch({
+        type: 'slide-mutation-failed',
+        projectId,
+        token,
+        status: toMessage(error),
+      });
       await report(async () => {
         throw error;
       });
     }
   };
-  const currentSlide = Math.min(selectedSlide, 5);
+  const reopen = async () => {
+    if (project.pendingMutation) return;
+    const token = nextMutationToken();
+    const projectId = project.id;
+    const slide = currentSlide;
+    dispatch({
+      type: 'slide-mutation-started',
+      projectId,
+      token,
+      kind: 'reopen',
+      slide,
+    });
+    try {
+      const result = await adapter.reopenSlide(projectId, slide);
+      dispatch({
+        type: 'slide-mutation-resolved',
+        projectId,
+        token,
+        result,
+      });
+    } catch (error) {
+      dispatch({
+        type: 'slide-mutation-failed',
+        projectId,
+        token,
+        status: toMessage(error),
+      });
+      await report(async () => {
+        throw error;
+      });
+    }
+  };
+  const rename = async (event: FormEvent) => {
+    event.preventDefault();
+    const name = draftName.trim();
+    if (!name || isRenaming) return;
+    setIsRenaming(true);
+    try {
+      const result = await adapter.renameProject(project.id, name);
+      dispatch({ type: 'project-renamed', projectId: project.id, name });
+      setEditingName(false);
+      await report(async () => result);
+    } catch (error) {
+      await report(async () => {
+        throw error;
+      });
+    } finally {
+      setIsRenaming(false);
+    }
+  };
+  const exportPpt = async () => {
+    if (isExporting) return;
+    setIsExporting(true);
+    await report(() => adapter.exportProject(project.id, project.name));
+    setIsExporting(false);
+  };
+  const selectPanel = (panel: 'workflow' | 'canvas' | 'review') => {
+    setMobilePanel(panel);
+    document.getElementById(`workspace-tab-${panel}`)?.focus();
+  };
+  const onTabKeyDown = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    panel: 'workflow' | 'canvas' | 'review',
+  ) => {
+    const panels = ['workflow', 'canvas', 'review'] as const;
+    const index = panels.indexOf(panel);
+    const next =
+      event.key === 'ArrowRight'
+        ? panels[(index + 1) % panels.length]
+        : event.key === 'ArrowLeft'
+          ? panels[(index - 1 + panels.length) % panels.length]
+          : event.key === 'Home'
+            ? panels[0]
+            : event.key === 'End'
+              ? panels.at(-1)
+              : null;
+    if (!next) return;
+    event.preventDefault();
+    selectPanel(next);
+  };
   return (
-    <div className="workspace-shell">
+    <main id="main-content" className="workspace-shell">
       <header className="workspace-header">
         <div>
           <button
@@ -787,19 +958,36 @@ function WorkspacePage({
             <span>/</span>
             <strong>{project.name}</strong>
           </nav>
-          <h1>
-            {project.name}{' '}
-            <button
-              className="edit-title"
-              aria-label="编辑项目名称"
-              onClick={() => setSlideStatus('项目名称编辑将在本地版本中保存。')}
-            >
-              <Icon name="edit" />
-            </button>
-          </h1>
-          <p>
-            创建时间：2025-05-12 10:23 <span /> 最后更新：2025-05-16 14:32
-          </p>
+          {editingName ? (
+            <form className="rename-project" onSubmit={rename}>
+              <label htmlFor="workspace-project-name">项目名称</label>
+              <input
+                id="workspace-project-name"
+                value={draftName}
+                onChange={(event) => setDraftName(event.target.value)}
+                autoFocus
+              />
+              <button className="button button-primary" disabled={isRenaming || !draftName.trim()}>
+                {isRenaming ? '保存中…' : '保存名称'}
+              </button>
+            </form>
+          ) : (
+            <h1>
+              {project.name}{' '}
+              <button
+                className="edit-title"
+                aria-label="编辑项目名称"
+                onClick={() => {
+                  setDraftName(project.name);
+                  setEditingName(true);
+                }}
+              >
+                <Icon name="edit" />
+              </button>
+            </h1>
+          )}
+          <p className="project-goal">项目目标：{project.goal}</p>
+          <p>最后更新：{project.updatedAt}</p>
         </div>
         <div className="workspace-actions">
           <span>
@@ -807,9 +995,8 @@ function WorkspacePage({
           </span>
           <button
             className="button button-secondary"
-            onClick={() =>
-              void report(() => adapter.exportProject(project.id, project.name))
-            }
+            disabled={isExporting}
+            onClick={() => void exportPpt()}
           >
             <Icon name="export" />
             导出
@@ -830,10 +1017,13 @@ function WorkspacePage({
         ).map(([id, label]) => (
           <button
             key={id}
+            id={`workspace-tab-${id}`}
             role="tab"
             aria-selected={mobilePanel === id}
             aria-controls={`${id}-panel`}
-            onClick={() => setMobilePanel(id)}
+            tabIndex={mobilePanel === id ? 0 : -1}
+            onKeyDown={(event) => onTabKeyDown(event, id)}
+            onClick={() => selectPanel(id)}
           >
             {label}
           </button>
@@ -844,23 +1034,34 @@ function WorkspacePage({
           id="workflow-panel"
           className="workflow-rail"
           aria-label="PPT 工作流"
+          role="tabpanel"
+          aria-labelledby="workspace-tab-workflow"
         >
           <ol>
             {workspaceStages.map(([id, label], index) => (
               <li
                 key={id}
                 className={
-                  stage === id ? 'is-current' : index < 4 ? 'is-complete' : ''
+                  project.workflowStage === id
+                    ? 'is-current'
+                    : index < currentStageIndex
+                      ? 'is-complete'
+                      : ''
                 }
               >
                 <button
-                  onClick={() => {
-                    setStage(id);
-                    setSlideStatus(`已切换到${label}。`);
-                  }}
+                  disabled={index > currentStageIndex}
+                  onClick={() =>
+                    void report(async () => ({
+                      status:
+                        index < currentStageIndex
+                          ? `${label}已完成；当前阶段仍为${workspaceStages[currentStageIndex]?.[1]}。`
+                          : `当前阶段：${label}。`,
+                    }))
+                  }
                 >
                   <span className="stage-mark">
-                    {index < 4 ? <Icon name="check" /> : index + 1}
+                    {index < currentStageIndex ? <Icon name="check" /> : index + 1}
                   </span>
                   {label}
                 </button>
@@ -875,13 +1076,19 @@ function WorkspacePage({
                   <button
                     key={label}
                     className={page === currentSlide ? 'is-selected' : ''}
-                    onClick={() => setSelectedSlide(page)}
+                    onClick={() =>
+                      dispatch({ type: 'select-slide', projectId: project.id, slide: page })
+                    }
                   >
                     <span>{String(page).padStart(2, '0')}</span>
                     {label}
                     <i
                       aria-label={
-                        page < 3 ? '已批准' : page === 3 ? '等待审批' : '未开始'
+                        project.slides[index]?.status === 'approved'
+                          ? '已批准'
+                          : project.slides[index]?.status === 'waiting'
+                            ? '等待审批'
+                            : '未开始'
                       }
                     />
                   </button>
@@ -890,7 +1097,12 @@ function WorkspacePage({
             )}
           </div>
         </aside>
-        <main id="canvas-panel" className="canvas-area">
+        <section
+          id="canvas-panel"
+          className="canvas-area"
+          role="tabpanel"
+          aria-labelledby="workspace-tab-canvas"
+        >
           <div className="canvas-scroll">
             <SlideCanvas slide={currentSlide} />
           </div>
@@ -898,7 +1110,7 @@ function WorkspacePage({
             <button
               className="button button-secondary"
               disabled={currentSlide === 1}
-              onClick={() => setSelectedSlide(Math.max(1, currentSlide - 1))}
+              onClick={() => dispatch({ type: 'select-slide', projectId: project.id, slide: currentSlide - 1 })}
             >
               <Icon name="arrowLeft" />
               上一页
@@ -907,17 +1119,19 @@ function WorkspacePage({
             <button
               className="button button-secondary"
               disabled={currentSlide === 5}
-              onClick={() => setSelectedSlide(Math.min(5, currentSlide + 1))}
+              onClick={() => dispatch({ type: 'select-slide', projectId: project.id, slide: currentSlide + 1 })}
             >
               下一页
               <Icon name="arrowRight" />
             </button>
           </div>
-        </main>
+        </section>
         <aside
           id="review-panel"
           className="review-inspector"
           aria-label="审批面板"
+          role="tabpanel"
+          aria-labelledby="workspace-tab-review"
         >
           <header>
             <Icon name="eye" />
@@ -972,13 +1186,12 @@ function WorkspacePage({
           </section>
           <div className="review-state-row">
             <p className="review-state" aria-live="polite">
-              {slideStatus}
+              {project.slideNotice}
             </p>
             <button
               className="text-action"
-              onClick={() =>
-                void action(() => adapter.reopenSlide(project.id, currentSlide))
-              }
+              disabled={Boolean(project.pendingMutation)}
+              onClick={() => void reopen()}
             >
               重新打开
             </button>
@@ -986,24 +1199,18 @@ function WorkspacePage({
           <div className="review-actions">
             <button
               className="button button-secondary"
-              onClick={() =>
-                void action(() =>
-                  adapter.regenerateSlide(project.id, currentSlide, comment),
-                )
-              }
+              disabled={Boolean(project.pendingMutation)}
+              onClick={() => void runSlideMutation('regenerate')}
             >
               <Icon name="refresh" />
               重新生成
             </button>
             <button
               className="button button-primary"
-              onClick={() =>
-                void action(() =>
-                  adapter.approveSlide(project.id, currentSlide, comment),
-                )
-              }
+              disabled={Boolean(project.pendingMutation) || currentSlideState?.status !== 'waiting'}
+              onClick={() => void runSlideMutation('approve')}
             >
-              批准并生成下一页
+              {currentSlide === 5 ? '批准并进入转换' : '批准并生成下一页'}
             </button>
           </div>
           <p className="capability-note">
@@ -1012,7 +1219,7 @@ function WorkspacePage({
           </p>
         </aside>
       </div>
-    </div>
+    </main>
   );
 }
 
@@ -1131,16 +1338,39 @@ function Metric({
 }
 
 function ApprovalsPage({
+  adapter,
+  items,
+  pending,
+  dispatch,
+  nextMutationToken,
   report,
 }: {
+  adapter: DesktopAdapter;
+  items: ApprovalSummary[];
+  pending: Record<string, number>;
+  dispatch: (action: WorkbenchAction) => void;
+  nextMutationToken: () => number;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
 }) {
-  const [items, setItems] = useState(approvalItems);
-  const decide = (id: string, label: string) => {
-    setItems((current) => current.filter((item) => item.id !== id));
-    void report(async () => ({ status: `${label}已记录。` }));
+  const decide = async (
+    id: string,
+    decision: 'approved' | 'rejected',
+  ) => {
+    if (pending[id] !== undefined) return;
+    const token = nextMutationToken();
+    dispatch({ type: 'approval-mutation-started', approvalId: id, token });
+    try {
+      const result = await adapter.decideApproval(id, decision);
+      dispatch({ type: 'approval-mutation-resolved', approvalId: id, token });
+      await report(async () => result);
+    } catch (error) {
+      dispatch({ type: 'approval-mutation-failed', approvalId: id, token });
+      await report(async () => {
+        throw error;
+      });
+    }
   };
   return (
     <div className="standard-page">
@@ -1160,13 +1390,15 @@ function ApprovalsPage({
               <div>
                 <button
                   className="button button-secondary"
-                  onClick={() => decide(item.id, '已驳回')}
+                  disabled={pending[item.id] !== undefined}
+                  onClick={() => void decide(item.id, 'rejected')}
                 >
                   驳回
                 </button>
                 <button
                   className="button button-primary"
-                  onClick={() => decide(item.id, '已批准')}
+                  disabled={pending[item.id] !== undefined}
+                  onClick={() => void decide(item.id, 'approved')}
                 >
                   批准
                 </button>
@@ -1183,36 +1415,34 @@ function ApprovalsPage({
 
 function MemoryPage({
   adapter,
+  memory,
+  dispatch,
+  nextMutationToken,
   report,
 }: {
   adapter: DesktopAdapter;
+  memory: WorkbenchMemory[];
+  dispatch: (action: WorkbenchAction) => void;
+  nextMutationToken: () => number;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
 }) {
-  const [memory, setMemory] = useState([
-    {
-      id: 'memory-chart',
-      title: '图表优先',
-      content: '在经营复盘类 PPT 中，优先使用趋势图和对比图呈现关键数据。',
-      status: '待决定',
-    },
-    {
-      id: 'memory-tone',
-      title: '中文简洁表述',
-      content: '报告文本采用简洁、直接的中文表达，并保留关键事实来源。',
-      status: '待决定',
-    },
-  ]);
   const decide = async (id: string, decision: 'approved' | 'rejected') => {
+    const item = memory.find((entry) => entry.id === id);
+    if (!item || item.pendingToken !== null) return;
+    const token = nextMutationToken();
+    dispatch({ type: 'memory-mutation-started', memoryId: id, token });
     try {
       const result = await adapter.decideMemory(id, decision);
-      setMemory((current) =>
-        current.map((item) =>
-          item.id === id ? { ...item, status: result.status } : item,
-        ),
-      );
+      dispatch({
+        type: 'memory-mutation-resolved',
+        memoryId: id,
+        token,
+        status: result.status,
+      });
     } catch (error) {
+      dispatch({ type: 'memory-mutation-failed', memoryId: id, token });
       await report(async () => {
         throw error;
       });
@@ -1241,6 +1471,7 @@ function MemoryPage({
               <div className="memory-actions">
                 <button
                   className="button button-secondary"
+                  disabled={item.pendingToken !== null}
                   aria-label={`拒绝偏好：${item.title}`}
                   onClick={() => void decide(item.id, 'rejected')}
                 >
@@ -1248,6 +1479,7 @@ function MemoryPage({
                 </button>
                 <button
                   className="button button-primary"
+                  disabled={item.pendingToken !== null}
                   aria-label={`批准偏好：${item.title}`}
                   onClick={() => void decide(item.id, 'approved')}
                 >
@@ -1255,6 +1487,7 @@ function MemoryPage({
                 </button>
               </div>
             )}
+            {item.pendingToken !== null && <span className="muted">正在保存…</span>}
           </article>
         ))}
       </section>
@@ -1264,17 +1497,23 @@ function MemoryPage({
 
 function SettingsPage({
   adapter,
+  account,
+  runtime,
   report,
 }: {
   adapter: DesktopAdapter;
+  account: WorkbenchState['account'];
+  runtime: WorkbenchState['runtime'];
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
 }) {
   const [workspacePath, setWorkspacePath] = useState(
-    '/Users/demo/Documents/Workspaces',
+    adapter.mode === 'demo' ? '/Users/demo/Documents/Workspaces' : '',
   );
-  const [codexPath, setCodexPath] = useState('自动检测');
+  const [codexPath, setCodexPath] = useState(
+    adapter.mode === 'demo' ? '演示：自动检测' : '',
+  );
   const [isSaving, setIsSaving] = useState(false);
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -1312,11 +1551,15 @@ function SettingsPage({
         </section>
         <section>
           <h2>账户状态</h2>
-          <p className="connected">
+          <p className={runtime.status === 'connected' ? 'connected' : 'muted'}>
             <span className="connection-dot" />
-            本地连接可用
+            {account.status === 'connected'
+              ? `${account.email ?? '账户已连接'} · ${account.plan ?? 'ChatGPT'}`
+              : account.status === 'logged_out'
+                ? '尚未登录'
+                : '账户能力不可用'}
           </p>
-          <p className="muted">账号查询与登录通过 Codex App Server 完成。</p>
+          <p className="muted">{runtime.detail}</p>
         </section>
         <button className="button button-primary" disabled={isSaving}>
           {isSaving ? '正在保存…' : '保存设置'}
@@ -1449,4 +1692,10 @@ function routeFromHash(): Route | null {
 
 function toMessage(error: unknown): string {
   return error instanceof Error ? error.message : '操作未完成，请稍后重试。';
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null
+    ? (value as Record<string, unknown>)
+    : null;
 }

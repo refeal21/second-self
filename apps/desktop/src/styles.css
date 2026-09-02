@@ -1523,7 +1523,7 @@ textarea::placeholder {
   }
 }
 
-@media (min-width: 900px) {
+@media (min-width: 956px) {
   .slide-canvas {
     padding: 28px 38px;
   }
@@ -1578,7 +1578,7 @@ textarea::placeholder {
   }
 }
 
-@media (max-width: 899px) {
+@media (max-width: 955px) {
   .desktop-window {
     border: 0;
     border-radius: 0;

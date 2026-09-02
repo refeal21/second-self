@@ -150,7 +150,8 @@ export class PptDeliveryCoordinator {
           visualVersionIds: receipt.visualVersionIds,
         };
         const report =
-          (await this.#recoverQaBundle(input)) ?? (await this.#qa.run(input));
+          (await this.#recoverQaBundle(input, receipt)) ??
+          (await this.#qa.run(input));
         this.#mutations.commitQaReport({
           receipt,
           report,
@@ -184,15 +185,18 @@ export class PptDeliveryCoordinator {
     }
   }
 
-  async #recoverQaBundle(input: {
-    projectId: string;
-    pptxPath: string;
-    expectedPageCount: number;
-    round: number;
-    exportSha256: string;
-    specVersionId: string;
-    visualVersionIds: Readonly<Record<string, string>>;
-  }): Promise<LibreOfficeQaReport | undefined> {
+  async #recoverQaBundle(
+    input: {
+      projectId: string;
+      pptxPath: string;
+      expectedPageCount: number;
+      round: number;
+      exportSha256: string;
+      specVersionId: string;
+      visualVersionIds: Readonly<Record<string, string>>;
+    },
+    currentReceipt: ExportReceipt,
+  ): Promise<LibreOfficeQaReport | undefined> {
     const relativePath = `qa/qa-round-${input.round}.json`;
     const contents = await this.#artifacts
       .read(input.projectId, relativePath)
@@ -201,6 +205,7 @@ export class PptDeliveryCoordinator {
         throw error;
       });
     if (!contents) return undefined;
+    await this.#revalidateCurrentReceipt(currentReceipt);
     let bundle: unknown;
     try {
       bundle = JSON.parse(new TextDecoder().decode(contents));
@@ -221,6 +226,38 @@ export class PptDeliveryCoordinator {
     return reissue(report);
   }
 
+  async #revalidateCurrentReceipt(current: ExportReceipt): Promise<void> {
+    if (
+      isAbsolute(current.relativePath) ||
+      current.relativePath.includes('\\') ||
+      current.relativePath
+        .split('/')
+        .some((part) => part === '.' || part === '..') ||
+      !current.relativePath.startsWith('exports/') ||
+      !/\.pptx$/i.test(current.relativePath)
+    ) {
+      throw new Error('Current export receipt must be inside project exports');
+    }
+    const expectedPath = await this.#artifacts.resolvePath(
+      current.projectId,
+      current.relativePath,
+    );
+    const bytes = await this.#artifacts.read(
+      current.projectId,
+      current.relativePath,
+    );
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    if (
+      expectedPath !== current.artifactPath ||
+      bytes.byteLength !== current.byteLength ||
+      sha256 !== current.sha256
+    ) {
+      throw new Error(
+        'current export receipt hash does not match validated artifact bytes',
+      );
+    }
+  }
+
   async #validateRepairedReceipt(
     current: ExportReceipt,
     repaired: { pptxPath: string; exportSha256: string },
@@ -239,26 +276,7 @@ export class PptDeliveryCoordinator {
     ) {
       throw new Error('Repaired PPTX must be inside project exports');
     }
-    const currentPath = await this.#artifacts.resolvePath(
-      current.projectId,
-      current.relativePath,
-    );
-    const currentBytes = await this.#artifacts.read(
-      current.projectId,
-      current.relativePath,
-    );
-    const currentSha256 = createHash('sha256')
-      .update(currentBytes)
-      .digest('hex');
-    if (
-      currentPath !== current.artifactPath ||
-      currentBytes.byteLength !== current.byteLength ||
-      currentSha256 !== current.sha256
-    ) {
-      throw new Error(
-        'current export receipt hash does not match validated artifact bytes',
-      );
-    }
+    await this.#revalidateCurrentReceipt(current);
     const artifactPath = await this.#artifacts.resolvePath(
       current.projectId,
       repaired.pptxPath,
@@ -325,12 +343,52 @@ function validateQaBundle(
     throw new Error('Existing QA bundle does not match the runtime schema');
   }
   const report = candidate as unknown as LibreOfficeQaReport;
+  if (!hasCoherentQaSemantics(report)) {
+    throw new Error('Existing QA bundle violates semantic invariants');
+  }
   if (readableSummary !== formatQaReadableSummary(report)) {
     throw new Error(
       'Existing QA bundle readable summary does not match report',
     );
   }
   return report;
+}
+
+function hasCoherentQaSemantics(report: LibreOfficeQaReport): boolean {
+  const renderedPaths = new Set(report.renderedPages);
+  const comparisonPaths = new Set(report.comparisons.map(({ path }) => path));
+  const derivedBlankPages = report.comparisons.flatMap((comparison, index) =>
+    comparison.blank ? [index + 1] : [],
+  );
+  const issuesAreCoherent =
+    report.issues.length > 0 &&
+    report.issues.every((issue) => issue.trim().length > 0);
+  const arraysAreCoherent =
+    report.actualPageCount === report.renderedPages.length &&
+    report.comparisons.length === report.renderedPages.length &&
+    renderedPaths.size === report.renderedPages.length &&
+    comparisonPaths.size === report.comparisons.length &&
+    [...comparisonPaths].every((path) => renderedPaths.has(path)) &&
+    report.blankPages.length === new Set(report.blankPages).size &&
+    report.blankPages.every((page) => page <= report.actualPageCount) &&
+    JSON.stringify(report.blankPages) === JSON.stringify(derivedBlankPages);
+  if (!arraysAreCoherent) return false;
+  if (report.status !== 'passed') return issuesAreCoherent;
+  return (
+    report.actualPageCount === report.expectedPageCount &&
+    report.issues.length === 0 &&
+    report.blankPages.length === 0 &&
+    report.renderedPages.length === report.expectedPageCount &&
+    report.comparisons.length === report.expectedPageCount &&
+    report.comparisons.every((comparison) => !comparison.blank) &&
+    isNonEmptyString(report.sofficePath) &&
+    isNonEmptyString(report.rendererPath) &&
+    isNonEmptyString(report.pdfPath)
+  );
+}
+
+function isNonEmptyString(value: string | null): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -543,6 +543,135 @@ describe('project delivery evidence coordinator', () => {
   );
 
   it.each([
+    [
+      'a passed report with no rendered pages and a timeout issue',
+      qaBundle({
+        status: 'passed',
+        actualPageCount: 0,
+        renderedPages: [],
+        comparisons: [],
+        issues: ['LibreOffice conversion timed out'],
+      }),
+    ],
+    [
+      'a passed report whose comparison path is not a rendered page',
+      qaBundle({
+        comparisons: [
+          {
+            path: '/workspace/project-1/qa/run-1/not-rendered.png',
+            blank: false,
+          },
+        ],
+      }),
+    ],
+    [
+      'a passed report without real command paths',
+      qaBundle({ sofficePath: null, rendererPath: null, pdfPath: null }),
+    ],
+    ['a failed report with no issues', qaBundle({ status: 'failed' })],
+    ['a blocked report with no issues', qaBundle({ status: 'blocked' })],
+    [
+      'a failed report with duplicate blank page numbers',
+      qaBundle({
+        status: 'failed',
+        blankPages: [1, 1],
+        issues: ['Blank rendered pages: 1'],
+      }),
+    ],
+  ])(
+    'rejects %s before replay signing or QA commands',
+    async (_label, bundle) => {
+      const artifacts = new MemoryArtifacts();
+      artifacts.files.set(
+        'project-1/qa/qa-round-1.json',
+        new TextEncoder().encode(JSON.stringify(bundle, null, 2)),
+      );
+      const projects = await conversionProject(artifacts);
+      const commands = new RoundQaCommands(artifacts);
+      const qa = new LibreOfficeQa(
+        commands,
+        artifacts,
+        new RoundComparator([]),
+        { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'] },
+      );
+      let reissueCalls = 0;
+      const signingQa: QaRunner = {
+        run: qa.run,
+        reissueValidatedReport: (report) => {
+          reissueCalls += 1;
+          return qa.reissueValidatedReport(report);
+        },
+      };
+
+      await expect(
+        deliveryCoordinator(
+          projects,
+          artifacts,
+          new CapturingExporter(),
+          signingQa,
+        ).deliver('project-1', 'deck.pptx'),
+      ).rejects.toThrow('semantic invariants');
+      expect(commands.calls).toEqual([]);
+      expect(reissueCalls).toBe(0);
+      expect(projects.getProjectSnapshot('project-1')).toMatchObject({
+        project: { workflowStatus: 'qa' },
+        qaCheckpoint: { nextAction: 'qa', reports: [] },
+      });
+    },
+  );
+
+  it('rejects a persisted QA bundle when its current export receipt changed before replay', async () => {
+    const artifacts = new MemoryArtifacts();
+    const projects = await conversionProject(artifacts);
+    const exporter = new CapturingExporter();
+    const commands = new RoundQaCommands(artifacts);
+    const realQa = new LibreOfficeQa(
+      commands,
+      artifacts,
+      new RoundComparator([]),
+      { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'] },
+    );
+    let interrupt = true;
+    let reissueCalls = 0;
+    const interruptedQa: QaRunner = {
+      run: async (input) => {
+        const report = await realQa.run(input);
+        if (interrupt) {
+          interrupt = false;
+          throw new Error('interrupted after QA persistence');
+        }
+        return report;
+      },
+      reissueValidatedReport: (report) => {
+        reissueCalls += 1;
+        return realQa.reissueValidatedReport(report);
+      },
+    };
+    const delivery = deliveryCoordinator(
+      projects,
+      artifacts,
+      exporter,
+      interruptedQa,
+    );
+
+    await expect(delivery.deliver('project-1', 'deck.pptx')).rejects.toThrow(
+      'interrupted after QA persistence',
+    );
+    artifacts.files.set('project-1/exports/deck.pptx', new Uint8Array([99]));
+
+    await expect(delivery.deliver('project-1', 'deck.pptx')).rejects.toThrow(
+      'current export receipt hash',
+    );
+    expect(exporter.calls).toBe(1);
+    expect(commands.calls).toEqual(['soffice', 'pdftoppm']);
+    expect(reissueCalls).toBe(0);
+    expect(projects.getProjectSnapshot('project-1')).toMatchObject({
+      project: { workflowStatus: 'qa' },
+      qaCheckpoint: { nextAction: 'qa', reports: [] },
+    });
+  });
+
+  it.each([
     ['path', 'inside project exports'],
     ['hash', 'hash'],
     ['stale', 'new artifact hash'],

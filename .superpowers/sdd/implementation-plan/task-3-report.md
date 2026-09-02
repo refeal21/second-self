@@ -1,4 +1,4 @@
-# Task 3 report — image-first PPT workflow and fix rounds 1–3
+# Task 3 report — image-first PPT workflow and fix rounds 1–4
 
 ## Outcome
 
@@ -175,3 +175,17 @@ Fix commits:
   - blank deck: `failed`, one rendered page, `blankPages: [1]`;
   - repair: blank initial QA then `exports/repaired.pptx` passed, with one repair round;
   - recovery: an injected interruption after the durable round-1 bundle left the checkpoint resumable; replay passed with exactly the original two QA commands (one conversion and one render), not a second QA execution.
+
+## Fix-round 4 implementation
+
+- Persisted QA bundles now require semantic consistency before they can be reissued with the factory-local QA proof. A passed report must have the exact expected/rendered/comparison count, no issues or blanks, a one-to-one rendered/comparison path mapping, no blank comparison, and non-empty LibreOffice, renderer, and PDF paths.
+- Every replayed report validates unique rendered/comparison paths, comparison/page cardinality, an exact comparison-derived blank-page sequence with unique in-range page numbers, and the existing finite optional difference-score type boundary. Failed and blocked reports require a non-empty, non-blank issue list, so they cannot be mistaken for a successful report.
+- The coordinator now re-resolves, re-reads, length-checks, and SHA-256-checks the current export receipt after finding a persisted QA bundle but before parsing/reissuing it. A stale or in-place-mutated receipt rejects without running QA, reissuing the local proof, advancing the checkpoint, or re-exporting.
+
+## Fix-round 4 TDD and verification
+
+- RED: seven new delivery counterexamples initially failed: six contradictory persisted bundles (including the exact `passed`, expected-one/actual-zero/empty-render/timeout-issue case) were accepted, and a QA bundle replayed after the current export bytes were changed.
+- GREEN: `pnpm --filter @digital-twin/worker exec vitest run src/delivery-coordinator.test.ts` → exit 0; 19/19 passed. The semantic cases prove that neither QA commands nor the reissue signer run; the stale-current-receipt case retains the QA checkpoint and executes no second QA run.
+- Worker gate: `pnpm --filter @digital-twin/worker test` → exit 0; 14 files, 139 tests passed.
+- Fresh repository gate: `pnpm typecheck`, `pnpm lint`, `pnpm test`, `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check`, `npx --yes prettier@3.6.2 --single-quote --check apps/worker/src/delivery-coordinator.ts apps/worker/src/delivery-coordinator.test.ts`, and `git diff --check` all exited 0.
+- Real local LibreOffice smoke used the bundled runtime `soffice` and `pdftoppm`, `LocalWorkspaceArtifacts`, `LocalCommandRunner`, `PngPixelPageComparator`, and actual PptxGenJS bytes: normal one-page deck passed with no blanks; empty one-page deck failed with `blankPages: [1]`; a durable-QA interruption recovered by replaying the saved bundle to passed with exactly one real QA execution.

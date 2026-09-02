@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { createIsolatedPptWorkflow } from './ppt-project.js';
 import {
-  PptProjectService,
-  SourceAnalysisService,
-  VisualGenerationService,
+  type PptProjectService,
   type SlideSpec,
   type SourceAnalysis,
   type WorkspaceArtifacts,
@@ -46,6 +45,23 @@ const analysis: SourceAnalysis = {
   ],
 };
 
+const workflowByProjects = new WeakMap<
+  PptProjectService,
+  ReturnType<typeof createIsolatedPptWorkflow>
+>();
+
+function testProject(artifacts: WorkspaceArtifacts): PptProjectService {
+  const workflow = createIsolatedPptWorkflow(artifacts);
+  workflowByProjects.set(workflow.projects, workflow);
+  return workflow.projects;
+}
+
+function testWorkflow(projects: PptProjectService) {
+  const workflow = workflowByProjects.get(projects);
+  if (!workflow) throw new Error('Missing isolated test workflow');
+  return workflow;
+}
+
 const slideSpecs: SlideSpec[] = [
   {
     id: 'slide-1',
@@ -82,11 +98,18 @@ const slideSpecs: SlideSpec[] = [
   },
 ];
 
+const validPng = Uint8Array.from(
+  Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  ),
+);
+
 async function analyze(
   service: PptProjectService,
   output: SourceAnalysis = analysis,
 ) {
-  const sourceAnalysis = new SourceAnalysisService(service, {
+  const sourceAnalysis = testWorkflow(service).sourceAnalysis({
     analyze: async () => output,
   });
   await sourceAnalysis.request({
@@ -99,7 +122,7 @@ async function analyze(
 
 async function projectAtOutlineReview() {
   const artifacts = new MemoryArtifacts();
-  const service = new PptProjectService(artifacts);
+  const service = testProject(artifacts);
   await service.createProject({
     id: 'project-1',
     name: 'Board update',
@@ -128,7 +151,7 @@ async function projectAtOutlineReview() {
 describe('PPT project workflow', () => {
   it('rejects duplicate and unsafe outline slide ids before persisting workflow state', async () => {
     const artifacts = new MemoryArtifacts();
-    const service = new PptProjectService(artifacts);
+    const service = testProject(artifacts);
     await service.createProject({
       id: 'project-1',
       name: 'Deck',
@@ -177,6 +200,79 @@ describe('PPT project workflow', () => {
     ).rejects.toThrow('exact unique bijection');
   });
 
+  it.each([
+    {
+      label: 'table row with the wrong length',
+      mutate: (candidate: SlideSpec) => {
+        (candidate.tables[0]!.rows as unknown as unknown[][]) = [['only-one']];
+      },
+    },
+    {
+      label: 'non-string chart category',
+      mutate: (candidate: SlideSpec) => {
+        (candidate.charts[0]!.categories as unknown as unknown[]) = [2025];
+      },
+    },
+    {
+      label: 'chart values inconsistent with categories',
+      mutate: (candidate: SlideSpec) => {
+        (
+          candidate.charts[0]!.series[0] as unknown as { values: number[] }
+        ).values = [100];
+      },
+    },
+    {
+      label: 'non-finite chart value',
+      mutate: (candidate: SlideSpec) => {
+        (
+          candidate.charts[0]!.series[0] as unknown as { values: number[] }
+        ).values = [100, Number.POSITIVE_INFINITY];
+      },
+    },
+    {
+      label: 'negative shape layout',
+      mutate: (candidate: SlideSpec) => {
+        (candidate.shapes[0] as { x: number }).x = -0.1;
+      },
+    },
+    {
+      label: 'non-finite shape layout',
+      mutate: (candidate: SlideSpec) => {
+        (candidate.shapes[0] as { w: number }).w = Number.NaN;
+      },
+    },
+    {
+      label: 'malformed source citation',
+      mutate: (candidate: SlideSpec) => {
+        (candidate.sourceMap[0] as unknown as { title: number }).title = 12;
+      },
+    },
+  ])('rejects nested slide spec output with $label', async ({ mutate }) => {
+    const { service } = await projectAtOutlineReview();
+    service.approveOutline('project-1', '2026-09-01T01:00:00.000Z');
+    const candidate = structuredClone(slideSpecs[0]!);
+    mutate(candidate);
+
+    await expect(
+      service.submitSlideSpecs('project-1', [candidate]),
+    ).rejects.toThrow('runtime schema');
+    expect(service.getProjectSnapshot('project-1').slideSpecs).toBeNull();
+  });
+
+  it('rejects duplicate nested object identifiers', async () => {
+    const { service } = await projectAtOutlineReview();
+    service.approveOutline('project-1', '2026-09-01T01:00:00.000Z');
+    const candidate = structuredClone(slideSpecs[0]!);
+    (candidate.tables as SlideSpec['tables'][number][]).push(
+      structuredClone(candidate.tables[0]!),
+    );
+
+    await expect(
+      service.submitSlideSpecs('project-1', [candidate]),
+    ).rejects.toThrow('unique nested identifiers');
+    expect(service.getProjectSnapshot('project-1').slideSpecs).toBeNull();
+  });
+
   it('persists slide specs as one atomic authoritative bundle before committing state', async () => {
     const { artifacts, service } = await projectAtOutlineReview();
     service.approveOutline('project-1', '2026-09-01T01:00:00.000Z');
@@ -195,7 +291,7 @@ describe('PPT project workflow', () => {
 
   it('commits outline state only after its artifact write succeeds', async () => {
     const artifacts = new MemoryArtifacts();
-    const service = new PptProjectService(artifacts);
+    const service = testProject(artifacts);
     await service.createProject({
       id: 'project-1',
       name: 'Deck',
@@ -316,20 +412,22 @@ describe('PPT project workflow', () => {
     service.approveOutline('project-1', '2026-09-01T01:00:00.000Z');
     await service.submitSlideSpecs('project-1', slideSpecs);
     service.approveSlideSpecs('project-1', '2026-09-01T02:00:00.000Z');
-    await new VisualGenerationService(service, {
-      capability: async () => ({
-        id: 'image_gen.imagegen',
-        status: 'available',
-      }),
-      generate: async () => ({
-        status: 'generated',
-        image: new Uint8Array([1]),
-        mediaType: 'image/png',
-        usage: 'full_slide_reference',
-        textFree: false,
-        altText: 'Approved reference.',
-      }),
-    }).generate('project-1', 'slide-1');
+    await testWorkflow(service)
+      .visualGeneration({
+        capability: async () => ({
+          id: 'image_gen.imagegen',
+          status: 'available',
+        }),
+        generate: async () => ({
+          status: 'generated',
+          image: validPng,
+          mediaType: 'image/png',
+          usage: 'full_slide_reference',
+          textFree: false,
+          altText: 'Approved reference.',
+        }),
+      })
+      .generate('project-1', 'slide-1');
     service.approveSlideVisual(
       'project-1',
       'slide-1',
@@ -346,7 +444,7 @@ describe('PPT project workflow', () => {
 
   it('cannot use one approved visual as approval evidence for two pages', async () => {
     const artifacts = new MemoryArtifacts();
-    const service = new PptProjectService(artifacts);
+    const service = testProject(artifacts);
     await service.createProject({
       id: 'project-1',
       name: 'Deck',
@@ -372,20 +470,22 @@ describe('PPT project workflow', () => {
       { ...slideSpecs[0]!, id: 'slide-2', title: 'Two' },
     ]);
     service.approveSlideSpecs('project-1', '2026-09-01T02:00:00.000Z');
-    await new VisualGenerationService(service, {
-      capability: async () => ({
-        id: 'image_gen.imagegen',
-        status: 'available',
-      }),
-      generate: async () => ({
-        status: 'generated',
-        image: new Uint8Array([1]),
-        mediaType: 'image/png',
-        usage: 'full_slide_reference',
-        textFree: false,
-        altText: 'Page one',
-      }),
-    }).generate('project-1', 'slide-1');
+    await testWorkflow(service)
+      .visualGeneration({
+        capability: async () => ({
+          id: 'image_gen.imagegen',
+          status: 'available',
+        }),
+        generate: async () => ({
+          status: 'generated',
+          image: validPng,
+          mediaType: 'image/png',
+          usage: 'full_slide_reference',
+          textFree: false,
+          altText: 'Page one',
+        }),
+      })
+      .generate('project-1', 'slide-1');
     service.approveSlideVisual(
       'project-1',
       'slide-1',

@@ -1,9 +1,10 @@
-import {
-  COMMIT_VALIDATED_SOURCE_ANALYSIS,
-  type ValidatedSourceAnalysisEvidence,
-} from './analysis-evidence.js';
 import { assertStrictIdentifier } from './identifiers.js';
-import { PptProjectService, type SourceAnalysis } from './ppt-project.js';
+import {
+  type ProjectMutationPort,
+  type PptProjectService,
+  type SourceAnalysis,
+  type ValidatedSourceAnalysisEvidence,
+} from './ppt-project.js';
 
 export interface SourceAnalysisGatewayRequest {
   projectId: string;
@@ -28,6 +29,7 @@ export interface RequestSourceAnalysis {
 }
 
 export type SourceAnalysisRequestStatus =
+  | 'staging'
   | 'ready'
   | 'awaiting_web_search_approval'
   | 'web_search_rejected'
@@ -47,30 +49,45 @@ export interface SourceAnalysisRequest {
 interface SharedAnalysisState {
   requests: Map<string, SourceAnalysisRequest>;
   activeProjects: Set<string>;
+  reservedProjects: Map<string, string>;
 }
 
 const stateByProjects = new WeakMap<PptProjectService, SharedAnalysisState>();
 
 export class SourceAnalysisService {
-  private readonly state: SharedAnalysisState;
+  readonly #projects: PptProjectService;
+  readonly #gateway: SourceAnalysisGateway;
+  readonly #mutations: ProjectMutationPort;
+  readonly #state: SharedAnalysisState;
 
   constructor(
-    private readonly projects: PptProjectService,
-    private readonly gateway: SourceAnalysisGateway,
+    projects: PptProjectService,
+    gateway: SourceAnalysisGateway,
+    mutations: ProjectMutationPort,
   ) {
+    this.#projects = projects;
+    this.#gateway = gateway;
+    this.#mutations = mutations;
     const existing = stateByProjects.get(projects);
-    this.state = existing ?? {
+    this.#state = existing ?? {
       requests: new Map(),
       activeProjects: new Set<string>(),
+      reservedProjects: new Map<string, string>(),
     };
-    stateByProjects.set(projects, this.state);
+    stateByProjects.set(projects, this.#state);
   }
 
   async request(input: RequestSourceAnalysis): Promise<SourceAnalysisRequest> {
     assertStrictIdentifier('request', input.id);
     assertStrictIdentifier('project', input.projectId);
-    if (this.state.requests.has(input.id)) {
+    if (this.#state.requests.has(input.id)) {
       throw new Error(`Analysis request already exists: ${input.id}`);
+    }
+    const reservation = this.#state.reservedProjects.get(input.projectId);
+    if (reservation) {
+      throw new Error(
+        `Source analysis project is already reserved by request: ${reservation}`,
+      );
     }
     const sourceIds = input.sourceIds.map((id) =>
       assertStrictIdentifier('source', id),
@@ -81,7 +98,7 @@ export class SourceAnalysisService {
     ) {
       throw new Error('Analysis requires a unique attached source set');
     }
-    const snapshot = this.projects.getProjectSnapshot(input.projectId);
+    const snapshot = this.#projects.getProjectSnapshot(input.projectId);
     if (snapshot.project.workflowStatus !== 'intake') {
       throw new Error('Source analysis can only be requested during intake');
     }
@@ -92,18 +109,33 @@ export class SourceAnalysisService {
     const request: SourceAnalysisRequest = {
       ...input,
       sourceIds,
-      status: input.webSearchQuery ? 'awaiting_web_search_approval' : 'ready',
+      status: 'staging',
     };
-    await this.projects
-      .artifactStore()
-      .write(
+    this.#state.requests.set(request.id, request);
+    this.#state.reservedProjects.set(request.projectId, request.id);
+    let workflowReserved = false;
+    try {
+      this.#mutations.beginSourceAnalysis(input.projectId);
+      workflowReserved = true;
+      await this.#mutations.artifacts.write(
         input.projectId,
         `sources/${input.id}-request.json`,
         JSON.stringify(request, null, 2),
       );
-    this.projects.beginSourceAnalysis(input.projectId);
-    this.state.requests.set(request.id, request);
-    return this.copy(request);
+      request.status = input.webSearchQuery
+        ? 'awaiting_web_search_approval'
+        : 'ready';
+      return this.#copy(request);
+    } catch (error) {
+      this.#state.requests.delete(request.id);
+      if (this.#state.reservedProjects.get(request.projectId) === request.id) {
+        this.#state.reservedProjects.delete(request.projectId);
+      }
+      if (workflowReserved) {
+        this.#mutations.rollbackSourceAnalysis(request.projectId);
+      }
+      throw error;
+    }
   }
 
   async decideWebSearch(
@@ -111,12 +143,12 @@ export class SourceAnalysisService {
     approved: boolean,
     decidedAt: string,
   ): Promise<SourceAnalysisRequest> {
-    const request = this.requireRequest(requestId);
+    const request = this.#requireRequest(requestId);
     if (request.status !== 'awaiting_web_search_approval') {
       throw new Error('Analysis request is not awaiting web-search approval');
     }
     const decision = { approved, decidedAt };
-    await this.projects.artifactStore().write(
+    await this.#mutations.artifacts.write(
       request.projectId,
       `sources/${request.id}-web-search-approval.json`,
       JSON.stringify(
@@ -133,14 +165,14 @@ export class SourceAnalysisService {
     );
     request.webSearchDecision = decision;
     request.status = approved ? 'ready' : 'web_search_rejected';
-    return this.copy(request);
+    return this.#copy(request);
   }
 
   async execute(requestId: string): Promise<SourceAnalysisRequest> {
-    const request = this.requireRequest(requestId);
+    const request = this.#requireRequest(requestId);
     if (
       request.status === 'running' ||
-      this.state.activeProjects.has(request.projectId)
+      this.#state.activeProjects.has(request.projectId)
     ) {
       throw new Error('Source analysis is already running for this project');
     }
@@ -155,9 +187,9 @@ export class SourceAnalysisService {
     }
 
     request.status = 'running';
-    this.state.activeProjects.add(request.projectId);
+    this.#state.activeProjects.add(request.projectId);
     try {
-      const output = await this.gateway.analyze({
+      const output = await this.#gateway.analyze({
         projectId: request.projectId,
         requestId: request.id,
         sourceIds: [...request.sourceIds],
@@ -186,30 +218,30 @@ export class SourceAnalysisService {
             }
           : {}),
       };
-      await this.projects[COMMIT_VALIDATED_SOURCE_ANALYSIS](evidence);
+      await this.#mutations.commitSourceAnalysis(evidence);
       request.output = structuredClone(output);
       request.status = 'completed';
-      return this.copy(request);
+      return this.#copy(request);
     } catch (error) {
       request.status = 'ready';
       throw error;
     } finally {
-      this.state.activeProjects.delete(request.projectId);
+      this.#state.activeProjects.delete(request.projectId);
     }
   }
 
   get(requestId: string): SourceAnalysisRequest {
-    return this.copy(this.requireRequest(requestId));
+    return this.#copy(this.#requireRequest(requestId));
   }
 
-  private requireRequest(requestId: string): SourceAnalysisRequest {
+  #requireRequest(requestId: string): SourceAnalysisRequest {
     assertStrictIdentifier('request', requestId);
-    const request = this.state.requests.get(requestId);
+    const request = this.#state.requests.get(requestId);
     if (!request) throw new Error(`Unknown analysis request: ${requestId}`);
     return request;
   }
 
-  private copy(request: SourceAnalysisRequest): SourceAnalysisRequest {
+  #copy(request: SourceAnalysisRequest): SourceAnalysisRequest {
     return structuredClone(request);
   }
 }
@@ -257,7 +289,8 @@ function validateSourceAnalysis(
     if (
       !point ||
       typeof point.label !== 'string' ||
-      (typeof point.value !== 'string' && typeof point.value !== 'number')
+      (typeof point.value !== 'string' && typeof point.value !== 'number') ||
+      (typeof point.value === 'number' && !Number.isFinite(point.value))
     ) {
       throw new Error('Source data point does not match the runtime schema');
     }

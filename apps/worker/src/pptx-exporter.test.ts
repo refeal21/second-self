@@ -140,6 +140,11 @@ describe('PptxGenJS editable exporter', () => {
           mediaType: 'image/png',
           usage: 'complex_visual',
           textFree: true,
+          embeddingAudit: {
+            classification: 'complex_visual',
+            approvedForEmbedding: true,
+            decidedAt: '2026-09-01T03:00:00.000Z',
+          },
           altText: 'Text-free growth texture.',
         },
       }),
@@ -156,6 +161,32 @@ describe('PptxGenJS editable exporter', () => {
     expect(media).toHaveLength(1);
     expect(slideXml).toContain('<p:pic>');
     expect(slideXml?.match(/Approved growth title/g)).toHaveLength(1);
+  });
+
+  it('does not trust the generated textFree classification without a user audit', async () => {
+    const exporter = new PptxGenJsExporter();
+    const bytes = await exporter.export(
+      deck({
+        image: onePixelPng,
+        asset: {
+          artifactPath: '/workspace/project-1/visuals/slide-1-v3.png',
+          mediaType: 'image/png',
+          usage: 'text_free_background',
+          textFree: true,
+          altText: 'Model-claimed text-free background.',
+        },
+      }),
+    );
+    const archive = await unzip(bytes);
+    const slideXml = await archive
+      .file('ppt/slides/slide1.xml')
+      ?.async('string');
+    const media = Object.keys(archive.files).filter(
+      (path) => path.startsWith('ppt/media/') && !archive.files[path]?.dir,
+    );
+
+    expect(media).toEqual([]);
+    expect(slideXml).not.toContain('<p:pic>');
   });
 });
 

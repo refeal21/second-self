@@ -54,48 +54,83 @@ export class LocalCommandRunner implements CommandRunner {
     options: CommandRunOptions,
   ): Promise<CommandResult> {
     return new Promise((resolve) => {
+      const useProcessGroup = process.platform !== 'win32';
       const child = spawn(command, [...args], {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, ...options.env },
+        detached: useProcessGroup,
       });
-      let stdout = '';
-      let stderr = '';
+      const byteLimit = Math.max(0, Math.floor(options.maxOutputBytes));
+      let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+      let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let settled = false;
       let timedOut = false;
-      const appendBounded = (current: string, chunk: string): string =>
-        `${current}${chunk}`.slice(-options.maxOutputBytes);
-      child.stdout.setEncoding('utf8');
-      child.stderr.setEncoding('utf8');
-      child.stdout.on('data', (chunk: string) => {
+      let killTimer: NodeJS.Timeout | undefined;
+      let settleTimer: NodeJS.Timeout | undefined;
+      const appendBounded = (
+        current: Buffer<ArrayBufferLike>,
+        chunk: Buffer<ArrayBufferLike>,
+      ): Buffer<ArrayBufferLike> => {
+        const combined = Buffer.concat([current, chunk]);
+        return combined.byteLength <= byteLimit
+          ? combined
+          : combined.subarray(combined.byteLength - byteLimit);
+      };
+      const decode = (value: Buffer<ArrayBufferLike>): string => {
+        let decoded = value.toString('utf8');
+        while (Buffer.byteLength(decoded) > byteLimit)
+          decoded = decoded.slice(1);
+        return decoded;
+      };
+      child.stdout.on('data', (chunk: Buffer<ArrayBufferLike>) => {
         stdout = appendBounded(stdout, chunk);
       });
-      child.stderr.on('data', (chunk: string) => {
+      child.stderr.on('data', (chunk: Buffer<ArrayBufferLike>) => {
         stderr = appendBounded(stderr, chunk);
       });
+      const terminate = (signal: NodeJS.Signals): void => {
+        try {
+          if (useProcessGroup && child.pid) process.kill(-child.pid, signal);
+          else child.kill(signal);
+        } catch {
+          child.kill(signal);
+        }
+      };
       const timeout = setTimeout(() => {
         timedOut = true;
-        child.kill('SIGTERM');
-        setTimeout(() => {
-          if (!settled) child.kill('SIGKILL');
-        }, 500).unref();
+        terminate('SIGTERM');
+        killTimer = setTimeout(() => {
+          if (!settled) terminate('SIGKILL');
+        }, 200);
+        killTimer.unref();
+        settleTimer = setTimeout(() => {
+          if (settled) return;
+          child.stdout.destroy();
+          child.stderr.destroy();
+          finish({ exitCode: 124, timedOut: true });
+        }, 350);
+        settleTimer.unref();
       }, options.timeoutMs);
       timeout.unref();
-      const finish = (result: CommandResult): void => {
+      const finish = (
+        result: Pick<CommandResult, 'exitCode' | 'timedOut'>,
+      ): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        resolve(result);
+        if (killTimer) clearTimeout(killTimer);
+        if (settleTimer) clearTimeout(settleTimer);
+        resolve({ ...result, stdout: decode(stdout), stderr: decode(stderr) });
       };
       child.on('error', (error) => {
+        stderr = appendBounded(stderr, Buffer.from(error.message));
         finish({
           exitCode: 127,
-          stdout,
-          stderr: appendBounded(stderr, error.message),
           timedOut,
         });
       });
       child.on('close', (code) => {
-        finish({ exitCode: code ?? 1, stdout, stderr, timedOut });
+        finish({ exitCode: timedOut ? 124 : (code ?? 1), timedOut });
       });
     });
   }
@@ -201,20 +236,30 @@ const defaultBundledSoffice = [
 ];
 
 export class LibreOfficeQa implements QaRunner {
+  readonly #commands: CommandRunner;
+  readonly #artifacts: WorkspaceArtifactAccess;
+  readonly #comparator: RenderedPageComparator;
+  readonly #options: LibreOfficeQaOptions;
+
   constructor(
-    private readonly commands: CommandRunner,
-    private readonly artifacts: WorkspaceArtifactAccess,
-    private readonly comparator: RenderedPageComparator = new PngPixelPageComparator(),
-    private readonly options: LibreOfficeQaOptions = {},
-  ) {}
+    commands: CommandRunner,
+    artifacts: WorkspaceArtifactAccess,
+    comparator: RenderedPageComparator = new PngPixelPageComparator(),
+    options: LibreOfficeQaOptions = {},
+  ) {
+    this.#commands = commands;
+    this.#artifacts = artifacts;
+    this.#comparator = comparator;
+    this.#options = options;
+  }
 
   async run(input: QaRunInput): Promise<LibreOfficeQaReport> {
     try {
-      return await this.runChecked(input);
+      return await this.#runChecked(input);
     } catch (error) {
-      return this.persist(
+      return this.#persist(
         input,
-        await this.report(input, {
+        await this.#report(input, {
           status: 'failed',
           issues: [
             `QA command or validation failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -224,7 +269,7 @@ export class LibreOfficeQa implements QaRunner {
     }
   }
 
-  private async runChecked(input: QaRunInput): Promise<LibreOfficeQaReport> {
+  async #runChecked(input: QaRunInput): Promise<LibreOfficeQaReport> {
     if (
       isAbsolute(input.pptxPath) ||
       input.pptxPath.includes('\\') ||
@@ -232,74 +277,74 @@ export class LibreOfficeQa implements QaRunner {
       !input.pptxPath.startsWith('exports/') ||
       !/\.pptx$/i.test(input.pptxPath)
     ) {
-      return this.persist(
+      return this.#persist(
         input,
-        await this.report(input, {
+        await this.#report(input, {
           issues: ['PPTX input must be inside project exports'],
         }),
       );
     }
-    const pptxPath = await this.artifacts.resolvePath(
+    const pptxPath = await this.#artifacts.resolvePath(
       input.projectId,
       input.pptxPath,
     );
-    const pptxBytes = await this.artifacts.read(
+    const pptxBytes = await this.#artifacts.read(
       input.projectId,
       input.pptxPath,
     );
     const actualHash = createHash('sha256').update(pptxBytes).digest('hex');
     if (actualHash !== input.exportSha256) {
-      return this.persist(
+      return this.#persist(
         input,
-        await this.report(input, {
+        await this.#report(input, {
           status: 'failed',
           issues: ['PPTX input hash does not match validated export receipt'],
         }),
       );
     }
     const runDirectoryRelative = `qa/run-${input.round}`;
-    const qaDirectory = await this.artifacts.ensureDirectory(
+    const qaDirectory = await this.#artifacts.ensureDirectory(
       input.projectId,
       runDirectoryRelative,
     );
-    const profileDirectory = await this.artifacts.ensureDirectory(
+    const profileDirectory = await this.#artifacts.ensureDirectory(
       input.projectId,
       `${runDirectoryRelative}/profile`,
     );
-    const tempDirectory = await this.artifacts.ensureDirectory(
+    const tempDirectory = await this.#artifacts.ensureDirectory(
       input.projectId,
       `${runDirectoryRelative}/temp`,
     );
-    const soffice = await this.firstExecutable([
-      this.options.configuredSoffice,
-      ...(this.options.bundledSoffice ?? defaultBundledSoffice),
+    const soffice = await this.#firstExecutable([
+      this.#options.configuredSoffice,
+      ...(this.#options.bundledSoffice ?? defaultBundledSoffice),
     ]);
     if (!soffice) {
-      return this.persist(
+      return this.#persist(
         input,
-        await this.report(input, {
+        await this.#report(input, {
           issues: ['LibreOffice soffice executable is unavailable'],
         }),
       );
     }
-    const renderer = await this.firstExecutable(
-      this.options.pdfRenderers ?? ['pdftoppm'],
+    const renderer = await this.#firstExecutable(
+      this.#options.pdfRenderers ?? ['pdftoppm'],
     );
     if (!renderer) {
-      return this.persist(
+      return this.#persist(
         input,
-        await this.report(input, {
+        await this.#report(input, {
           sofficePath: soffice,
           issues: ['A PDF page renderer is unavailable'],
         }),
       );
     }
     const commandOptions: CommandRunOptions = {
-      timeoutMs: this.options.commandTimeoutMs ?? 30_000,
-      maxOutputBytes: this.options.maxCommandOutputBytes ?? 64_000,
+      timeoutMs: this.#options.commandTimeoutMs ?? 30_000,
+      maxOutputBytes: this.#options.maxCommandOutputBytes ?? 64_000,
       env: { TMPDIR: tempDirectory },
     };
-    const conversion = await this.commands.run(
+    const conversion = await this.#commands.run(
       soffice,
       [
         `-env:UserInstallation=${pathToFileURL(profileDirectory).href}`,
@@ -315,9 +360,9 @@ export class LibreOfficeQa implements QaRunner {
     const stem = basename(pptxPath, extname(pptxPath));
     const pdfPath = join(qaDirectory, `${stem}.pdf`);
     if (conversion.exitCode !== 0 || conversion.timedOut) {
-      return this.persist(
+      return this.#persist(
         input,
-        await this.report(input, {
+        await this.#report(input, {
           sofficePath: soffice,
           rendererPath: renderer,
           pdfPath,
@@ -327,15 +372,15 @@ export class LibreOfficeQa implements QaRunner {
       );
     }
     const renderPrefix = join(qaDirectory, 'rendered');
-    const rendering = await this.commands.run(
+    const rendering = await this.#commands.run(
       renderer,
       ['-png', '-r', '144', pdfPath, renderPrefix],
       commandOptions,
     );
     if (rendering.exitCode !== 0 || rendering.timedOut) {
-      return this.persist(
+      return this.#persist(
         input,
-        await this.report(input, {
+        await this.#report(input, {
           sofficePath: soffice,
           rendererPath: renderer,
           pdfPath,
@@ -345,23 +390,23 @@ export class LibreOfficeQa implements QaRunner {
       );
     }
     const pageNames = (
-      await this.artifacts.list(input.projectId, runDirectoryRelative)
+      await this.#artifacts.list(input.projectId, runDirectoryRelative)
     )
       .filter((name) => /^rendered-\d+\.png$/.test(name))
       .sort(numericPageOrder);
     const pages = await Promise.all(
       pageNames.map(async (name) => ({
-        path: await this.artifacts.resolvePath(
+        path: await this.#artifacts.resolvePath(
           input.projectId,
           `${runDirectoryRelative}/${name}`,
         ),
-        contents: await this.artifacts.read(
+        contents: await this.#artifacts.read(
           input.projectId,
           `${runDirectoryRelative}/${name}`,
         ),
       })),
     );
-    const comparisons = await this.comparator.compare(pages);
+    const comparisons = await this.#comparator.compare(pages);
     if (comparisons.length !== pages.length) {
       throw new Error(
         'Rendered-page comparator must return one result per page',
@@ -380,9 +425,9 @@ export class LibreOfficeQa implements QaRunner {
         ? [`Blank rendered pages: ${blankPages.join(', ')}`]
         : []),
     ];
-    return this.persist(
+    return this.#persist(
       input,
-      await this.report(input, {
+      await this.#report(input, {
         status: issues.length === 0 ? 'passed' : 'failed',
         sofficePath: soffice,
         rendererPath: renderer,
@@ -396,18 +441,18 @@ export class LibreOfficeQa implements QaRunner {
     );
   }
 
-  private async firstExecutable(
+  async #firstExecutable(
     candidates: readonly (string | undefined)[],
   ): Promise<string | null> {
     for (const candidate of [
       ...new Set(candidates.filter((value): value is string => Boolean(value))),
     ]) {
-      if (await this.commands.canExecute(candidate)) return candidate;
+      if (await this.#commands.canExecute(candidate)) return candidate;
     }
     return null;
   }
 
-  private async report(
+  async #report(
     input: QaRunInput,
     values: Partial<LibreOfficeQaReport>,
   ): Promise<LibreOfficeQaReport> {
@@ -428,32 +473,38 @@ export class LibreOfficeQa implements QaRunner {
       blankPages: [],
       comparisons: [],
       issues: [],
-      jsonReportPath: await this.artifacts.resolvePath(
+      jsonReportPath: await this.#artifacts.resolvePath(
         input.projectId,
         `qa/qa-round-${input.round}.json`,
       ),
-      textReportPath: await this.artifacts.resolvePath(
+      textReportPath: await this.#artifacts.resolvePath(
         input.projectId,
-        `qa/qa-round-${input.round}.txt`,
+        `qa/qa-round-${input.round}.json`,
       ),
       ...values,
     };
   }
 
-  private async persist(
+  async #persist(
     input: QaRunInput,
     report: LibreOfficeQaReport,
   ): Promise<LibreOfficeQaReport> {
-    await this.artifacts.write(
-      input.projectId,
-      `qa/qa-round-${input.round}.json`,
-      JSON.stringify(report, null, 2),
-    );
-    await this.artifacts.write(
-      input.projectId,
-      `qa/qa-round-${input.round}.txt`,
-      textReport(report),
-    );
+    const readableSummary = textReport(report);
+    const relativePath = `qa/qa-round-${input.round}.json`;
+    const serialized = JSON.stringify({ ...report, readableSummary }, null, 2);
+    try {
+      await this.#artifacts.write(input.projectId, relativePath, serialized);
+    } catch (error) {
+      const persisted = await this.#artifacts
+        .read(input.projectId, relativePath)
+        .catch(() => undefined);
+      if (
+        !persisted ||
+        !Buffer.from(persisted).equals(Buffer.from(serialized, 'utf8'))
+      ) {
+        throw error;
+      }
+    }
     const frozen = deepFreeze(report);
     authenticQaReports.add(frozen);
     return frozen;

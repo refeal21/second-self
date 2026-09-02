@@ -8,7 +8,7 @@ import {
   unlink,
 } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { assertStrictIdentifier } from './identifiers.js';
 
 export const PROJECT_ARTIFACT_DIRECTORIES = [
@@ -53,8 +53,7 @@ export class LocalWorkspaceArtifacts implements WorkspaceArtifactAccess {
 
   async initializeProject(projectId: string): Promise<void> {
     assertStrictIdentifier('project', projectId);
-    await mkdir(this.workspaceRoot, { recursive: true });
-    await this.assertDirectoryWithoutSymlink(this.workspaceRoot);
+    await this.initializeWorkspaceRoot();
     const projectRoot = this.projectRoot(projectId);
     await this.mkdirChecked(projectRoot);
     for (const directory of PROJECT_ARTIFACT_DIRECTORIES) {
@@ -261,6 +260,45 @@ export class LocalWorkspaceArtifacts implements WorkspaceArtifactAccess {
       if (!isNodeError(error) || error.code !== 'EEXIST') throw error;
     });
     await this.assertDirectoryWithoutSymlink(path);
+  }
+
+  private async initializeWorkspaceRoot(): Promise<void> {
+    const parsed = parse(this.workspaceRoot);
+    const components = this.workspaceRoot
+      .slice(parsed.root.length)
+      .split('/')
+      .filter(Boolean);
+    let current = parsed.root;
+    await this.assertDirectoryWithoutSymlink(current);
+    let creating = false;
+    for (const component of components) {
+      current = join(current, component);
+      const status = await lstat(current).catch((error: unknown) => {
+        if (isNodeError(error) && error.code === 'ENOENT') return undefined;
+        throw error;
+      });
+      if (status) {
+        if (status.isSymbolicLink()) {
+          throw new Error(
+            `Workspace root path contains a symbolic link: ${current}`,
+          );
+        }
+        if (!status.isDirectory()) {
+          throw new Error(
+            `Workspace root path component is not a directory: ${current}`,
+          );
+        }
+        if (creating) {
+          throw new Error(
+            `Workspace root changed while it was being created: ${current}`,
+          );
+        }
+        continue;
+      }
+      creating = true;
+      await mkdir(current);
+      await this.assertDirectoryWithoutSymlink(current);
+    }
   }
 
   private async assertDirectoryWithoutSymlink(path: string): Promise<void> {

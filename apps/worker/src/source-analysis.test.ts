@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { createIsolatedPptWorkflow } from './ppt-project.js';
 import {
-  PptProjectService,
-  SourceAnalysisService,
   type SourceAnalysis,
   type SourceAnalysisGateway,
   type SourceAnalysisGatewayRequest,
@@ -16,6 +15,68 @@ class MemoryArtifacts implements WorkspaceArtifacts {
     if (this.writes.has(key)) throw new Error(`already exists: ${key}`);
     this.writes.set(key, contents);
     return `/workspace/${key}`;
+  }
+}
+
+class DeferredRequestArtifacts extends MemoryArtifacts {
+  private releaseWrite: (() => void) | undefined;
+  private markStarted!: () => void;
+  readonly writeStarted = new Promise<void>((resolve) => {
+    this.markStarted = resolve;
+  });
+
+  release(): void {
+    this.releaseWrite?.();
+  }
+
+  override async write(
+    projectId: string,
+    path: string,
+    contents: string | Uint8Array,
+  ) {
+    if (path === 'sources/analysis-1-request.json') {
+      this.markStarted();
+      await new Promise<void>((resolve) => {
+        this.releaseWrite = resolve;
+      });
+    }
+    return super.write(projectId, path, contents);
+  }
+}
+
+class FailOnceRequestArtifacts extends MemoryArtifacts {
+  private failed = false;
+
+  override async write(
+    projectId: string,
+    path: string,
+    contents: string | Uint8Array,
+  ) {
+    if (!this.failed && path === 'sources/analysis-1-request.json') {
+      this.failed = true;
+      throw new Error('simulated request write failure');
+    }
+    return super.write(projectId, path, contents);
+  }
+}
+
+class FailOncePathArtifacts extends MemoryArtifacts {
+  private failed = false;
+
+  constructor(private readonly failedPath: string) {
+    super();
+  }
+
+  override async write(
+    projectId: string,
+    path: string,
+    contents: string | Uint8Array,
+  ) {
+    if (!this.failed && path === this.failedPath) {
+      this.failed = true;
+      throw new Error(`simulated ${path} write failure`);
+    }
+    return super.write(projectId, path, contents);
   }
 }
 
@@ -44,9 +105,11 @@ class FakeSourceAnalysisGateway implements SourceAnalysisGateway {
   }
 }
 
-async function createProject() {
-  const artifacts = new MemoryArtifacts();
-  const projects = new PptProjectService(artifacts);
+async function createProject(
+  artifacts: MemoryArtifacts = new MemoryArtifacts(),
+) {
+  const workflow = createIsolatedPptWorkflow(artifacts);
+  const { projects } = workflow;
   await projects.createProject({
     id: 'project-1',
     name: 'Deck',
@@ -58,14 +121,14 @@ async function createProject() {
     mediaType: 'application/pdf',
     contents: new Uint8Array([1]),
   });
-  return { artifacts, projects };
+  return { artifacts, projects, workflow };
 }
 
 describe('source analysis approval and provenance', () => {
   it('persists web-search approval and binds output to project/request/source set', async () => {
-    const { artifacts, projects } = await createProject();
+    const { artifacts, projects, workflow } = await createProject();
     const gateway = new FakeSourceAnalysisGateway();
-    const service = new SourceAnalysisService(projects, gateway);
+    const service = workflow.sourceAnalysis(gateway);
     const pending = await service.request({
       id: 'analysis-1',
       projectId: 'project-1',
@@ -122,11 +185,8 @@ describe('source analysis approval and provenance', () => {
   });
 
   it('rejects unsafe request/source ids and unattached source sets', async () => {
-    const { projects } = await createProject();
-    const service = new SourceAnalysisService(
-      projects,
-      new FakeSourceAnalysisGateway(),
-    );
+    const { workflow } = await createProject();
+    const service = workflow.sourceAnalysis(new FakeSourceAnalysisGateway());
     await expect(
       service.request({
         id: '../analysis',
@@ -144,13 +204,12 @@ describe('source analysis approval and provenance', () => {
   });
 
   it('rejects model output citing a source outside the requested source set', async () => {
-    const { projects } = await createProject();
+    const { projects, workflow } = await createProject();
     const invalid: SourceAnalysis = {
       ...validAnalysis,
       findings: [{ id: 'finding-1', text: 'Forged', sourceIds: ['source-2'] }],
     };
-    const service = new SourceAnalysisService(
-      projects,
+    const service = workflow.sourceAnalysis(
       new FakeSourceAnalysisGateway(invalid),
     );
     await service.request({
@@ -166,7 +225,7 @@ describe('source analysis approval and provenance', () => {
   });
 
   it('shares a project lock across service instances and marks running before awaiting the gateway', async () => {
-    const { projects } = await createProject();
+    const { workflow } = await createProject();
     let resolveOutput: ((output: SourceAnalysis) => void) | undefined;
     const gateway: SourceAnalysisGateway = {
       analyze: () =>
@@ -174,8 +233,8 @@ describe('source analysis approval and provenance', () => {
           resolveOutput = resolve;
         }),
     };
-    const firstService = new SourceAnalysisService(projects, gateway);
-    const secondService = new SourceAnalysisService(projects, gateway);
+    const firstService = workflow.sourceAnalysis(gateway);
+    const secondService = workflow.sourceAnalysis(gateway);
     await firstService.request({
       id: 'analysis-1',
       projectId: 'project-1',
@@ -189,5 +248,115 @@ describe('source analysis approval and provenance', () => {
     expect(secondService.get('analysis-1').status).toBe('running');
     resolveOutput?.(validAnalysis);
     await expect(first).resolves.toMatchObject({ status: 'completed' });
+  });
+
+  it('reserves a project before request artifact I/O so a concurrent loser writes nothing', async () => {
+    const artifacts = new DeferredRequestArtifacts();
+    const { workflow } = await createProject(artifacts);
+    const firstService = workflow.sourceAnalysis(
+      new FakeSourceAnalysisGateway(),
+    );
+    const secondService = workflow.sourceAnalysis(
+      new FakeSourceAnalysisGateway(),
+    );
+
+    const first = firstService.request({
+      id: 'analysis-1',
+      projectId: 'project-1',
+      sourceIds: ['source-1'],
+    });
+    await artifacts.writeStarted;
+    expect(
+      workflow.projects.getProjectSnapshot('project-1').project.workflowStatus,
+    ).toBe('source_analysis');
+    await expect(
+      secondService.request({
+        id: 'analysis-2',
+        projectId: 'project-1',
+        sourceIds: ['source-1'],
+      }),
+    ).rejects.toThrow('reserved');
+    expect(
+      artifacts.writes.has('project-1/sources/analysis-2-request.json'),
+    ).toBe(false);
+
+    artifacts.release();
+    await expect(first).resolves.toMatchObject({ status: 'ready' });
+  });
+
+  it('rolls back request reservations after artifact I/O failure so retry is clean', async () => {
+    const artifacts = new FailOnceRequestArtifacts();
+    const { workflow } = await createProject(artifacts);
+    const service = workflow.sourceAnalysis(new FakeSourceAnalysisGateway());
+    const input = {
+      id: 'analysis-1',
+      projectId: 'project-1',
+      sourceIds: ['source-1'],
+    } as const;
+
+    await expect(service.request(input)).rejects.toThrow(
+      'simulated request write failure',
+    );
+    await expect(service.request(input)).resolves.toMatchObject({
+      status: 'ready',
+    });
+    expect(
+      [...artifacts.writes.keys()].filter((path) =>
+        path.endsWith('analysis-1-request.json'),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('keeps web-search approval retryable when its artifact write fails', async () => {
+    const artifacts = new FailOncePathArtifacts(
+      'sources/analysis-1-web-search-approval.json',
+    );
+    const { workflow } = await createProject(artifacts);
+    const service = workflow.sourceAnalysis(new FakeSourceAnalysisGateway());
+    await service.request({
+      id: 'analysis-1',
+      projectId: 'project-1',
+      sourceIds: ['source-1'],
+      webSearchQuery: 'approved query',
+    });
+
+    await expect(
+      service.decideWebSearch('analysis-1', true, '2026-09-01T01:00:00.000Z'),
+    ).rejects.toThrow('write failure');
+    expect(service.get('analysis-1').status).toBe(
+      'awaiting_web_search_approval',
+    );
+    expect(service.get('analysis-1').webSearchDecision).toBeUndefined();
+
+    await expect(
+      service.decideWebSearch('analysis-1', true, '2026-09-01T01:00:00.000Z'),
+    ).resolves.toMatchObject({ status: 'ready' });
+  });
+
+  it('keeps analysis execution retryable when evidence persistence fails', async () => {
+    const artifacts = new FailOncePathArtifacts(
+      'sources/analysis-1-analysis.json',
+    );
+    const { projects, workflow } = await createProject(artifacts);
+    const service = workflow.sourceAnalysis(new FakeSourceAnalysisGateway());
+    await service.request({
+      id: 'analysis-1',
+      projectId: 'project-1',
+      sourceIds: ['source-1'],
+    });
+
+    await expect(service.execute('analysis-1')).rejects.toThrow(
+      'write failure',
+    );
+    expect(service.get('analysis-1').status).toBe('ready');
+    expect(projects.getProjectSnapshot('project-1')).toMatchObject({
+      project: { workflowStatus: 'source_analysis' },
+      sourceAnalysis: null,
+      sourceAnalysisEvidence: null,
+    });
+
+    await expect(service.execute('analysis-1')).resolves.toMatchObject({
+      status: 'completed',
+    });
   });
 });

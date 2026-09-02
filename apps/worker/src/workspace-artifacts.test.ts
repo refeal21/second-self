@@ -3,6 +3,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  realpath,
   rm,
   symlink,
 } from 'node:fs/promises';
@@ -26,7 +27,9 @@ afterEach(async () => {
 
 describe('local workspace artifact boundary', () => {
   it('creates exactly the six project artifact folders and writes inside them', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-'));
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-')),
+    );
     temporaryDirectories.push(root);
     const artifacts = new LocalWorkspaceArtifacts(root);
 
@@ -46,7 +49,9 @@ describe('local workspace artifact boundary', () => {
   });
 
   it('rejects project ids and artifact paths that escape the workspace', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-'));
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-')),
+    );
     temporaryDirectories.push(root);
     const artifacts = new LocalWorkspaceArtifacts(root);
 
@@ -59,7 +64,9 @@ describe('local workspace artifact boundary', () => {
   it.each(['', '.', '..', 'UPPER', 'bad/project'])(
     'rejects unsafe project identifier %j',
     async (projectId) => {
-      const root = await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-'));
+      const root = await realpath(
+        await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-')),
+      );
       temporaryDirectories.push(root);
       const artifacts = new LocalWorkspaceArtifacts(root);
 
@@ -70,7 +77,9 @@ describe('local workspace artifact boundary', () => {
   );
 
   it('rejects dot path components and cannot cross from slide specs into outline', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-'));
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-')),
+    );
     temporaryDirectories.push(root);
     const artifacts = new LocalWorkspaceArtifacts(root);
     await artifacts.initializeProject('project-1');
@@ -93,7 +102,9 @@ describe('local workspace artifact boundary', () => {
   });
 
   it('uses create-only writes so a frozen artifact cannot be overwritten', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-'));
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-')),
+    );
     temporaryDirectories.push(root);
     const artifacts = new LocalWorkspaceArtifacts(root);
     await artifacts.initializeProject('project-1');
@@ -108,8 +119,12 @@ describe('local workspace artifact boundary', () => {
   });
 
   it('rejects a symlink replacing one of the six fixed directories', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-'));
-    const outside = await mkdtemp(join(tmpdir(), 'digital-twin-outside-'));
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-')),
+    );
+    const outside = await realpath(
+      await mkdtemp(join(tmpdir(), 'digital-twin-outside-')),
+    );
     temporaryDirectories.push(root, outside);
     const artifacts = new LocalWorkspaceArtifacts(root);
     await artifacts.initializeProject('project-1');
@@ -123,8 +138,12 @@ describe('local workspace artifact boundary', () => {
   });
 
   it('rejects a symlink in any existing nested directory component', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-'));
-    const outside = await mkdtemp(join(tmpdir(), 'digital-twin-outside-'));
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-')),
+    );
+    const outside = await realpath(
+      await mkdtemp(join(tmpdir(), 'digital-twin-outside-')),
+    );
     temporaryDirectories.push(root, outside);
     const artifacts = new LocalWorkspaceArtifacts(root);
     await artifacts.initializeProject('project-1');
@@ -135,5 +154,34 @@ describe('local workspace artifact boundary', () => {
       artifacts.write('project-1', 'qa/run-1/profile/escaped.json', 'nope'),
     ).rejects.toThrow('symbolic link');
     expect(await readdir(outside)).toEqual([]);
+  });
+
+  it('rejects an existing symlink in the workspace root parent chain before mkdir', async () => {
+    const rawBase = await mkdtemp(join(tmpdir(), 'digital-twin-parent-'));
+    const base = await realpath(rawBase);
+    const rawOutside = await mkdtemp(join(tmpdir(), 'digital-twin-outside-'));
+    const outside = await realpath(rawOutside);
+    temporaryDirectories.push(base, outside);
+    await symlink(outside, join(base, 'linked-parent'));
+    const artifacts = new LocalWorkspaceArtifacts(
+      join(base, 'linked-parent', 'new-workspace'),
+    );
+
+    await expect(artifacts.initializeProject('project-1')).rejects.toThrow(
+      'symbolic link',
+    );
+    expect(await readdir(outside)).toEqual([]);
+  });
+
+  it('rejects non-string identifiers before applying the identifier pattern', async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'digital-twin-artifacts-')),
+    );
+    temporaryDirectories.push(root);
+    const artifacts = new LocalWorkspaceArtifacts(root);
+
+    await expect(
+      artifacts.initializeProject(12 as unknown as string),
+    ).rejects.toThrow('Invalid project identifier');
   });
 });

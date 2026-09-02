@@ -1,10 +1,10 @@
 import type { Version } from '@digital-twin/core';
 import {
   type ApprovedVisualAsset,
-  PptProjectService,
+  type ProjectMutationPort,
+  type PptProjectService,
   type SlideSpec,
 } from './ppt-project.js';
-import { STORE_GENERATED_VISUAL } from './visual-evidence.js';
 
 export type VisualAssetUsage =
   | 'full_slide_reference'
@@ -59,10 +59,19 @@ export type VisualGenerationServiceResult =
     };
 
 export class VisualGenerationService {
+  readonly #projects: PptProjectService;
+  readonly #gateway: VisualGenerationGateway;
+  readonly #mutations: ProjectMutationPort;
+
   constructor(
-    private readonly projects: PptProjectService,
-    private readonly gateway: VisualGenerationGateway,
-  ) {}
+    projects: PptProjectService,
+    gateway: VisualGenerationGateway,
+    mutations: ProjectMutationPort,
+  ) {
+    this.#projects = projects;
+    this.#gateway = gateway;
+    this.#mutations = mutations;
+  }
 
   async generate(
     projectId: string,
@@ -70,16 +79,16 @@ export class VisualGenerationService {
   ): Promise<VisualGenerationServiceResult> {
     let release: (() => void) | undefined;
     try {
-      release = this.projects.acquireProjectOperation(
+      release = this.#mutations.acquireOperation(
         projectId,
         'slide visual generation',
       );
-      const { spec, version } = this.projects.getApprovedSlideSpec(
+      const { spec, version } = this.#projects.getApprovedSlideSpec(
         projectId,
         slideId,
       );
-      const projectCwd = await this.projects.projectDirectory(projectId);
-      const result = await this.gateway.generate({
+      const projectCwd = await this.#projects.projectDirectory(projectId);
+      const result = await this.#gateway.generate({
         projectId,
         projectCwd,
         slideId,
@@ -88,10 +97,14 @@ export class VisualGenerationService {
         imageGenerationBrief: spec.imageGenerationBrief,
       });
       if (result.status === 'blocked') {
-        this.projects.blockVisualGeneration(projectId, slideId, result.message);
+        this.#mutations.blockVisualGeneration(
+          projectId,
+          slideId,
+          result.message,
+        );
         return result;
       }
-      const visual = await this.projects[STORE_GENERATED_VISUAL]({
+      const visual = await this.#mutations.storeGeneratedVisual({
         projectId,
         slideId,
         generated: result,
@@ -109,14 +122,14 @@ export class VisualGenerationService {
   }
 
   async resume(projectId: string): Promise<void> {
-    const capability = await this.gateway.capability();
+    const capability = await this.#gateway.capability();
     if (
       capability.id !== 'image_gen.imagegen' ||
       capability.status !== 'available'
     ) {
       throw new Error('The ImageGen capability is still unavailable');
     }
-    this.projects.resumeVisualReview(projectId);
+    this.#mutations.resumeVisualReview(projectId);
   }
 }
 

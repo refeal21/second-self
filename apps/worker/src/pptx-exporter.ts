@@ -66,7 +66,9 @@ export class PptxGenJsExporter implements PptxExporter {
       if (
         visual &&
         visual.asset.textFree &&
-        visual.asset.usage !== 'full_slide_reference'
+        visual.asset.usage !== 'full_slide_reference' &&
+        visual.asset.embeddingAudit?.approvedForEmbedding === true &&
+        visual.asset.embeddingAudit.classification === visual.asset.usage
       ) {
         addApprovedVisual(
           slide,

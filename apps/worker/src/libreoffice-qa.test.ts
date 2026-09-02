@@ -3,6 +3,7 @@ import { PNG } from 'pngjs';
 import { createHash } from 'node:crypto';
 import {
   LibreOfficeQa,
+  LocalCommandRunner,
   PngPixelPageComparator,
   QaRepairOrchestrator,
   type CommandResult,
@@ -83,6 +84,18 @@ class MemoryArtifactAccess implements WorkspaceArtifactAccess {
   }
 }
 
+class CreateOnlyQaArtifacts extends MemoryArtifactAccess {
+  override async write(
+    projectId: string,
+    path: string,
+    contents: string | Uint8Array,
+  ): Promise<string> {
+    const key = `${projectId}/${path}`;
+    if (this.writes.has(key)) throw new Error(`already exists: ${key}`);
+    return super.write(projectId, path, contents);
+  }
+}
+
 class DeterministicComparator implements RenderedPageComparator {
   async compare(pages: readonly { path: string; contents: Uint8Array }[]) {
     return pages.map((page, index) => ({
@@ -130,7 +143,7 @@ describe('LibreOffice presentation QA', () => {
     expect(results.map(({ blank }) => blank)).toEqual([true, true, false]);
   });
 
-  it('detects bundled soffice, converts and renders headlessly, then writes JSON and text reports', async () => {
+  it('detects bundled soffice, converts and renders headlessly, then writes one atomic QA bundle', async () => {
     const commands = new FakeCommandRunner([
       '/Applications/LibreOffice.app/Contents/MacOS/soffice',
       'pdftoppm',
@@ -196,9 +209,35 @@ describe('LibreOffice presentation QA', () => {
       comparisons: [{ differenceScore: 0 }, { differenceScore: 0.25 }],
     });
     expect(artifacts.writes.has('project-1/qa/qa-round-1.json')).toBe(true);
+    expect(artifacts.writes.has('project-1/qa/qa-round-1.txt')).toBe(false);
     expect(
-      String(artifacts.writes.get('project-1/qa/qa-round-1.txt')),
+      String(artifacts.writes.get('project-1/qa/qa-round-1.json')),
     ).toContain('Blank rendered pages: 2');
+  });
+
+  it('persists create-only QA output with one write so no partial second-file dead end exists', async () => {
+    const artifacts = new CreateOnlyQaArtifacts();
+    artifacts.files.set('project-1/exports/deck.pptx', exportBytes);
+    const qa = new LibreOfficeQa(
+      new FakeCommandRunner([]),
+      artifacts,
+      new DeterministicComparator(),
+      { bundledSoffice: [], pdfRenderers: [] },
+    );
+
+    const report = await qa.run({
+      projectId: 'project-1',
+      pptxPath: 'exports/deck.pptx',
+      expectedPageCount: 1,
+      round: 1,
+      ...receipt,
+    });
+
+    expect(report.status).toBe('blocked');
+    expect([...artifacts.writes.keys()]).toEqual([
+      'project-1/qa/qa-round-1.json',
+    ]);
+    expect(report.textReportPath).toBe(report.jsonReportPath);
   });
 
   it('returns a capability-unavailable report without attempting conversion when soffice is absent', async () => {
@@ -287,6 +326,37 @@ describe('LibreOffice presentation QA', () => {
     });
     expect(timeoutReport).toMatchObject({ status: 'failed' });
     expect(timeoutReport.issues.join(' ')).toContain('timed out');
+  });
+});
+
+describe('local command runner process boundaries', () => {
+  it('caps multibyte stdout and stderr by bytes', async () => {
+    const result = await new LocalCommandRunner().run(
+      process.execPath,
+      [
+        '-e',
+        'process.stdout.write("😀".repeat(20));process.stderr.write("界".repeat(20))',
+      ],
+      { timeoutMs: 2_000, maxOutputBytes: 8 },
+    );
+
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(8);
+    expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(8);
+  });
+
+  it('settles promptly after timeout even when a descendant inherited output pipes', async () => {
+    const started = Date.now();
+    const result = await new LocalCommandRunner().run(
+      process.execPath,
+      [
+        '-e',
+        'require("node:child_process").spawn(process.execPath,["-e","setTimeout(()=>{},800)"],{stdio:["ignore","inherit","inherit"]});setInterval(()=>{},1000)',
+      ],
+      { timeoutMs: 50, maxOutputBytes: 1024 },
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(Date.now() - started).toBeLessThan(500);
   });
 });
 

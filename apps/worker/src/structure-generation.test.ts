@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { createIsolatedPptWorkflow } from './ppt-project.js';
 import {
   OutlineGenerationService,
-  PptProjectService,
   SlideSpecGenerationService,
-  SourceAnalysisService,
   type OutlineGenerationGateway,
   type SlideSpec,
   type SlideSpecGenerationGateway,
@@ -23,7 +22,8 @@ class MemoryArtifacts implements WorkspaceArtifacts {
 }
 
 async function analyzedProject() {
-  const projects = new PptProjectService(new MemoryArtifacts());
+  const workflow = createIsolatedPptWorkflow(new MemoryArtifacts());
+  const { projects } = workflow;
   await projects.createProject({
     id: 'project-1',
     name: 'Deck',
@@ -34,6 +34,12 @@ async function analyzedProject() {
     fileName: 'report.pdf',
     mediaType: 'application/pdf',
     contents: new Uint8Array([1]),
+  });
+  await projects.attachSource('project-1', {
+    id: 'source-2',
+    fileName: 'unused.pdf',
+    mediaType: 'application/pdf',
+    contents: new Uint8Array([2]),
   });
   const analysisGateway: SourceAnalysisGateway = {
     analyze: async () => ({
@@ -49,7 +55,7 @@ async function analyzedProject() {
       sourceMap: [{ sourceId: 'source-1', title: 'Report', locator: 'page 8' }],
     }),
   };
-  const analysis = new SourceAnalysisService(projects, analysisGateway);
+  const analysis = workflow.sourceAnalysis(analysisGateway);
   await analysis.request({
     id: 'analysis-1',
     projectId: 'project-1',
@@ -73,6 +79,22 @@ const generatedSpec: SlideSpec = {
 };
 
 describe('structured AI generation provenance', () => {
+  it('rejects outline citations to an attached source outside the completed analysis set', async () => {
+    const projects = await analyzedProject();
+    await expect(
+      projects.submitOutline('project-1', {
+        title: 'Deck',
+        slides: [
+          {
+            id: 'slide-1',
+            title: 'Growth',
+            purpose: 'Explain growth',
+            sourceIds: ['source-2'],
+          },
+        ],
+      }),
+    ).rejects.toThrow('completed analysis source set');
+  });
   it('gives the outline gateway only completed validated analysis evidence', async () => {
     const projects = await analyzedProject();
     const requests: unknown[] = [];

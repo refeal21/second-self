@@ -18,13 +18,16 @@ export interface OutlineGenerationGateway {
 }
 
 export class OutlineGenerationService {
-  constructor(
-    private readonly projects: PptProjectService,
-    private readonly gateway: OutlineGenerationGateway,
-  ) {}
+  readonly #projects: PptProjectService;
+  readonly #gateway: OutlineGenerationGateway;
+
+  constructor(projects: PptProjectService, gateway: OutlineGenerationGateway) {
+    this.#projects = projects;
+    this.#gateway = gateway;
+  }
 
   async generate(projectId: string): Promise<Version> {
-    const snapshot = this.projects.getProjectSnapshot(projectId);
+    const snapshot = this.#projects.getProjectSnapshot(projectId);
     if (
       snapshot.project.workflowStatus !== 'source_analysis' ||
       !snapshot.sourceAnalysis ||
@@ -34,12 +37,12 @@ export class OutlineGenerationService {
         'Outline generation requires completed validated source analysis',
       );
     }
-    const outline = await this.gateway.generate({
+    const outline = await this.#gateway.generate({
       projectId,
       analysis: snapshot.sourceAnalysis,
       analysisEvidence: snapshot.sourceAnalysisEvidence,
     });
-    return this.projects.submitOutline(projectId, outline);
+    return this.#projects.submitOutline(projectId, outline);
   }
 }
 
@@ -55,13 +58,19 @@ export interface SlideSpecGenerationGateway {
 }
 
 export class SlideSpecGenerationService {
+  readonly #projects: PptProjectService;
+  readonly #gateway: SlideSpecGenerationGateway;
+
   constructor(
-    private readonly projects: PptProjectService,
-    private readonly gateway: SlideSpecGenerationGateway,
-  ) {}
+    projects: PptProjectService,
+    gateway: SlideSpecGenerationGateway,
+  ) {
+    this.#projects = projects;
+    this.#gateway = gateway;
+  }
 
   async generate(projectId: string): Promise<Version> {
-    const snapshot = this.projects.getProjectSnapshot(projectId);
+    const snapshot = this.#projects.getProjectSnapshot(projectId);
     if (
       snapshot.project.workflowStatus !== 'detail_review' ||
       snapshot.outline?.version.status !== 'frozen' ||
@@ -69,12 +78,12 @@ export class SlideSpecGenerationService {
     ) {
       throw new Error('Slide-spec generation requires a frozen outline');
     }
-    const specs = await this.gateway.generate({
+    const specs = await this.#gateway.generate({
       projectId,
       outline: snapshot.outline.value,
       outlineVersion: snapshot.outline.version,
       analysis: snapshot.sourceAnalysis,
     });
-    return this.projects.submitSlideSpecs(projectId, specs);
+    return this.#projects.submitSlideSpecs(projectId, specs);
   }
 }

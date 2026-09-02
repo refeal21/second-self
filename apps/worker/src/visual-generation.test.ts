@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { createIsolatedPptWorkflow } from './ppt-project.js';
 import {
   CodexVisualGenerationGateway,
-  PptProjectService,
-  VisualGenerationService,
+  type PptProjectService,
   type CodexImageGenTurnRequest,
   type CodexImageGenTurnRunner,
   type GeneratedVisualAsset,
@@ -84,8 +84,17 @@ const spec: SlideSpec = {
   imageGenerationBrief: 'Text-free blue abstract growth bars.',
 };
 
+const validPng = Uint8Array.from(
+  Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  ),
+);
+
 async function projectAtVisualReview(artifacts: WorkspaceArtifacts) {
-  const projects = new PptProjectService(artifacts);
+  const workflow = createIsolatedPptWorkflow(artifacts);
+  const { projects } = workflow;
+  workflowByProjects.set(projects, workflow);
   await projects.createProject({
     id: 'project-1',
     name: 'Deck',
@@ -97,9 +106,9 @@ async function projectAtVisualReview(artifacts: WorkspaceArtifacts) {
     mediaType: 'application/pdf',
     contents: new Uint8Array([1]),
   });
-  const sourceAnalysis = new (
-    await import('./source-analysis.js')
-  ).SourceAnalysisService(projects, { analyze: async () => analysis });
+  const sourceAnalysis = workflow.sourceAnalysis({
+    analyze: async () => analysis,
+  });
   await sourceAnalysis.request({
     id: 'analysis-1',
     projectId: 'project-1',
@@ -116,9 +125,23 @@ async function projectAtVisualReview(artifacts: WorkspaceArtifacts) {
   return projects;
 }
 
+const workflowByProjects = new WeakMap<
+  PptProjectService,
+  ReturnType<typeof createIsolatedPptWorkflow>
+>();
+
+function visualService(
+  projects: PptProjectService,
+  gateway: VisualGenerationGateway,
+) {
+  const workflow = workflowByProjects.get(projects);
+  if (!workflow) throw new Error('Missing isolated test workflow');
+  return workflow.visualGeneration(gateway);
+}
+
 const generatedVisual = (byte = 7): GeneratedVisualAsset => ({
   status: 'generated',
-  image: new Uint8Array([byte]),
+  image: byte === 99 ? new Uint8Array([byte]) : validPng,
   mediaType: 'image/png',
   usage: 'full_slide_reference',
   textFree: false,
@@ -141,8 +164,8 @@ describe('slide visual generation and approval', () => {
     const artifacts = new MemoryArtifacts();
     const projects = await projectAtVisualReview(artifacts);
     const gateway = new DeferredVisualGateway();
-    const visuals = new VisualGenerationService(projects, gateway);
-    const secondVisuals = new VisualGenerationService(projects, gateway);
+    const visuals = visualService(projects, gateway);
+    const secondVisuals = visualService(projects, gateway);
 
     const first = visuals.generate('project-1', 'slide-1');
     await expect(
@@ -166,15 +189,35 @@ describe('slide visual generation and approval', () => {
       projectCwd: '/workspace/project-1',
     });
     expect(artifacts.writes.get('project-1/visuals/slide-1-v1.png')).toEqual(
-      new Uint8Array([7]),
+      validPng,
     );
+  });
+
+  it('rejects bytes that are not a decodable PNG before artifact storage', async () => {
+    const artifacts = new MemoryArtifacts();
+    const projects = await projectAtVisualReview(artifacts);
+    const visuals = visualService(projects, {
+      capability: async () => ({
+        id: 'image_gen.imagegen',
+        status: 'available',
+      }),
+      generate: async () => generatedVisual(99),
+    });
+
+    await expect(visuals.generate('project-1', 'slide-1')).rejects.toThrow(
+      'decodable PNG',
+    );
+    expect(artifacts.writes.has('project-1/visuals/slide-1-v1.png')).toBe(
+      false,
+    );
+    expect(projects.getProjectSnapshot('project-1').visuals).toEqual({});
   });
 
   it('freezes each approved page and reopening it creates a new current version', async () => {
     const artifacts = new MemoryArtifacts();
     const projects = await projectAtVisualReview(artifacts);
     const gateway = new DeferredVisualGateway();
-    const visuals = new VisualGenerationService(projects, gateway);
+    const visuals = visualService(projects, gateway);
 
     const first = visuals.generate('project-1', 'slide-1');
     await Promise.resolve();
@@ -228,7 +271,7 @@ describe('slide visual generation and approval', () => {
     const artifacts = new MemoryArtifacts();
     const projects = await projectAtVisualReview(artifacts);
     let byte = 0;
-    const visuals = new VisualGenerationService(projects, {
+    const visuals = visualService(projects, {
       capability: async () => ({
         id: 'image_gen.imagegen',
         status: 'available',
@@ -355,7 +398,7 @@ describe('recoverable ImageGen blocking', () => {
         message: 'Unavailable',
       }),
     };
-    const service = new VisualGenerationService(projects, gateway);
+    const service = visualService(projects, gateway);
 
     await expect(
       service.generate('project-1', 'slide-1'),

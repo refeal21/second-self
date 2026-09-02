@@ -1,9 +1,34 @@
 export * from './app-server.js';
 export * from './delivery-coordinator.js';
-export type { ExportReceipt } from './delivery-evidence.js';
 export * from './general-tasks.js';
 export * from './libreoffice-qa.js';
-export * from './ppt-project.js';
+export {
+  PptProjectService,
+  createProductionPptWorkflow,
+} from './ppt-project.js';
+export type {
+  ApprovedVisualAsset,
+  AttachedSource,
+  ExportReceipt,
+  PptOutline,
+  PptProjectSnapshot,
+  ProductionPptWorkflow,
+  ProductionPptWorkflowInput,
+  QaCheckpoint,
+  RecoverableBlockedCondition,
+  SlideChart,
+  SlideShape,
+  SlideSpec,
+  SlideTable,
+  SlideVisualVersion,
+  SourceAnalysis,
+  SourceAnalysisEvidence,
+  SourceAttachment,
+  SourceCitation,
+  SourceDataPoint,
+  SourceFinding,
+  ValidatedSourceAnalysisEvidence,
+} from './ppt-project.js';
 export * from './pptx-exporter.js';
 export * from './source-analysis.js';
 export * from './structure-generation.js';

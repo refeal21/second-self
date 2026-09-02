@@ -279,6 +279,12 @@ describe('desktop workbench interactions', () => {
         projects: [],
         approvals: [],
         memories: [],
+        collections: {
+          projects: 'unavailable',
+          approvals: 'unavailable',
+          memories: 'unavailable',
+        },
+        settings: { workspacePath: '', codexPath: '' },
       },
     } as DesktopAdapter;
     render(<App adapter={nativeLike} />);
@@ -286,6 +292,133 @@ describe('desktop workbench interactions', () => {
     expect(screen.getByText('不可用')).toBeInTheDocument();
     expect(screen.getByText('尚未从本地服务读取')).toBeInTheDocument();
     expect(screen.queryByText('年度经营复盘与增长计划')).not.toBeInTheDocument();
-    expect(screen.getByText('本地适配器尚未提供项目数据。')).toBeInTheDocument();
+    expect(screen.getByText('项目数据不可用')).toBeInTheDocument();
+  });
+
+  it('disables reopen for an unstarted future slide', async () => {
+    const user = userEvent.setup();
+    const adapter = createDemoDesktopAdapter();
+    const reopen = vi.spyOn(adapter, 'reopenSlide');
+    render(<App adapter={adapter} initialRoute="workspace" />);
+
+    await user.click(screen.getByRole('button', { name: /05 实施保障/ }));
+    const button = screen.getByRole('button', { name: '重新打开' });
+    expect(button).toBeDisabled();
+    await user.click(button);
+    expect(reopen).not.toHaveBeenCalled();
+  });
+
+  it('renders and submits answers for every App Server question', async () => {
+    const user = userEvent.setup();
+    const base = createDemoDesktopAdapter();
+    const respondToTaskInput = vi.fn(async () => ({ status: '已提交全部回答。' }));
+    const adapter: DesktopAdapter = {
+      ...base,
+      async startTask(prompt) {
+        return {
+          id: 'multi-input-task',
+          prompt,
+          status: 'waiting_for_input',
+          transcript: [{ role: 'user', text: prompt }],
+          usage: '0 tokens',
+          error: null,
+          pendingInteraction: {
+            requestId: 'input-multi',
+            kind: 'user_input',
+            params: {
+              questions: [
+                {
+                  id: 'tone',
+                  header: '表达风格',
+                  question: '使用什么语气？',
+                  options: [
+                    { label: '简洁', description: '直接给出结论' },
+                    { label: '详细', description: '补充解释' },
+                  ],
+                },
+                {
+                  id: 'audience',
+                  header: '目标受众',
+                  question: '主要面向谁？',
+                  options: [
+                    { label: '管理层', description: '突出经营判断' },
+                    { label: '研发团队', description: '突出执行细节' },
+                  ],
+                },
+              ],
+            },
+          },
+        };
+      },
+      respondToTaskInput,
+    };
+    render(<App adapter={adapter} initialRoute="tasks" />);
+    await user.click(screen.getByRole('button', { name: /开始任务/ }));
+
+    expect(screen.getByRole('group', { name: '表达风格' })).toHaveTextContent(
+      '使用什么语气？',
+    );
+    expect(screen.getByText('直接给出结论')).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: '目标受众' })).toHaveTextContent(
+      '主要面向谁？',
+    );
+    await user.click(screen.getByLabelText('简洁'));
+    await user.click(screen.getByLabelText('管理层'));
+    await user.click(screen.getByRole('button', { name: '提交回答' }));
+
+    expect(respondToTaskInput).toHaveBeenCalledWith('multi-input-task', {
+      tone: ['简洁'],
+      audience: ['管理层'],
+    });
+  });
+
+  it('shows unavailable instead of empty-success copy for native collections', async () => {
+    const user = userEvent.setup();
+    const demo = createDemoDesktopAdapter();
+    const nativeLike = {
+      ...demo,
+      mode: 'tauri',
+      initialState: {
+        ...demo.initialState,
+        projects: [],
+        approvals: [],
+        memories: [],
+        collections: {
+          projects: 'unavailable',
+          approvals: 'unavailable',
+          memories: 'unavailable',
+        },
+      },
+    } as DesktopAdapter;
+    render(<App adapter={nativeLike} initialRoute="approvals" />);
+
+    expect(screen.getByText('审批数据不可用')).toBeInTheDocument();
+    expect(screen.queryByText('所有审批都已处理。')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('link', { name: '偏好记忆' }));
+    expect(screen.getByText('偏好记忆数据不可用')).toBeInTheDocument();
+  });
+
+  it('persists settings across route navigation after saving', async () => {
+    const user = userEvent.setup();
+    const adapter = createDemoDesktopAdapter();
+    const save = vi.spyOn(adapter, 'saveSettings');
+    render(<App adapter={adapter} initialRoute="settings" />);
+
+    await user.clear(screen.getByLabelText('默认工作区路径'));
+    await user.type(screen.getByLabelText('默认工作区路径'), '/tmp/persisted');
+    await user.clear(screen.getByLabelText('Codex 可执行路径'));
+    await user.type(screen.getByLabelText('Codex 可执行路径'), '/usr/local/bin/codex');
+    await user.click(screen.getByRole('button', { name: '保存设置' }));
+    expect(save).toHaveBeenCalledWith({
+      workspacePath: '/tmp/persisted',
+      codexPath: '/usr/local/bin/codex',
+    });
+    await user.click(screen.getByRole('link', { name: '首页' }));
+    await user.click(screen.getByRole('link', { name: '设置' }));
+
+    expect(screen.getByLabelText('默认工作区路径')).toHaveValue('/tmp/persisted');
+    expect(screen.getByLabelText('Codex 可执行路径')).toHaveValue(
+      '/usr/local/bin/codex',
+    );
   });
 });

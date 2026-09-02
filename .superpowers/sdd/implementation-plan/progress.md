@@ -103,7 +103,7 @@ Task 4: Ruling: one app-level reducer is authoritative for project identity/goal
 
 Task 4: Ruling: approving page 5 clamps selection to page 5 and advances the workflow to editable conversion/export-ready; reopening an earlier page demotes that page to waiting and all later pages to pending; stage-history clicks are read-only — this prevents impossible later completion from surviving workflow rollback.
 
-Task 4: Ruling: compact panel mode begins at 955px rather than the original `<900px` guideline because the collapsed navigation plus `170 + 400 + 310` minimum columns cannot fit at 900–955 — 956px is the first exact-fit width — if column minimums change, this breakpoint may be lowered only with browser overflow evidence.
+Task 4: Ruling (superseded by fix round 2): compact panel mode originally began at 955px, but the review boundary probe showed 956px must also remain compact; the authoritative boundary is now recorded below.
 
 Task 4: Ruling: project creation requires both name and goal, selection is by persisted adapter ID, and rename is an adapter mutation with pending/error UI; the previous explanatory no-op control is removed.
 
@@ -112,3 +112,17 @@ Task 4: Ruling: PPT approve/regenerate/reopen and memory actions use reducer mut
 Task 4: Ruling: compact workspace tabs implement tablist/tab/tabpanel ownership, roving tabindex, arrow/Home/End focus movement, and a real `main#main-content` skip destination; the document language/title are Chinese.
 
 Task 4: fix round 1 implementation complete pending review (native adapter scripted tests 4/4; store tests 4/4; desktop 35/35; core 8/8; worker 147/147; Rust integration 13/13; repository typecheck/lint/build green; Browser QA at 1440/955/900/820/390 plus 901/1279 shows zero horizontal overflow and zero console warnings/errors).
+
+Task 4: fix round 2 review rejected fix round 1 (pending future slides could be reopened/skip prior pages; App Server input rendered only the first question; native empty collections looked successfully processed; settings remounted; 956px missed compact mode).
+
+Task 4: Ruling: reopening is valid only when the target page is currently `approved`; reducer start and resolution both revalidate that exact state, preserve earlier page states, and never synthesize approval for predecessors — malformed or stale mutations become no-ops rather than repairing the workflow by inference.
+
+Task 4: Ruling: a user-input request is one atomic App Server interaction containing all questions; the UI renders every header/question/option/description, requires one answer per question, and sends a single answer map keyed by every question ID.
+
+Task 4: Ruling: native project/approval/memory collections have explicit `unavailable | loading | loaded` metadata independent of array length — an unavailable empty collection must say unavailable, while success-empty wording is reserved for `loaded`.
+
+Task 4: Ruling: workspace/Codex settings belong to the app-level store and survive route remounts; explicit save calls the adapter with that durable draft rather than rebuilding defaults inside the settings page.
+
+Task 4: Ruling: compact panel mode includes 956px and the full shell starts at 957px with exact-fit `169 + 400 + 310` columns — browser measurements require both document and workspace scroll widths to equal client widths at the boundary.
+
+Task 4: fix round 2 implementation complete pending review (RED 7 failures → focused GREEN 27/27; desktop 42/42 plus lint/typecheck/build green; Browser QA 956 compact and 957 exact-fit three-column with no horizontal overflow; pending page 5 reopen disabled; repository typecheck/lint green; core 8/8, worker 147/147, desktop 42/42, Rust integration 13/13 plus unit/doc suites; `git diff --check` green).

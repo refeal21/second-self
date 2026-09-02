@@ -10,29 +10,29 @@ describe('single workbench project and slide store', () => {
   it('approves page five without creating page six and enters conversion', () => {
     let state = demoState();
     const projectId = state.selectedProjectId!;
-    state = workbenchReducer(state, {
-      type: 'select-slide',
-      projectId,
-      slide: 5,
-    });
-    state = workbenchReducer(state, {
-      type: 'slide-mutation-started',
-      projectId,
-      token: 1,
-      kind: 'approve',
-      slide: 5,
-    });
-    state = workbenchReducer(state, {
-      type: 'slide-mutation-resolved',
-      projectId,
-      token: 1,
-      result: {
-        status: '第 5 页已批准，进入可编辑转换。',
-        nextSlide: 6,
-        stage: 'conversion',
-        exportReady: true,
-      },
-    });
+    for (const page of [3, 4, 5]) {
+      state = workbenchReducer(state, {
+        type: 'slide-mutation-started',
+        projectId,
+        token: page,
+        kind: 'approve',
+        slide: page,
+      });
+      state = workbenchReducer(state, {
+        type: 'slide-mutation-resolved',
+        projectId,
+        token: page,
+        result: {
+          status:
+            page === 5
+              ? '第 5 页已批准，进入可编辑转换。'
+              : `已批准，进入第 ${page + 1} 页`,
+          nextSlide: page + 1,
+          stage: page === 5 ? 'conversion' : undefined,
+          exportReady: page === 5,
+        },
+      });
+    }
 
     const project = state.projects.find((item) => item.id === projectId)!;
     expect(project.selectedSlide).toBe(5);
@@ -62,6 +62,79 @@ describe('single workbench project and slide store', () => {
       'pending',
       'pending',
     ]);
+  });
+
+  it('rejects reopening a pending future page without changing any status', () => {
+    let state = demoState();
+    const projectId = state.selectedProjectId!;
+    const before = state.projects[0]!;
+    state = workbenchReducer(state, {
+      type: 'slide-mutation-started',
+      projectId,
+      token: 30,
+      kind: 'reopen',
+      slide: 5,
+    });
+    state = workbenchReducer(state, {
+      type: 'slide-mutation-resolved',
+      projectId,
+      token: 30,
+      result: { status: '不应生效' },
+    });
+
+    expect(state.projects[0]).toEqual(before);
+  });
+
+  it('never infers prior approvals while reopening or approving', () => {
+    let state = demoState();
+    const projectId = state.selectedProjectId!;
+    state = {
+      ...state,
+      projects: state.projects.map((project) =>
+        project.id === projectId
+          ? {
+              ...project,
+              selectedSlide: 2,
+              slides: project.slides.map((slide) => ({
+                ...slide,
+                status:
+                  slide.page === 2
+                    ? ('approved' as const)
+                    : ('pending' as const),
+              })),
+            }
+          : project,
+      ),
+    };
+    state = workbenchReducer(state, {
+      type: 'reopen-slide',
+      projectId,
+      slide: 2,
+      status: '重新打开',
+    });
+    expect(state.projects[0]?.slides.map((slide) => slide.status)).toEqual([
+      'pending',
+      'waiting',
+      'pending',
+      'pending',
+      'pending',
+    ]);
+
+    const beforeSkip = state.projects[0]!;
+    state = workbenchReducer(state, {
+      type: 'slide-mutation-started',
+      projectId,
+      token: 31,
+      kind: 'approve',
+      slide: 4,
+    });
+    state = workbenchReducer(state, {
+      type: 'slide-mutation-resolved',
+      projectId,
+      token: 31,
+      result: { status: '跳页', nextSlide: 5 },
+    });
+    expect(state.projects[0]).toEqual(beforeSkip);
   });
 
   it('ignores stale PPT and memory mutation responses', () => {

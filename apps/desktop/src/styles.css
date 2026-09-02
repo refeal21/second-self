@@ -688,6 +688,46 @@ textarea::placeholder {
   display: flex;
   gap: 9px;
 }
+.task-footer > .task-input-response {
+  display: grid;
+  width: min(560px, 100%);
+  gap: 14px;
+}
+.task-input-response fieldset {
+  display: grid;
+  gap: 8px;
+  padding: 13px;
+  border: 1px solid #dfe2e8;
+  border-radius: 7px;
+}
+.task-input-response legend {
+  padding: 0 5px;
+  color: #303745;
+  font-weight: 650;
+}
+.task-input-response p {
+  color: #505764;
+  line-height: 1.45;
+}
+.task-question-options {
+  display: grid;
+  gap: 7px;
+}
+.task-question-options label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+}
+.task-question-options input {
+  width: auto;
+  margin-top: 3px;
+}
+.task-question-options small {
+  display: block;
+  margin-top: 2px;
+  color: #777e8a;
+}
 .empty-state {
   max-width: 620px;
   margin: 80px auto;
@@ -1504,7 +1544,7 @@ textarea::placeholder {
     padding-right: 18px;
   }
   .workspace-layout {
-    grid-template-columns: 170px minmax(400px, 1fr) 310px;
+    grid-template-columns: 169px minmax(400px, 1fr) 310px;
   }
   .workflow-rail {
     padding-left: 8px;
@@ -1523,7 +1563,7 @@ textarea::placeholder {
   }
 }
 
-@media (min-width: 956px) {
+@media (min-width: 957px) {
   .slide-canvas {
     padding: 28px 38px;
   }
@@ -1578,7 +1618,7 @@ textarea::placeholder {
   }
 }
 
-@media (max-width: 955px) {
+@media (max-width: 956px) {
   .desktop-window {
     border: 0;
     border-radius: 0;

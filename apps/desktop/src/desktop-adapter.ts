@@ -45,12 +45,23 @@ export interface RuntimeSummary {
   uptime: string | null;
   queue: number | null;
 }
+export type CollectionAvailability = 'unavailable' | 'loading' | 'loaded';
+export interface DesktopSettings {
+  workspacePath: string;
+  codexPath: string;
+}
 export interface DesktopInitialState {
   account: AccountSummary;
   projects: ProjectSummary[];
   approvals: ApprovalSummary[];
   memories: MemorySummary[];
   runtime: RuntimeSummary;
+  collections: {
+    projects: CollectionAvailability;
+    approvals: CollectionAvailability;
+    memories: CollectionAvailability;
+  };
+  settings: DesktopSettings;
 }
 export interface PendingTaskInteraction {
   requestId: number | string;
@@ -127,12 +138,27 @@ const demoInitialState: DesktopInitialState = {
     { id: 'memory-chart', title: '图表优先', content: '在经营复盘类 PPT 中，优先使用趋势图和对比图呈现关键数据。', status: '待决定' },
     { id: 'memory-tone', title: '中文简洁表述', content: '报告文本采用简洁、直接的中文表达，并保留关键事实来源。', status: '待决定' },
   ],
+  collections: {
+    projects: 'loaded',
+    approvals: 'loaded',
+    memories: 'loaded',
+  },
+  settings: {
+    workspacePath: '/Users/demo/Documents/Workspaces',
+    codexPath: '演示：自动检测',
+  },
 };
 
 const nativeInitialState: DesktopInitialState = {
   account: { email: null, plan: null, status: 'unavailable' },
   runtime: { status: 'unavailable', detail: '尚未从本地服务读取', model: null, address: null, uptime: null, queue: null },
   projects: [], approvals: [], memories: [],
+  collections: {
+    projects: 'unavailable',
+    approvals: 'unavailable',
+    memories: 'unavailable',
+  },
+  settings: { workspacePath: '', codexPath: '' },
 };
 
 export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): DesktopAdapter {

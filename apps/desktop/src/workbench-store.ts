@@ -2,6 +2,8 @@ import type {
   AccountSummary,
   ApprovalResult,
   ApprovalSummary,
+  CollectionAvailability,
+  DesktopSettings,
   DesktopInitialState,
   MemorySummary,
   ProjectSummary,
@@ -44,6 +46,12 @@ export interface WorkbenchState {
   approvals: ApprovalSummary[];
   pendingApprovals: Record<string, number>;
   memories: WorkbenchMemory[];
+  collections: {
+    projects: CollectionAvailability;
+    approvals: CollectionAvailability;
+    memories: CollectionAvailability;
+  };
+  settings: DesktopSettings;
 }
 
 type SlideMutationResult = RegenerateResult | ApprovalResult | { status: string };
@@ -88,7 +96,8 @@ export type WorkbenchAction =
       token: number;
       status: string;
     }
-  | { type: 'memory-mutation-failed'; memoryId: string; token: number };
+  | { type: 'memory-mutation-failed'; memoryId: string; token: number }
+  | { type: 'settings-edited'; settings: DesktopSettings };
 
 export function createWorkbenchState(initial: DesktopInitialState): WorkbenchState {
   return {
@@ -102,6 +111,8 @@ export function createWorkbenchState(initial: DesktopInitialState): WorkbenchSta
       ...structuredClone(memory),
       pendingToken: null,
     })),
+    collections: structuredClone(initial.collections),
+    settings: structuredClone(initial.settings),
   };
 }
 
@@ -122,6 +133,7 @@ export function workbenchReducer(
         ...state,
         projects: [project, ...state.projects],
         selectedProjectId: project.id,
+        collections: { ...state.collections, projects: 'loaded' },
       };
     }
     case 'project-renamed':
@@ -136,14 +148,25 @@ export function workbenchReducer(
         selectedSlide: clampSlide(action.slide),
       }));
     case 'slide-mutation-started':
-      return updateProject(state, action.projectId, (project) => ({
-        ...project,
-        pendingMutation: {
-          token: action.token,
-          kind: action.kind,
-          slide: clampSlide(action.slide),
-        },
-      }));
+      return updateProject(state, action.projectId, (project) => {
+        const slide = clampSlide(action.slide);
+        const target = project.slides[slide - 1];
+        if (
+          (action.kind === 'approve' &&
+            (!canApprove(project, slide) || project.selectedSlide !== slide)) ||
+          (action.kind === 'reopen' && target?.status !== 'approved')
+        ) {
+          return project;
+        }
+        return {
+          ...project,
+          pendingMutation: {
+            token: action.token,
+            kind: action.kind,
+            slide,
+          },
+        };
+      });
     case 'slide-mutation-resolved':
       return updateProject(state, action.projectId, (project) => {
         const pending = project.pendingMutation;
@@ -161,15 +184,22 @@ export function workbenchReducer(
           };
         }
         if (pending.kind === 'reopen') {
+          if (project.slides[pending.slide - 1]?.status !== 'approved') {
+            return { ...project, pendingMutation: null };
+          }
           return reopenProject(project, pending.slide, action.result.status);
         }
         const page = pending.slide;
+        if (!canApprove(project, page) || project.selectedSlide !== page) {
+          return { ...project, pendingMutation: null };
+        }
         const isLast = page === 5;
         const slides = project.slides.map((slide) => {
-          if (slide.page <= page) return { ...slide, status: 'approved' as const };
+          if (slide.page === page)
+            return { ...slide, status: 'approved' as const };
           if (!isLast && slide.page === page + 1)
             return { ...slide, status: 'waiting' as const };
-          return { ...slide, status: 'pending' as const };
+          return slide;
         });
         return {
           ...project,
@@ -192,9 +222,12 @@ export function workbenchReducer(
           : project,
       );
     case 'reopen-slide':
-      return updateProject(state, action.projectId, (project) =>
-        reopenProject(project, action.slide, action.status),
-      );
+      return updateProject(state, action.projectId, (project) => {
+        const slide = clampSlide(action.slide);
+        return project.slides[slide - 1]?.status === 'approved'
+          ? reopenProject(project, slide, action.status)
+          : project;
+      });
     case 'approval-mutation-started':
       return {
         ...state,
@@ -246,6 +279,8 @@ export function workbenchReducer(
             : memory,
         ),
       };
+    case 'settings-edited':
+      return { ...state, settings: structuredClone(action.settings) };
   }
 }
 
@@ -322,10 +357,20 @@ function reopenProject(
       ...item,
       status:
         item.page < page
-          ? 'approved'
+          ? item.status
           : item.page === page
             ? 'waiting'
             : 'pending',
     })),
   };
+}
+
+function canApprove(project: WorkbenchProject, page: number): boolean {
+  const target = project.slides[page - 1];
+  return (
+    target?.status === 'waiting' &&
+    project.slides
+      .filter((slide) => slide.page < page)
+      .every((slide) => slide.status === 'approved')
+  );
 }

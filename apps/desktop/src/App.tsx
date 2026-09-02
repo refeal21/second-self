@@ -10,6 +10,7 @@ import {
 import {
   createDesktopAdapter,
   type ApprovalSummary,
+  type CollectionAvailability,
   type DesktopAdapter,
   type TaskSummary,
 } from './desktop-adapter.js';
@@ -127,7 +128,13 @@ export function App({
         ) : (
           <main id="main-content" className="workspace-unavailable">
             <h1>项目工作台不可用</h1>
-            <p>本地适配器尚未提供任何项目，请返回项目列表重试。</p>
+            <p>
+              {collectionMessage(
+                workbench.collections.projects,
+                '当前没有可打开的项目。',
+                '项目数据',
+              )}
+            </p>
             <button className="button button-primary" onClick={() => navigate('projects')}>
               返回 PPT 项目
             </button>
@@ -153,6 +160,7 @@ export function App({
           <ProjectsPage
             adapter={adapter}
             projects={workbench.projects}
+            availability={workbench.collections.projects}
             dispatch={dispatch}
             navigate={navigate}
             report={report}
@@ -162,6 +170,7 @@ export function App({
           <ApprovalsPage
             adapter={adapter}
             items={workbench.approvals}
+            availability={workbench.collections.approvals}
             pending={workbench.pendingApprovals}
             dispatch={dispatch}
             nextMutationToken={() => ++mutationCounter.current}
@@ -172,6 +181,7 @@ export function App({
           <MemoryPage
             adapter={adapter}
             memory={workbench.memories}
+            availability={workbench.collections.memories}
             dispatch={dispatch}
             nextMutationToken={() => ++mutationCounter.current}
             report={report}
@@ -182,6 +192,8 @@ export function App({
             adapter={adapter}
             account={workbench.account}
             runtime={workbench.runtime}
+            settings={workbench.settings}
+            dispatch={dispatch}
             report={report}
           />
         )}
@@ -363,7 +375,11 @@ function DashboardPage({
             ))}
             {!workbench.projects.length && (
               <div className="empty-inline" role="row">
-                本地适配器尚未提供项目数据。
+                {collectionMessage(
+                  workbench.collections.projects,
+                  '当前没有项目。',
+                  '项目数据',
+                )}
               </div>
             )}
           </div>
@@ -401,7 +417,13 @@ function DashboardAside({
             <ApprovalRow key={item.id} item={item} />
           ))}
           {!workbench.approvals.length && (
-            <p className="muted">当前没有从适配器加载到待处理审批。</p>
+            <p className="muted">
+              {collectionMessage(
+                workbench.collections.approvals,
+                '当前没有待处理审批。',
+                '审批数据',
+              )}
+            </p>
           )}
         </div>
       </section>
@@ -490,9 +512,21 @@ function TasksPage({
   const [prompt, setPrompt] = useState(
     '请整理本周产品评审的结论，并输出行动清单。',
   );
-  const [inputAnswer, setInputAnswer] = useState('');
+  const [inputAnswers, setInputAnswers] = useState<Record<string, string[]>>(
+    {},
+  );
   const [isStarting, setIsStarting] = useState(false);
   const [isResponding, setIsResponding] = useState(false);
+  const inputQuestions = task ? parseTaskQuestions(task) : [];
+  const hasAllInputAnswers =
+    inputQuestions.length > 0 &&
+    inputQuestions.every((question) =>
+      inputAnswers[question.id]?.some((answer) => answer.trim()),
+    );
+
+  useEffect(() => {
+    setInputAnswers({});
+  }, [task?.pendingInteraction?.requestId]);
 
   const start = async (event: FormEvent) => {
     event.preventDefault();
@@ -534,17 +568,19 @@ function TasksPage({
     }
   };
   const answerInput = async () => {
-    if (!task?.pendingInteraction || !inputAnswer.trim()) return;
-    const params = asRecord(task.pendingInteraction.params);
-    const questions = Array.isArray(params?.questions) ? params.questions : [];
-    const first = asRecord(questions[0]);
-    const questionId = typeof first?.id === 'string' ? first.id : 'answer';
+    if (!task?.pendingInteraction || !hasAllInputAnswers) return;
     setIsResponding(true);
     try {
-      const result = await adapter.respondToTaskInput(task.id, {
-        [questionId]: [inputAnswer.trim()],
-      });
-      setInputAnswer('');
+      const answers = Object.fromEntries(
+        inputQuestions.map((question) => [
+          question.id,
+          (inputAnswers[question.id] ?? [])
+            .map((answer) => answer.trim())
+            .filter(Boolean),
+        ]),
+      );
+      const result = await adapter.respondToTaskInput(task.id, answers);
+      setInputAnswers({});
       await report(async () => result);
     } catch (error) {
       await report(async () => {
@@ -665,15 +701,65 @@ function TasksPage({
             )}
             {task.status === 'waiting_for_input' && (
               <div className="task-input-response">
-                <label htmlFor="task-input-answer">Codex 需要补充信息</label>
-                <input
-                  id="task-input-answer"
-                  value={inputAnswer}
-                  onChange={(event) => setInputAnswer(event.target.value)}
-                />
+                <strong>Codex 需要补充信息</strong>
+                {inputQuestions.map((question, questionIndex) => (
+                  <fieldset key={question.id}>
+                    <legend>{question.header}</legend>
+                    <p>{question.question}</p>
+                    {question.options.length ? (
+                      <div className="task-question-options">
+                        {question.options.map((option, optionIndex) => {
+                          const optionId = `task-question-${questionIndex}-${optionIndex}`;
+                          return (
+                          <label key={option.label} htmlFor={optionId}>
+                            <input
+                              id={optionId}
+                              type="radio"
+                              aria-label={option.label}
+                              name={`task-question-${question.id}`}
+                              value={option.label}
+                              checked={
+                                inputAnswers[question.id]?.[0] === option.label
+                              }
+                              onChange={() =>
+                                setInputAnswers((current) => ({
+                                  ...current,
+                                  [question.id]: [option.label],
+                                }))
+                              }
+                            />
+                            <span>
+                              {option.label}
+                              {option.description && (
+                                <small>{option.description}</small>
+                              )}
+                            </span>
+                          </label>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <label>
+                        回答
+                        <input
+                          value={inputAnswers[question.id]?.[0] ?? ''}
+                          onChange={(event) =>
+                            setInputAnswers((current) => ({
+                              ...current,
+                              [question.id]: [event.target.value],
+                            }))
+                          }
+                        />
+                      </label>
+                    )}
+                  </fieldset>
+                ))}
+                {!inputQuestions.length && (
+                  <p role="alert">App Server 未提供可回答的问题。</p>
+                )}
                 <button
                   className="button button-primary"
-                  disabled={isResponding || !inputAnswer.trim()}
+                  disabled={isResponding || !hasAllInputAnswers}
                   onClick={() => void answerInput()}
                 >
                   提交回答
@@ -699,12 +785,14 @@ function TasksPage({
 function ProjectsPage({
   adapter,
   projects,
+  availability,
   dispatch,
   navigate,
   report,
 }: {
   adapter: DesktopAdapter;
   projects: WorkbenchProject[];
+  availability: CollectionAvailability;
   dispatch: (action: WorkbenchAction) => void;
   navigate: (route: Route) => void;
   report: (
@@ -766,7 +854,13 @@ function ProjectsPage({
             </button>
           ))}
           {!projects.length && (
-            <div className="empty-inline">本地适配器尚未提供项目。</div>
+            <div className="empty-inline">
+              {collectionMessage(
+                availability,
+                '当前没有项目。',
+                '项目数据',
+              )}
+            </div>
           )}
         </section>
         <section className="project-create">
@@ -1190,7 +1284,10 @@ function WorkspacePage({
             </p>
             <button
               className="text-action"
-              disabled={Boolean(project.pendingMutation)}
+              disabled={
+                Boolean(project.pendingMutation) ||
+                currentSlideState?.status !== 'approved'
+              }
               onClick={() => void reopen()}
             >
               重新打开
@@ -1340,6 +1437,7 @@ function Metric({
 function ApprovalsPage({
   adapter,
   items,
+  availability,
   pending,
   dispatch,
   nextMutationToken,
@@ -1347,6 +1445,7 @@ function ApprovalsPage({
 }: {
   adapter: DesktopAdapter;
   items: ApprovalSummary[];
+  availability: CollectionAvailability;
   pending: Record<string, number>;
   dispatch: (action: WorkbenchAction) => void;
   nextMutationToken: () => number;
@@ -1381,9 +1480,15 @@ function ApprovalsPage({
       <section className="approval-board">
         <div className="section-heading">
           <h2>待处理审批</h2>
-          <span className="muted">{items.length} 项</span>
+          <span className="muted">
+            {availability === 'loaded' ? `${items.length} 项` : '未加载'}
+          </span>
         </div>
-        {items.length ? (
+        {availability !== 'loaded' ? (
+          <div className="empty-inline" role="status">
+            {collectionMessage(availability, '', '审批数据')}
+          </div>
+        ) : items.length ? (
           items.map((item) => (
             <div className="approval-board-row" key={item.id}>
               <ApprovalRow item={item} />
@@ -1416,12 +1521,14 @@ function ApprovalsPage({
 function MemoryPage({
   adapter,
   memory,
+  availability,
   dispatch,
   nextMutationToken,
   report,
 }: {
   adapter: DesktopAdapter;
   memory: WorkbenchMemory[];
+  availability: CollectionAvailability;
   dispatch: (action: WorkbenchAction) => void;
   nextMutationToken: () => number;
   report: (
@@ -1454,6 +1561,11 @@ function MemoryPage({
         title="偏好记忆"
         description="仅在你批准后，系统才会把新的工作偏好保存为可复用记忆。"
       />
+      {availability !== 'loaded' ? (
+        <div className="empty-inline" role="status">
+          {collectionMessage(availability, '', '偏好记忆数据')}
+        </div>
+      ) : (
       <section className="memory-list">
         {memory.map((item) => (
           <article className="memory-row" key={item.id}>
@@ -1491,6 +1603,7 @@ function MemoryPage({
           </article>
         ))}
       </section>
+      )}
     </div>
   );
 }
@@ -1499,26 +1612,24 @@ function SettingsPage({
   adapter,
   account,
   runtime,
+  settings,
+  dispatch,
   report,
 }: {
   adapter: DesktopAdapter;
   account: WorkbenchState['account'];
   runtime: WorkbenchState['runtime'];
+  settings: WorkbenchState['settings'];
+  dispatch: (action: WorkbenchAction) => void;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
 }) {
-  const [workspacePath, setWorkspacePath] = useState(
-    adapter.mode === 'demo' ? '/Users/demo/Documents/Workspaces' : '',
-  );
-  const [codexPath, setCodexPath] = useState(
-    adapter.mode === 'demo' ? '演示：自动检测' : '',
-  );
   const [isSaving, setIsSaving] = useState(false);
   const save = async (event: FormEvent) => {
     event.preventDefault();
     setIsSaving(true);
-    await report(() => adapter.saveSettings({ workspacePath, codexPath }));
+    await report(() => adapter.saveSettings(settings));
     setIsSaving(false);
   };
   return (
@@ -1533,8 +1644,13 @@ function SettingsPage({
           <label htmlFor="workspace-path">默认工作区路径</label>
           <input
             id="workspace-path"
-            value={workspacePath}
-            onChange={(event) => setWorkspacePath(event.target.value)}
+            value={settings.workspacePath}
+            onChange={(event) =>
+              dispatch({
+                type: 'settings-edited',
+                settings: { ...settings, workspacePath: event.target.value },
+              })
+            }
           />
         </section>
         <section>
@@ -1542,8 +1658,13 @@ function SettingsPage({
           <label htmlFor="codex-path">Codex 可执行路径</label>
           <input
             id="codex-path"
-            value={codexPath}
-            onChange={(event) => setCodexPath(event.target.value)}
+            value={settings.codexPath}
+            onChange={(event) =>
+              dispatch({
+                type: 'settings-edited',
+                settings: { ...settings, codexPath: event.target.value },
+              })
+            }
           />
           <p className="muted">
             应用会优先使用配置路径，其次检测本机可执行文件。
@@ -1692,6 +1813,53 @@ function routeFromHash(): Route | null {
 
 function toMessage(error: unknown): string {
   return error instanceof Error ? error.message : '操作未完成，请稍后重试。';
+}
+
+function collectionMessage(
+  availability: CollectionAvailability,
+  emptyMessage: string,
+  label: string,
+): string {
+  if (availability === 'loading') return `${label}正在加载`;
+  if (availability === 'unavailable') return `${label}不可用`;
+  return emptyMessage;
+}
+
+interface TaskInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: Array<{ label: string; description: string }>;
+}
+
+function parseTaskQuestions(task: TaskSummary): TaskInputQuestion[] {
+  if (task.pendingInteraction?.kind !== 'user_input') return [];
+  const params = asRecord(task.pendingInteraction.params);
+  if (!Array.isArray(params?.questions)) return [];
+  return params.questions.flatMap((value) => {
+    const question = asRecord(value);
+    if (typeof question?.id !== 'string') return [];
+    const text =
+      typeof question.question === 'string' ? question.question : '请提供回答';
+    const header =
+      typeof question.header === 'string' ? question.header : text;
+    const options = Array.isArray(question.options)
+      ? question.options.flatMap((optionValue) => {
+          const option = asRecord(optionValue);
+          if (typeof option?.label !== 'string') return [];
+          return [
+            {
+              label: option.label,
+              description:
+                typeof option.description === 'string'
+                  ? option.description
+                  : '',
+            },
+          ];
+        })
+      : [];
+    return [{ id: question.id, header, question: text, options }];
+  });
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

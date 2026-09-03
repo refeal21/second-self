@@ -71,12 +71,27 @@ pub fn atomic_write_workspace_file(
     candidate: &Path,
     contents: &[u8],
 ) -> Result<PathBuf, String> {
+    atomic_write_workspace_file_with_observer(workspace_root, candidate, contents, || {})
+}
+
+/// Testable form of the atomic writer. `parent_opened` runs only after every
+/// parent directory descriptor has been opened with `O_NOFOLLOW`; production
+/// uses the zero-cost no-op wrapper above.
+pub fn atomic_write_workspace_file_with_observer<F>(
+    workspace_root: &Path,
+    candidate: &Path,
+    contents: &[u8],
+    parent_opened: F,
+) -> Result<PathBuf, String>
+where
+    F: FnOnce(),
+{
     let components = strict_relative_components(candidate)?;
     let workspace = fs::canonicalize(workspace_root)
         .map_err(|_| "Workspace root does not exist".to_string())?;
 
     #[cfg(unix)]
-    write_at_workspace_fd(&workspace, &components, contents)?;
+    write_at_workspace_fd(&workspace, &components, contents, parent_opened)?;
 
     #[cfg(not(unix))]
     {
@@ -103,6 +118,39 @@ pub fn atomic_write_workspace_file(
     Ok(workspace.join(candidate))
 }
 
+/// Creates a project and its fixed artifact directories while walking only
+/// directory descriptors rooted at the canonical workspace.
+pub fn create_workspace_project_tree(
+    workspace_root: &Path,
+    project_id: &str,
+    artifact_directories: &[&str],
+) -> Result<PathBuf, String> {
+    let workspace = fs::canonicalize(workspace_root)
+        .map_err(|_| "Workspace root does not exist".to_string())?;
+    let mut components = strict_relative_components(Path::new(project_id))?;
+    if components.len() != 1 {
+        return Err("Project id must be one path component".to_string());
+    }
+
+    #[cfg(unix)]
+    create_project_tree_at_workspace_fd(&workspace, &components[0], artifact_directories)?;
+
+    #[cfg(not(unix))]
+    {
+        let project = workspace.join(&components[0]);
+        fs::create_dir(&project)
+            .map_err(|error| format!("Project directory cannot be created: {error}"))?;
+        for directory in artifact_directories {
+            strict_relative_components(Path::new(directory))?;
+            fs::create_dir(project.join(directory)).map_err(|error| {
+                format!("Project artifact directory cannot be created: {error}")
+            })?;
+        }
+    }
+
+    Ok(workspace.join(components.remove(0)))
+}
+
 fn strict_relative_components(candidate: &Path) -> Result<Vec<std::ffi::OsString>, String> {
     if candidate.is_absolute() {
         return Err("Write path is outside the workspace".to_string());
@@ -125,6 +173,7 @@ fn write_at_workspace_fd(
     workspace: &Path,
     components: &[std::ffi::OsString],
     contents: &[u8],
+    parent_opened: impl FnOnce(),
 ) -> Result<(), String> {
     use std::{
         ffi::CString,
@@ -205,6 +254,8 @@ fn write_at_workspace_fd(
         }
     }
 
+    parent_opened();
+
     let target_name = c_name(components.last().expect("non-empty components"))?;
     let temporary_name = CString::new(format!(
         ".digital-twin-{}-{}.tmp",
@@ -268,4 +319,93 @@ fn write_at_workspace_fd(
         }
     }
     result
+}
+
+#[cfg(unix)]
+fn create_project_tree_at_workspace_fd(
+    workspace: &Path,
+    project_id: &std::ffi::OsStr,
+    artifact_directories: &[&str],
+) -> Result<(), String> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    fn c_name(value: &std::ffi::OsStr) -> Result<CString, String> {
+        CString::new(value.as_bytes()).map_err(|_| "Path contains a null byte".to_string())
+    }
+    fn open_dir(parent: i32, name: &CString) -> Result<OwnedFd, String> {
+        // SAFETY: name is nul-terminated and ownership of a successful fd is transferred.
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            Err(format!(
+                "Directory cannot be opened safely: {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            // SAFETY: fd is freshly opened and uniquely owned.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    }
+
+    let workspace_name = c_name(workspace.as_os_str())?;
+    // SAFETY: workspace_name is valid and the returned fd is uniquely owned.
+    let root_fd = unsafe {
+        libc::open(
+            workspace_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if root_fd < 0 {
+        return Err(format!(
+            "Workspace root cannot be opened safely: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: root_fd is freshly opened.
+    let root = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    let project_name = c_name(project_id)?;
+    // SAFETY: root descriptor and project_name are valid; mkdirat does not follow a final symlink.
+    if unsafe { libc::mkdirat(root.as_raw_fd(), project_name.as_ptr(), 0o700) } != 0 {
+        return Err(format!(
+            "Project directory cannot be created: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let project = open_dir(root.as_raw_fd(), &project_name)?;
+    for directory in artifact_directories {
+        if strict_relative_components(Path::new(directory))?.len() != 1 {
+            return Err("Artifact directory must be one path component".to_string());
+        }
+        let name = CString::new(directory.as_bytes())
+            .map_err(|_| "Artifact directory contains a null byte".to_string())?;
+        // SAFETY: project descriptor and name are valid.
+        if unsafe { libc::mkdirat(project.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            return Err(format!(
+                "Project artifact directory cannot be created: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        open_dir(project.as_raw_fd(), &name)?;
+    }
+    // SAFETY: fsync accepts live directory descriptors.
+    if unsafe { libc::fsync(project.as_raw_fd()) } != 0
+        || unsafe { libc::fsync(root.as_raw_fd()) } != 0
+    {
+        return Err(format!(
+            "Project directory sync failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }

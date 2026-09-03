@@ -44,9 +44,18 @@ export class TauriCodexTransport {
   private pendingStartEvents: CodexProcessEvent[] | null = null;
 
   constructor(
-    private readonly configuredPath: string | null,
+    private configuredPath: string | null,
     private readonly bridge: TauriBridge = defaultBridge,
   ) {}
+
+  async setConfiguredPath(path: string | null): Promise<void> {
+    const normalized = path?.trim() || null;
+    if (normalized === this.configuredPath) return;
+    this.configuredPath = normalized;
+    if (this.activeGeneration !== null || this.pendingStartEvents !== null) {
+      await this.stop();
+    }
+  }
 
   async start(): Promise<void> {
     const attempt = ++this.startAttempt;

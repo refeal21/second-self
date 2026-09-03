@@ -214,4 +214,19 @@ describe('typed Tauri Codex transport', () => {
     expect(lines).toEqual([]);
     expect(bridge.listenerCount('codex-app-server://stdout')).toBe(0);
   });
+
+  it('applies a saved Codex path immediately and restarts safely without an app restart', async () => {
+    const bridge = new FakeTauriBridge();
+    const transport = new TauriCodexTransport(null, bridge);
+    await transport.start();
+
+    await transport.setConfiguredPath('/saved/codex');
+    await transport.start();
+
+    expect(bridge.commands).toContainEqual({
+      command: 'stop_codex_app_server', args: { generation: 1 },
+    });
+    expect(bridge.commands.filter(({ command }) => command === 'start_codex_app_server').at(-1))
+      .toEqual({ command: 'start_codex_app_server', args: { configuredPath: '/saved/codex' } });
+  });
 });

@@ -115,4 +115,27 @@ describe('Tauri workflow Worker client', () => {
     await expect(client.health()).resolves.toMatchObject({ status: 'ready' });
     expect(bridge.commands.filter(({ command }) => command === 'start_worker_sidecar')).toHaveLength(2);
   });
+
+  it('exposes typed production PPT create, restore, execute and snapshot RPC calls', async () => {
+    class PipelineBridge extends FakeBridge {
+      override async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+        if (command !== 'send_worker_sidecar_line') return super.invoke(command, args);
+        this.commands.push({ command, args });
+        const request = JSON.parse(String(args?.line)) as { id: number; method: string; params: unknown };
+        queueMicrotask(() => this.emit('workflow-worker://stdout', {
+          generation: args?.generation,
+          line: `${JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { method: request.method, params: request.params } })}\n`,
+        }));
+        return undefined as T;
+      }
+    }
+    const client = new TauriWorkflowWorkerClient(new PipelineBridge());
+    const pipeline = { schemaVersion: 1, revision: 1, project: { id: 'project-1' } } as never;
+    await expect(client.createProject({
+      id: 'project-1', name: '项目', goal: '目标', createdAt: 'now', preferenceSnapshot: [],
+    })).resolves.toMatchObject({ method: 'ppt.project.create' });
+    await expect(client.restoreProject(pipeline)).resolves.toMatchObject({ method: 'ppt.project.restore' });
+    await expect(client.executeProject('project-1', { kind: 'outline.approve', at: 'now' })).resolves.toMatchObject({ method: 'ppt.project.execute' });
+    await expect(client.snapshotProject('project-1')).resolves.toMatchObject({ method: 'ppt.project.snapshot' });
+  });
 });

@@ -1,7 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use digital_twin_desktop_lib::workbench::{
-    CreateProjectInput, SlideMutationInput, WorkbenchService,
+    ArtifactWriteInput, AttachSourceInput, CreateProjectInput, PipelineCommitInput,
+    SlideMutationInput, WorkbenchService,
 };
 
 fn temporary_root(name: &str) -> std::path::PathBuf {
@@ -89,5 +90,122 @@ fn production_collections_start_empty_and_loaded_instead_of_demo_or_fake_success
     assert_eq!(initial.collections.memories, "loaded");
     assert_eq!(initial.account.status, "unavailable");
 
+    std::fs::remove_dir_all(root).expect("temporary root removed");
+}
+
+#[test]
+fn rust_owns_source_and_worker_write_intents_and_restores_the_complete_pipeline() {
+    let root = temporary_root("complete-pipeline");
+    let database_path = root.join("state.sqlite3");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&root).expect("root created");
+    let project_id;
+    let committed;
+    {
+        let service = WorkbenchService::open(&database_path, &workspace).expect("workbench opens");
+        let project = service
+            .create_project(CreateProjectInput {
+                name: "经营复盘".into(),
+                goal: "管理层决策".into(),
+            })
+            .expect("project created");
+        project_id = project.id;
+        let attached = service
+            .attach_source(AttachSourceInput {
+                project_id: project_id.clone(),
+                file_name: "kpis.csv".into(),
+                media_type: "text/csv".into(),
+                contents_base64: "MjAyNywxNTAK".into(),
+            })
+            .expect("source attached through Rust");
+        assert_eq!(attached["sources"][0]["fileName"], "kpis.csv");
+        assert!(workspace
+            .join(&project_id)
+            .join(attached["sources"][0]["relativePath"].as_str().unwrap())
+            .is_file());
+
+        let mut pipeline = attached.clone();
+        pipeline["revision"] = 3.into();
+        pipeline["project"]["workflowStatus"] = "outline_review".into();
+        pipeline["project"]["updatedAt"] = "2026-09-03T01:00:00Z".into();
+        pipeline["outline"] = serde_json::json!({
+            "version": {"id": format!("{project_id}-outline-v1"), "projectId": project_id,
+                "sequence": 1, "status": "frozen", "createdAt": "now", "frozenAt": "now"},
+            "value": {"title": "大纲", "slides": []}
+        });
+        pipeline["approvals"] = serde_json::json!([{
+            "id": format!("{project_id}-approval-outline"), "projectId": project_id,
+            "versionId": format!("{project_id}-outline-v1"), "stage": "outline_review",
+            "status": "approved", "decidedAt": "now"
+        }]);
+        pipeline["tasks"] = serde_json::json!([{
+            "id": format!("{project_id}-task-outline"), "kind": "outline_generation",
+            "status": "completed", "createdAt": "now", "updatedAt": "now", "error": null
+        }]);
+        committed = service
+            .commit_pipeline(PipelineCommitInput {
+                project_id: project_id.clone(),
+                expected_revision: 2,
+                pipeline,
+                writes: vec![ArtifactWriteInput {
+                    relative_path: "outline/outline-v1.json".into(),
+                    contents_base64: "e30K".into(),
+                    sha256: "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+                        .into(),
+                    byte_length: 3,
+                    kind: "outline".into(),
+                    version_id: format!("{project_id}-outline-v1"),
+                    slide_id: None,
+                    metadata: None,
+                }],
+            })
+            .expect("pipeline and artifacts committed");
+        let stale = service.commit_pipeline(PipelineCommitInput {
+            project_id: project_id.clone(),
+            expected_revision: 2,
+            pipeline: committed.clone(),
+            writes: vec![ArtifactWriteInput {
+                relative_path: "outline/outline-v1.json".into(),
+                contents_base64: "ZXZpbAo=".into(),
+                sha256: "886b67480dbe73b406ad83a1dd6d9596f93089d90c220ccfc91944c95f1c68c4".into(),
+                byte_length: 5,
+                kind: "outline".into(),
+                version_id: format!("{project_id}-outline-v1"),
+                slide_id: None,
+                metadata: None,
+            }],
+        });
+        assert!(stale
+            .expect_err("stale Worker result rejected")
+            .contains("stale"));
+        assert_eq!(
+            std::fs::read(workspace.join(&project_id).join("outline/outline-v1.json")).unwrap(),
+            b"{}\n"
+        );
+        let counts = service
+            .persistence_counts(&project_id)
+            .expect("counts read");
+        assert_eq!(
+            (
+                counts.versions,
+                counts.approvals,
+                counts.tasks,
+                counts.artifacts
+            ),
+            (1, 1, 1, 2)
+        );
+    }
+
+    let reopened = WorkbenchService::open(&database_path, &workspace).expect("workbench reopens");
+    assert_eq!(
+        reopened
+            .load_pipeline(&project_id)
+            .expect("pipeline restored"),
+        committed
+    );
+    assert_eq!(
+        std::fs::read(workspace.join(&project_id).join("outline/outline-v1.json")).unwrap(),
+        b"{}\n"
+    );
     std::fs::remove_dir_all(root).expect("temporary root removed");
 }

@@ -46,6 +46,7 @@ pub struct StoredProject {
     pub export_ready: bool,
     pub slide_notice: String,
     pub preference_snapshot: Vec<PreferenceSnapshot>,
+    pub pipeline: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -59,6 +60,7 @@ pub struct StoredCheckpoint {
     pub slide_statuses: Vec<String>,
     pub export_ready: bool,
     pub created_at: String,
+    pub pipeline: serde_json::Value,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +94,23 @@ pub struct StoredApproval {
     pub author: String,
     pub created_at: String,
     pub decided_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistenceCounts {
+    pub versions: i64,
+    pub approvals: i64,
+    pub tasks: i64,
+    pub artifacts: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PersistedArtifact {
+    pub id: String,
+    pub version_id: String,
+    pub path: String,
+    pub kind: String,
+    pub created_at: String,
 }
 
 impl Database {
@@ -181,32 +200,35 @@ impl Database {
     }
 
     pub fn insert_project(&self, project: &NewProject) -> Result<()> {
-        let preference_json = serde_json::to_string(&self.approved_memory_snapshot()?)
+        let preference_snapshot = self.approved_memory_snapshot()?;
+        let preference_json = serde_json::to_string(&preference_snapshot)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let pipeline_json = initial_pipeline_json(project, &preference_snapshot)?;
         let slides_json = default_slides_json();
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO projects
              (id, name, goal, workflow_status, progress, selected_slide,
               slide_statuses_json, export_ready, slide_notice,
-              preference_snapshot_json, created_at, updated_at)
+              preference_snapshot_json, pipeline_json, created_at, updated_at)
              VALUES (?1, ?2, ?3, 'intake', 10, 1, ?4, 0,
-                     '等待材料处理', ?5, ?6, ?6)",
+                     '等待材料处理', ?5, ?6, ?7, ?7)",
             params![
                 project.id,
                 project.name,
                 project.goal,
                 slides_json,
                 preference_json,
+                pipeline_json,
                 project.created_at
             ],
         )?;
         transaction.execute(
             "INSERT INTO checkpoints
              (project_id, sequence, workflow_status, selected_slide,
-              slide_statuses_json, export_ready, created_at)
-             VALUES (?1, 1, 'intake', 1, ?2, 0, ?3)",
-            params![project.id, slides_json, project.created_at],
+              slide_statuses_json, export_ready, created_at, pipeline_json)
+             VALUES (?1, 1, 'intake', 1, ?2, 0, ?3, ?4)",
+            params![project.id, slides_json, project.created_at, pipeline_json],
         )?;
         transaction.commit()
     }
@@ -269,7 +291,7 @@ impl Database {
             .query_row(
                 "SELECT id, name, goal, workflow_status, progress, selected_slide,
                         slide_statuses_json, export_ready, slide_notice,
-                        preference_snapshot_json, created_at, updated_at
+                        preference_snapshot_json, pipeline_json, created_at, updated_at
                  FROM projects WHERE id = ?1",
                 params![id],
                 row_to_project,
@@ -281,7 +303,7 @@ impl Database {
         let mut statement = self.connection.prepare(
             "SELECT id, name, goal, workflow_status, progress, selected_slide,
                     slide_statuses_json, export_ready, slide_notice,
-                    preference_snapshot_json, created_at, updated_at
+                    preference_snapshot_json, pipeline_json, created_at, updated_at
              FROM projects ORDER BY updated_at DESC, id DESC",
         )?;
         let result = statement.query_map([], row_to_project)?.collect();
@@ -292,7 +314,7 @@ impl Database {
         self.connection
             .query_row(
                 "SELECT project_id, sequence, workflow_status, selected_slide,
-                        slide_statuses_json, export_ready, created_at
+                        slide_statuses_json, export_ready, created_at, pipeline_json
                  FROM checkpoints WHERE project_id = ?1
                  ORDER BY sequence DESC LIMIT 1",
                 params![project_id],
@@ -305,10 +327,207 @@ impl Database {
                         slide_statuses: json_column(row.get::<_, String>(4)?, 4)?,
                         export_ready: row.get(5)?,
                         created_at: row.get(6)?,
+                        pipeline: json_column(row.get::<_, String>(7)?, 7)?,
                     })
                 },
             )
             .optional()
+    }
+
+    pub fn replace_pipeline(
+        &self,
+        project_id: &str,
+        expected_revision: i64,
+        pipeline: &serde_json::Value,
+        artifacts: &[PersistedArtifact],
+    ) -> Result<bool> {
+        let revision = json_i64(pipeline, "/revision")?;
+        if revision != expected_revision + 1 {
+            return Err(invalid_parameter(
+                "pipeline revision must advance exactly once",
+            ));
+        }
+        if json_str(pipeline, "/project/id")? != project_id {
+            return Err(invalid_parameter("pipeline project id does not match"));
+        }
+        let current: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT pipeline_json FROM projects WHERE id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let current: serde_json::Value = serde_json::from_str(&current).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        if json_i64(&current, "/revision")? != expected_revision {
+            return Err(invalid_parameter("stale pipeline revision"));
+        }
+
+        let workflow_status = json_str(pipeline, "/project/workflowStatus")?;
+        let updated_at = json_str(pipeline, "/project/updatedAt")?;
+        let selected_slide = selected_slide_number(pipeline);
+        let slide_statuses = slide_statuses(pipeline);
+        let progress = workflow_progress(workflow_status);
+        let export_ready = pipeline
+            .pointer("/exportReceipt")
+            .is_some_and(|value| !value.is_null());
+        let notice = pipeline
+            .pointer("/blockedCondition/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("PPT 工作流检查点已保存");
+        let pipeline_json = serde_json::to_string(pipeline)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let slides_json = serde_json::to_string(&slide_statuses)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE projects SET workflow_status=?2, progress=?3, selected_slide=?4,
+             slide_statuses_json=?5, export_ready=?6, slide_notice=?7, updated_at=?8,
+             pipeline_json=?9 WHERE id=?1",
+            params![
+                project_id,
+                workflow_status,
+                progress,
+                selected_slide,
+                slides_json,
+                export_ready,
+                notice,
+                updated_at,
+                pipeline_json
+            ],
+        )?;
+        for table in ["versions", "approvals", "tasks"] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE project_id = ?1"),
+                params![project_id],
+            )?;
+        }
+        let mut versions = Vec::new();
+        if let Some(version) = pipeline.pointer("/outline/version") {
+            versions.push(version);
+        }
+        if let Some(version) = pipeline.pointer("/slideSpecs/version") {
+            versions.push(version);
+        }
+        if let Some(visuals) = pipeline
+            .pointer("/visuals")
+            .and_then(serde_json::Value::as_object)
+        {
+            for visual in visuals.values() {
+                if let Some(history) = visual.as_array() {
+                    versions.extend(history.iter().filter_map(|item| item.get("version")));
+                } else if let Some(version) = visual.get("version") {
+                    versions.push(version);
+                }
+            }
+        }
+        for (ordinal, version) in versions.into_iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO versions (id, project_id, sequence, status, created_at, frozen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    json_str(version, "/id")?,
+                    project_id,
+                    ordinal as i64 + 1,
+                    json_str(version, "/status")?,
+                    json_str(version, "/createdAt")?,
+                    version.get("frozenAt").and_then(serde_json::Value::as_str)
+                ],
+            )?;
+        }
+        if let Some(approvals) = pipeline
+            .pointer("/approvals")
+            .and_then(serde_json::Value::as_array)
+        {
+            for approval in approvals {
+                let id = json_str(approval, "/id")?;
+                let decided_at = approval
+                    .get("decidedAt")
+                    .and_then(serde_json::Value::as_str);
+                transaction.execute(
+                    "INSERT INTO approvals (id, project_id, version_id, stage, slide_id, status,
+                     title, detail, author, created_at, decided_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'本机用户',?9,?10)",
+                    params![
+                        id,
+                        project_id,
+                        json_str(approval, "/versionId")?,
+                        json_str(approval, "/stage")?,
+                        approval.get("slideId").and_then(serde_json::Value::as_str),
+                        json_str(approval, "/status")?,
+                        format!("工作流审批·{}", json_str(approval, "/stage")?),
+                        format!(
+                            "版本 {} 已经用户明确批准",
+                            json_str(approval, "/versionId")?
+                        ),
+                        decided_at.unwrap_or(updated_at),
+                        decided_at
+                    ],
+                )?;
+            }
+        }
+        if let Some(tasks) = pipeline
+            .pointer("/tasks")
+            .and_then(serde_json::Value::as_array)
+        {
+            for task in tasks {
+                transaction.execute(
+                    "INSERT INTO tasks (id, project_id, status, created_at, updated_at) VALUES (?1,?2,?3,?4,?5)",
+                    params![json_str(task, "/id")?, project_id, json_str(task, "/status")?,
+                        json_str(task, "/createdAt")?, json_str(task, "/updatedAt")?],
+                )?;
+            }
+        }
+        for artifact in artifacts {
+            transaction.execute(
+                "INSERT OR REPLACE INTO artifacts (id, project_id, version_id, path, kind, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![artifact.id, project_id, artifact.version_id, artifact.path, artifact.kind, artifact.created_at],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO checkpoints (project_id, sequence, workflow_status, selected_slide,
+             slide_statuses_json, export_ready, created_at, pipeline_json)
+             SELECT ?1, COALESCE(MAX(sequence),0)+1, ?2, ?3, ?4, ?5, ?6, ?7
+             FROM checkpoints WHERE project_id=?1",
+            params![
+                project_id,
+                workflow_status,
+                selected_slide,
+                slides_json,
+                export_ready,
+                updated_at,
+                pipeline_json
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn persistence_counts(&self, project_id: &str) -> Result<PersistenceCounts> {
+        let count = |table: &str| {
+            self.connection.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE project_id=?1"),
+                params![project_id],
+                |row| row.get(0),
+            )
+        };
+        Ok(PersistenceCounts {
+            versions: count("versions")?,
+            approvals: count("approvals")?,
+            tasks: count("tasks")?,
+            artifacts: count("artifacts")?,
+        })
     }
 
     pub fn insert_approval(&self, approval: &StoredApproval) -> Result<()> {
@@ -402,6 +621,7 @@ impl Database {
                 slide_statuses_json TEXT NOT NULL DEFAULT '[\"waiting\",\"pending\",\"pending\",\"pending\",\"pending\"]',
                 export_ready INTEGER NOT NULL DEFAULT 0, slide_notice TEXT NOT NULL DEFAULT '',
                 preference_snapshot_json TEXT NOT NULL DEFAULT '[]',
+                pipeline_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS versions (
@@ -432,7 +652,8 @@ impl Database {
                 project_id TEXT NOT NULL REFERENCES projects(id), sequence INTEGER NOT NULL,
                 workflow_status TEXT NOT NULL, selected_slide INTEGER NOT NULL,
                 slide_statuses_json TEXT NOT NULL, export_ready INTEGER NOT NULL,
-                created_at TEXT NOT NULL, PRIMARY KEY(project_id, sequence)
+                created_at TEXT NOT NULL, pipeline_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(project_id, sequence)
             );
             ",
         )?;
@@ -445,12 +666,14 @@ impl Database {
             ("projects", "export_ready", "INTEGER NOT NULL DEFAULT 0"),
             ("projects", "slide_notice", "TEXT NOT NULL DEFAULT ''"),
             ("projects", "preference_snapshot_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("projects", "pipeline_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("approvals", "slide_id", "TEXT"),
             ("approvals", "title", "TEXT NOT NULL DEFAULT ''"),
             ("approvals", "detail", "TEXT NOT NULL DEFAULT ''"),
             ("approvals", "author", "TEXT NOT NULL DEFAULT '本机用户'"),
             ("approvals", "created_at", "TEXT NOT NULL DEFAULT ''"),
             ("memory_proposals", "title", "TEXT NOT NULL DEFAULT ''"),
+            ("checkpoints", "pipeline_json", "TEXT NOT NULL DEFAULT '{}'"),
         ] {
             self.ensure_column(table, column, definition)?;
         }
@@ -485,9 +708,137 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> Result<StoredProject> {
         export_ready: row.get(7)?,
         slide_notice: row.get(8)?,
         preference_snapshot: json_column(row.get::<_, String>(9)?, 9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        pipeline: json_column(row.get::<_, String>(10)?, 10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
+}
+
+fn initial_pipeline_json(
+    project: &NewProject,
+    preferences: &[PreferenceSnapshot],
+) -> Result<String> {
+    serde_json::to_string(&serde_json::json!({
+        "schemaVersion": 1,
+        "revision": 1,
+        "project": {
+            "id": project.id,
+            "name": project.name,
+            "goal": project.goal,
+            "workflowStatus": "intake",
+            "createdAt": project.created_at,
+            "updatedAt": project.created_at,
+        },
+        "preferenceSnapshot": preferences,
+        "sources": [],
+        "analysis": null,
+        "outline": null,
+        "slideSpecs": null,
+        "visuals": {},
+        "currentSlideId": null,
+        "approvals": [],
+        "tasks": [],
+        "blockedCondition": null,
+        "exportReceipt": null,
+        "qaReport": null,
+    }))
+    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn json_str<'a>(value: &'a serde_json::Value, pointer: &str) -> Result<&'a str> {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_parameter(&format!("pipeline field {pointer} is required")))
+}
+
+fn json_i64(value: &serde_json::Value, pointer: &str) -> Result<i64> {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| invalid_parameter(&format!("pipeline field {pointer} is required")))
+}
+
+fn selected_slide_number(pipeline: &serde_json::Value) -> i64 {
+    let Some(id) = pipeline
+        .pointer("/currentSlideId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return 1;
+    };
+    pipeline
+        .pointer("/slideSpecs/value")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|specs| {
+            specs
+                .iter()
+                .position(|spec| spec.get("id").and_then(serde_json::Value::as_str) == Some(id))
+        })
+        .map(|index| index as i64 + 1)
+        .unwrap_or(1)
+}
+
+fn slide_statuses(pipeline: &serde_json::Value) -> Vec<String> {
+    let specs = pipeline
+        .pointer("/slideSpecs/value")
+        .and_then(serde_json::Value::as_array);
+    let visuals = pipeline
+        .pointer("/visuals")
+        .and_then(serde_json::Value::as_object);
+    let current = pipeline
+        .pointer("/currentSlideId")
+        .and_then(serde_json::Value::as_str);
+    let mut statuses: Vec<String> = specs
+        .into_iter()
+        .flatten()
+        .map(|spec| {
+            let id = spec
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let visual = visuals.and_then(|items| items.get(id));
+            let version = visual
+                .and_then(|item| {
+                    item.as_array()
+                        .and_then(|items| items.last())
+                        .or(Some(item))
+                })
+                .and_then(|item| item.get("version"));
+            if version
+                .and_then(|item| item.get("status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("frozen")
+            {
+                "approved".to_string()
+            } else if current == Some(id) {
+                "waiting".to_string()
+            } else {
+                "pending".to_string()
+            }
+        })
+        .collect();
+    while statuses.len() < 5 {
+        statuses.push("pending".to_string());
+    }
+    statuses.truncate(5);
+    if statuses.iter().all(|status| status == "pending") {
+        statuses[0] = "waiting".to_string();
+    }
+    statuses
+}
+
+fn workflow_progress(status: &str) -> i64 {
+    match status {
+        "intake" => 10,
+        "source_analysis" => 25,
+        "outline_review" => 35,
+        "detail_review" => 45,
+        "visual_review" | "blocked" => 60,
+        "conversion" => 78,
+        "qa" => 90,
+        "completed" => 100,
+        _ => 0,
+    }
 }
 
 fn json_column<T: serde::de::DeserializeOwned>(value: String, index: usize) -> Result<T> {

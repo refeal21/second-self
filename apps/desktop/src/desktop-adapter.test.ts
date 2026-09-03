@@ -119,6 +119,10 @@ describe('native desktop general-task bridge', () => {
         worker: 'digital-twin-workflow-worker' as const,
         status: 'ready' as const,
       })),
+      createProject: vi.fn(async () => ({} as never)),
+      restoreProject: vi.fn(async (pipeline) => pipeline),
+      executeProject: vi.fn(async () => ({} as never)),
+      snapshotProject: vi.fn(async () => ({} as never)),
     };
     const adapter = createTauriDesktopAdapter(transport, invoke, worker);
 

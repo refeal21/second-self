@@ -98,4 +98,37 @@ describe('worker sidecar JSON-RPC boundary', () => {
       },
     });
   });
+
+  it('owns the production PPT aggregate and restores it after a process restart', async () => {
+    const created = JSON.parse((await handleWorkerRpcLine(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 5,
+      method: 'ppt.project.create',
+      params: {
+        id: 'sidecar-project',
+        name: '业务复盘',
+        goal: '生成五页管理层汇报',
+        createdAt: '2026-09-03T00:00:00.000Z',
+        preferenceSnapshot: [],
+      },
+    })))!);
+    expect(created.result.pipeline).toMatchObject({
+      project: { id: 'sidecar-project', workflowStatus: 'intake' },
+      revision: 1,
+    });
+
+    const restored = JSON.parse((await handleWorkerRpcLine(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 6,
+      method: 'ppt.project.restore',
+      params: { pipeline: created.result.pipeline },
+    })))!);
+    expect(restored.result).toEqual(created.result.pipeline);
+
+    const snapshot = JSON.parse((await handleWorkerRpcLine(JSON.stringify({
+      jsonrpc: '2.0', id: 7, method: 'ppt.project.snapshot',
+      params: { projectId: 'sidecar-project' },
+    })))!);
+    expect(snapshot.result).toEqual(created.result.pipeline);
+  });
 });

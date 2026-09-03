@@ -1,5 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import type {
+  NativePipelineAction,
+  NativePipelineResult,
+  NativePptPipeline,
+  NativePreferenceSnapshot,
+} from '../../worker/src/native-pipeline.js';
 
 export interface WorkflowWorkerHealth {
   protocolVersion: 1;
@@ -9,6 +15,16 @@ export interface WorkflowWorkerHealth {
 
 export interface WorkflowWorkerGateway {
   health(): Promise<WorkflowWorkerHealth>;
+  createProject(input: {
+    id: string;
+    name: string;
+    goal: string;
+    createdAt: string;
+    preferenceSnapshot: NativePreferenceSnapshot[];
+  }): Promise<NativePipelineResult>;
+  restoreProject(pipeline: NativePptPipeline): Promise<NativePptPipeline>;
+  executeProject(projectId: string, action: NativePipelineAction): Promise<NativePipelineResult>;
+  snapshotProject(projectId: string): Promise<NativePptPipeline>;
 }
 
 export interface WorkflowWorkerBridge {
@@ -60,6 +76,28 @@ export class TauriWorkflowWorkerClient implements WorkflowWorkerGateway {
       throw new Error('Workflow worker returned an incompatible health response');
     }
     return result;
+  }
+
+  createProject(input: {
+    id: string;
+    name: string;
+    goal: string;
+    createdAt: string;
+    preferenceSnapshot: NativePreferenceSnapshot[];
+  }): Promise<NativePipelineResult> {
+    return this.request('ppt.project.create', input) as Promise<NativePipelineResult>;
+  }
+
+  restoreProject(pipeline: NativePptPipeline): Promise<NativePptPipeline> {
+    return this.request('ppt.project.restore', { pipeline }) as Promise<NativePptPipeline>;
+  }
+
+  executeProject(projectId: string, action: NativePipelineAction): Promise<NativePipelineResult> {
+    return this.request('ppt.project.execute', { projectId, action }) as Promise<NativePipelineResult>;
+  }
+
+  snapshotProject(projectId: string): Promise<NativePptPipeline> {
+    return this.request('ppt.project.snapshot', { projectId }) as Promise<NativePptPipeline>;
   }
 
   async request(method: string, params?: unknown): Promise<unknown> {

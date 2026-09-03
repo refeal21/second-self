@@ -2,13 +2,54 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::workbench::{
-    ApprovalResult, CreateProjectInput, DesktopInitialState, ProjectSummary, RegenerateResult,
-    SlideMutationInput, WorkbenchService,
+    ApprovalResult, AttachSourceInput, CreateProjectInput, DesktopInitialState,
+    PipelineCommitInput, ProjectSummary, RegenerateResult, SlideMutationInput, WorkbenchService,
 };
 
 #[derive(Serialize)]
 pub struct StatusResult {
     pub status: String,
+}
+
+#[tauri::command]
+pub fn ppt_load_pipeline(
+    state: State<'_, WorkbenchService>,
+    project_id: String,
+) -> Result<serde_json::Value, String> {
+    state.load_pipeline(&project_id)
+}
+
+#[tauri::command]
+pub fn ppt_project_directory(
+    state: State<'_, WorkbenchService>,
+    project_id: String,
+) -> Result<String, String> {
+    state.project_directory(&project_id)
+}
+
+#[tauri::command]
+pub fn ppt_read_artifact(
+    state: State<'_, WorkbenchService>,
+    project_id: String,
+    relative_path: String,
+) -> Result<String, String> {
+    state.read_artifact(&project_id, &relative_path)
+}
+
+#[tauri::command]
+pub fn ppt_attach_source(
+    state: State<'_, WorkbenchService>,
+    input: AttachSourceInput,
+) -> Result<serde_json::Value, String> {
+    state.attach_source(input)
+}
+
+#[tauri::command]
+pub fn ppt_commit_pipeline(
+    state: State<'_, WorkbenchService>,
+    input: PipelineCommitInput,
+) -> Result<serde_json::Value, String> {
+    state.commit_pipeline(input)
 }
 
 #[derive(Serialize)]
@@ -110,6 +151,17 @@ pub fn memory_decide(
 ) -> Result<StatusResult, String> {
     Ok(StatusResult {
         status: state.decide_memory(&proposal_id, &decision)?,
+    })
+}
+
+#[tauri::command]
+pub fn memory_propose(
+    state: State<'_, WorkbenchService>,
+    title: String,
+    content: String,
+) -> Result<StatusResult, String> {
+    Ok(StatusResult {
+        status: state.propose_memory(title, content)?,
     })
 }
 

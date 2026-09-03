@@ -23,6 +23,7 @@ import {
   type WorkbenchState,
 } from './workbench-store.js';
 import './styles.css';
+import { NativeWorkspacePage } from './native-workspace.js';
 
 type Route =
   | 'dashboard'
@@ -143,7 +144,13 @@ export function App({
       <div className="workspace-app">
         <Sidebar adapter={adapter} route="projects" navigate={navigate} />
         {selectedProject ? (
-          <WorkspacePage
+          adapter.mode === 'tauri' ? <NativeWorkspacePage
+            adapter={adapter}
+            projectId={selectedProject.id}
+            projectName={selectedProject.name}
+            projectGoal={selectedProject.goal}
+            onBack={() => navigate('projects')}
+          /> : <WorkspacePage
             adapter={adapter}
             project={selectedProject}
             dispatch={dispatch}

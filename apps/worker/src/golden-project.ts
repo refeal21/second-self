@@ -222,7 +222,7 @@ export async function runGoldenProject(
   };
 }
 
-function goldenSourceAnalysis(): SourceAnalysis {
+export function goldenSourceAnalysis(): SourceAnalysis {
   return {
     findings: [
       {
@@ -301,7 +301,7 @@ function goldenSourceAnalysis(): SourceAnalysis {
   };
 }
 
-function goldenOutline(): PptOutline {
+export function goldenOutline(): PptOutline {
   return {
     title: '2026 年经营复盘与增长计划',
     slides: [
@@ -354,7 +354,7 @@ function goldenOutline(): PptOutline {
   };
 }
 
-function goldenSlideSpecs(): readonly SlideSpec[] {
+export function goldenSlideSpecs(): readonly SlideSpec[] {
   const reportCitation = {
     sourceId: 'source-report',
     title: '2026 管理层经营备忘录',

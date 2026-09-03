@@ -5,6 +5,12 @@ import {
   type WorkflowStatus,
 } from '@digital-twin/core';
 import { assertStrictIdentifier } from './identifiers.js';
+import {
+  NativePptRpcRuntime,
+  type NativePipelineAction,
+  type NativePptPipeline,
+  type NativePreferenceSnapshot,
+} from './native-pipeline.js';
 
 export const WORKER_RPC_PROTOCOL_VERSION = 1;
 export const WORKER_NAME = 'digital-twin-workflow-worker';
@@ -25,6 +31,10 @@ interface RpcError {
 }
 
 class InvalidParams extends Error {}
+
+const nativePptRuntime = new NativePptRpcRuntime({
+  imageGenAvailable: process.env.DIGITAL_TWIN_IMAGEGEN === 'available',
+});
 
 export async function handleWorkerRpcLine(
   line: string,
@@ -107,6 +117,32 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
       return transition(params);
     case 'checkpoint.recover':
       return recoverCheckpoint(params);
+    case 'ppt.project.create': {
+      const input = requireRecord(params);
+      const pipeline = nativePptRuntime.create({
+        id: requireString(input.id, 'id'),
+        name: requireString(input.name, 'name'),
+        goal: requireString(input.goal, 'goal'),
+        createdAt: requireString(input.createdAt, 'createdAt'),
+        preferenceSnapshot: requireArray(input.preferenceSnapshot, 'preferenceSnapshot') as NativePreferenceSnapshot[],
+      });
+      return { pipeline, writes: [], message: '项目已在工作流 Worker 中创建。' };
+    }
+    case 'ppt.project.restore': {
+      const input = requireRecord(params);
+      return nativePptRuntime.restore(input.pipeline as NativePptPipeline);
+    }
+    case 'ppt.project.snapshot': {
+      const input = requireRecord(params);
+      return nativePptRuntime.snapshot(requireString(input.projectId, 'projectId'));
+    }
+    case 'ppt.project.execute': {
+      const input = requireRecord(params);
+      return nativePptRuntime.execute(
+        requireString(input.projectId, 'projectId'),
+        input.action as NativePipelineAction,
+      );
+    }
     case 'test.crash':
       if (process.env.DIGITAL_TWIN_SIDECAR_TEST_MODE !== '1') {
         throw new MethodNotFound();
@@ -197,6 +233,18 @@ function requireNoParams(params: unknown): void {
 
 function requireRecord(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) throw new InvalidParams('Params must be an object');
+  return value;
+}
+
+function requireString(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new InvalidParams(`${field} is required`);
+  }
+  return value;
+}
+
+function requireArray(value: unknown, field: string): unknown[] {
+  if (!Array.isArray(value)) throw new InvalidParams(`${field} must be an array`);
   return value;
 }
 

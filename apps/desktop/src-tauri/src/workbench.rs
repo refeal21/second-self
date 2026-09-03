@@ -9,8 +9,16 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use crate::database::{Database, NewProject, ProjectMutation, StoredProject};
+use crate::{
+    database::{
+        Database, NewMemoryProposal, NewProject, PersistedArtifact, PersistenceCounts,
+        ProjectMutation, StoredProject,
+    },
+    paths::{atomic_write_workspace_file, create_workspace_project_tree},
+};
 
 const ARTIFACT_DIRECTORIES: [&str; 6] = [
     "sources",
@@ -41,6 +49,37 @@ pub struct SlideMutationInput {
     pub project_id: String,
     pub slide: i64,
     pub comment: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachSourceInput {
+    pub project_id: String,
+    pub file_name: String,
+    pub media_type: String,
+    pub contents_base64: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactWriteInput {
+    pub relative_path: String,
+    pub contents_base64: String,
+    pub sha256: String,
+    pub byte_length: usize,
+    pub kind: String,
+    pub version_id: String,
+    pub slide_id: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineCommitInput {
+    pub project_id: String,
+    pub expected_revision: i64,
+    pub pipeline: Value,
+    pub writes: Vec<ArtifactWriteInput>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -257,8 +296,8 @@ impl WorkbenchService {
         let goal = non_empty(input.goal, "Project goal")?;
         let id = next_identifier("project");
         let now = now_string();
-        let project_root = self.workspace()?.join(&id);
-        create_project_directories(&project_root)?;
+        let workspace = self.workspace()?;
+        let project_root = create_workspace_project_tree(&workspace, &id, &ARTIFACT_DIRECTORIES)?;
         let database = self.database()?;
         if let Err(error) = database.insert_project(&NewProject {
             id: id.clone(),
@@ -274,6 +313,174 @@ impl WorkbenchService {
             .map_err(database_error)?
             .ok_or_else(|| "Created project could not be reloaded".to_string())?;
         Ok(project_summary(stored))
+    }
+
+    pub fn load_pipeline(&self, project_id: &str) -> Result<Value, String> {
+        self.database()?
+            .get_project(project_id)
+            .map_err(database_error)?
+            .map(|project| project.pipeline)
+            .ok_or_else(|| "Unknown project".to_string())
+    }
+
+    pub fn project_directory(&self, project_id: &str) -> Result<String, String> {
+        self.load_pipeline(project_id)?;
+        let path = self.workspace()?.join(project_id);
+        let canonical = fs::canonicalize(path)
+            .map_err(|error| format!("Project directory cannot be resolved: {error}"))?;
+        if !canonical.starts_with(self.workspace()?) {
+            return Err("Project directory is outside the workspace".into());
+        }
+        Ok(canonical.to_string_lossy().into_owned())
+    }
+
+    pub fn read_artifact(&self, project_id: &str, relative_path: &str) -> Result<String, String> {
+        use base64::Engine;
+        validate_worker_relative_path(relative_path)?;
+        let workspace = self.workspace()?;
+        let project = fs::canonicalize(workspace.join(project_id))
+            .map_err(|error| format!("Project directory cannot be resolved: {error}"))?;
+        if !project.starts_with(&workspace) {
+            return Err("Project directory is outside the workspace".into());
+        }
+        let path = fs::canonicalize(project.join(relative_path))
+            .map_err(|error| format!("Artifact cannot be resolved: {error}"))?;
+        if !path.starts_with(&project) {
+            return Err("Artifact is outside the project".into());
+        }
+        let bytes = fs::read(path).map_err(|error| format!("Artifact cannot be read: {error}"))?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn attach_source(&self, input: AttachSourceInput) -> Result<Value, String> {
+        let file_name = non_empty(input.file_name, "Source file name")?;
+        if Path::new(&file_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(&file_name)
+        {
+            return Err("Source file name must not contain a path".into());
+        }
+        let media_type = non_empty(input.media_type, "Source media type")?;
+        let bytes = decode_base64(&input.contents_base64)?;
+        let database = self.database()?;
+        let mut pipeline = database
+            .get_project(&input.project_id)
+            .map_err(database_error)?
+            .map(|project| project.pipeline)
+            .ok_or_else(|| "Unknown project".to_string())?;
+        if pipeline
+            .pointer("/project/workflowStatus")
+            .and_then(Value::as_str)
+            != Some("intake")
+        {
+            return Err("Sources can only be attached during intake".into());
+        }
+        let expected_revision = pipeline
+            .get("revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "Persisted pipeline revision is invalid".to_string())?;
+        let source_id = next_identifier("source");
+        let relative_path = format!("sources/{source_id}.bin");
+        let sha256 = sha256(&bytes);
+        atomic_write_workspace_file(
+            &self.workspace()?,
+            Path::new(&input.project_id).join(&relative_path).as_path(),
+            &bytes,
+        )?;
+        let sources = pipeline
+            .get_mut("sources")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "Persisted pipeline sources are invalid".to_string())?;
+        sources.push(serde_json::json!({
+            "id": source_id, "fileName": file_name, "mediaType": media_type,
+            "relativePath": relative_path, "sha256": sha256, "byteLength": bytes.len(),
+        }));
+        pipeline["revision"] = (expected_revision + 1).into();
+        pipeline["project"]["updatedAt"] = now_string().into();
+        let artifact = PersistedArtifact {
+            id: format!("{}-artifact", source_id),
+            version_id: source_id,
+            path: relative_path,
+            kind: "source".into(),
+            created_at: now_string(),
+        };
+        if !database
+            .replace_pipeline(&input.project_id, expected_revision, &pipeline, &[artifact])
+            .map_err(database_error)?
+        {
+            return Err("Unknown project".into());
+        }
+        Ok(pipeline)
+    }
+
+    pub fn commit_pipeline(&self, input: PipelineCommitInput) -> Result<Value, String> {
+        let workspace = self.workspace()?;
+        let database = self.database()?;
+        let current = database
+            .get_project(&input.project_id)
+            .map_err(database_error)?
+            .ok_or_else(|| "Unknown project".to_string())?;
+        let current_revision = current
+            .pipeline
+            .get("revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "Persisted pipeline revision is invalid".to_string())?;
+        if current_revision != input.expected_revision {
+            return Err("stale pipeline revision".into());
+        }
+        let mut artifacts = Vec::with_capacity(input.writes.len());
+        for (index, write) in input.writes.iter().enumerate() {
+            let bytes = decode_base64(&write.contents_base64)?;
+            if bytes.len() != write.byte_length || sha256(&bytes) != write.sha256 {
+                return Err(
+                    "Worker artifact length or SHA-256 does not match its write intent".into(),
+                );
+            }
+            validate_worker_relative_path(&write.relative_path)?;
+            atomic_write_workspace_file(
+                &workspace,
+                Path::new(&input.project_id)
+                    .join(&write.relative_path)
+                    .as_path(),
+                &bytes,
+            )?;
+            artifacts.push(PersistedArtifact {
+                id: format!(
+                    "{}-artifact-{}-{}",
+                    input.project_id,
+                    input.expected_revision + 1,
+                    index + 1
+                ),
+                version_id: write.version_id.clone(),
+                path: write.relative_path.clone(),
+                kind: write.kind.clone(),
+                created_at: input
+                    .pipeline
+                    .pointer("/project/updatedAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .into(),
+            });
+        }
+        if !database
+            .replace_pipeline(
+                &input.project_id,
+                input.expected_revision,
+                &input.pipeline,
+                &artifacts,
+            )
+            .map_err(database_error)?
+        {
+            return Err("Unknown project".into());
+        }
+        Ok(input.pipeline)
+    }
+
+    pub fn persistence_counts(&self, project_id: &str) -> Result<PersistenceCounts, String> {
+        self.database()?
+            .persistence_counts(project_id)
+            .map_err(database_error)
     }
 
     pub fn rename_project(&self, id: &str, name: String) -> Result<String, String> {
@@ -447,6 +654,22 @@ impl WorkbenchService {
         .into())
     }
 
+    pub fn propose_memory(&self, title: String, content: String) -> Result<String, String> {
+        let title = non_empty(title, "Memory proposal title")?;
+        let content = non_empty(content, "Memory proposal content")?;
+        self.database()?
+            .insert_memory_proposal(&NewMemoryProposal {
+                id: next_identifier("memory"),
+                title: title.clone(),
+                content,
+                created_at: now_string(),
+            })
+            .map_err(database_error)?;
+        Ok(format!(
+            "偏好建议“{title}”已提交，只有你在偏好记忆中批准后才会生效。"
+        ))
+    }
+
     pub fn save_settings(
         &self,
         workspace_path: String,
@@ -547,19 +770,6 @@ impl WorkbenchService {
     }
 }
 
-fn create_project_directories(project_root: &Path) -> Result<(), String> {
-    if project_root.exists() {
-        return Err("Project directory already exists".into());
-    }
-    fs::create_dir(project_root)
-        .map_err(|error| format!("Project directory cannot be created: {error}"))?;
-    for directory in ARTIFACT_DIRECTORIES {
-        fs::create_dir(project_root.join(directory))
-            .map_err(|error| format!("Project artifact directory cannot be created: {error}"))?;
-    }
-    Ok(())
-}
-
 fn project_summary(project: StoredProject) -> ProjectSummary {
     ProjectSummary {
         id: project.id,
@@ -648,4 +858,40 @@ fn now_string() -> String {
 
 fn database_error(error: rusqlite::Error) -> String {
     format!("Local database operation failed: {error}")
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| "Artifact contents are not valid base64".to_string())
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn validate_worker_relative_path(value: &str) -> Result<(), String> {
+    let path = Path::new(value);
+    let first = path
+        .components()
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        });
+    if path.is_absolute()
+        || !ARTIFACT_DIRECTORIES
+            .iter()
+            .any(|directory| Some(*directory) == first)
+    {
+        return Err("Worker artifact path is outside the project artifact directories".into());
+    }
+    if path
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("Worker artifact path is outside the project artifact directories".into());
+    }
+    Ok(())
 }

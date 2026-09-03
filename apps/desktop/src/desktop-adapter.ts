@@ -5,6 +5,12 @@ import {
   type JsonRpcMessage,
 } from '../../worker/src/app-server.js';
 import { GeneralTaskManager, type GeneralTask } from '../../worker/src/general-tasks.js';
+import type {
+  NativePipelineAction,
+  NativePipelineResult,
+  NativePptPipeline,
+} from '../../worker/src/native-pipeline.js';
+import type { PptOutline, SlideSpec, SourceAnalysis } from '../../worker/src/ppt-project.js';
 import { TauriCodexTransport } from './codex-transport.js';
 import {
   TauriWorkflowWorkerClient,
@@ -94,6 +100,7 @@ export interface ApprovalResult {
   exportReady?: boolean;
 }
 export interface CreateProjectInput { name: string; goal: string }
+export interface SourceFileInput { fileName: string; mediaType: string; contentsBase64: string }
 
 export interface DesktopAdapter {
   readonly mode: DesktopAdapterMode;
@@ -106,6 +113,20 @@ export interface DesktopAdapter {
   respondToTask(taskId: string, decision: 'approve' | 'decline'): Promise<{ status: string }>;
   respondToTaskInput(taskId: string, answers: Record<string, string[]>): Promise<{ status: string }>;
   createProject(input: CreateProjectInput): Promise<ProjectSummary>;
+  loadProjectPipeline(projectId: string): Promise<NativePptPipeline>;
+  attachSource(projectId: string, input: SourceFileInput): Promise<NativePptPipeline>;
+  analyzeProject(projectId: string): Promise<NativePptPipeline>;
+  generateOutline(projectId: string): Promise<NativePptPipeline>;
+  saveOutline(projectId: string, outline: PptOutline): Promise<NativePptPipeline>;
+  approveOutline(projectId: string): Promise<NativePptPipeline>;
+  generateDetails(projectId: string): Promise<NativePptPipeline>;
+  saveDetails(projectId: string, specs: readonly SlideSpec[]): Promise<NativePptPipeline>;
+  approveDetails(projectId: string): Promise<NativePptPipeline>;
+  requestVisual(projectId: string, slideId: string): Promise<NativePptPipeline>;
+  replaceVisual(projectId: string, slideId: string, imageBase64: string, altText: string): Promise<NativePptPipeline>;
+  approveVisual(projectId: string, slideId: string): Promise<NativePptPipeline>;
+  reopenVisual(projectId: string, slideId: string): Promise<NativePptPipeline>;
+  proposeProjectMemory(projectId: string): Promise<{ status: string }>;
   renameProject(projectId: string, name: string): Promise<{ status: string }>;
   regenerateSlide(projectId: string, slide: number, comment: string): Promise<RegenerateResult>;
   approveSlide(projectId: string, slide: number, comment: string): Promise<ApprovalResult>;
@@ -231,6 +252,20 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
       if (options.createProjectError) throw new Error(options.createProjectError);
       return { id: `ppt-demo-${counter++}`, name: input.name, goal: input.goal, stage: '材料', progress: 10, updatedAt: '刚刚' };
     },
+    async loadProjectPipeline() { throw new Error('演示模式不使用本地持久化 PPT 管线。'); },
+    async attachSource() { throw new Error('演示模式不会写入本地材料。'); },
+    async analyzeProject() { throw new Error('演示模式不会消耗 Codex 任务。'); },
+    async generateOutline() { throw new Error('演示模式不会消耗 Codex 任务。'); },
+    async saveOutline() { throw new Error('演示模式不会保存生产大纲。'); },
+    async approveOutline() { throw new Error('演示模式不会保存生产审批。'); },
+    async generateDetails() { throw new Error('演示模式不会消耗 Codex 任务。'); },
+    async saveDetails() { throw new Error('演示模式不会保存生产细化。'); },
+    async approveDetails() { throw new Error('演示模式不会保存生产审批。'); },
+    async requestVisual() { throw new Error('演示模式不会请求 ImageGen。'); },
+    async replaceVisual() { throw new Error('演示模式不会写入视觉文件。'); },
+    async approveVisual() { throw new Error('演示模式不会保存生产审批。'); },
+    async reopenVisual() { throw new Error('演示模式不会改动生产版本。'); },
+    async proposeProjectMemory() { throw new Error('演示模式不会创建生产偏好建议。'); },
     async renameProject(_projectId, name) { return { status: `演示数据：项目已重命名为“${name}”。` }; },
     async regenerateSlide(_projectId, slide) {
       await delay('regenerateSlide');
@@ -264,9 +299,10 @@ class TauriDesktopAdapter implements DesktopAdapter {
   private readonly taskPrompts = new Map<string, string>();
   private readonly listeners = new Map<string, Set<(task: TaskSummary) => void>>();
   private taskCounter = 1;
+  private codexPath = '';
 
   constructor(
-    transport: NativeAppServerTransport,
+    private readonly transport: NativeAppServerTransport,
     private readonly nativeInvoke: NativeCommandInvoker,
     private readonly worker: WorkflowWorkerGateway,
   ) {
@@ -282,7 +318,12 @@ class TauriDesktopAdapter implements DesktopAdapter {
 
   async loadInitialState(): Promise<DesktopInitialState> {
     await this.worker.health();
-    return this.callNative('load_desktop_state', undefined);
+    const state = await this.callNative<DesktopInitialState>('load_desktop_state', undefined);
+    this.codexPath = state.settings.codexPath;
+    if (this.transport instanceof TauriCodexTransport) {
+      await this.transport.setConfiguredPath(state.settings.codexPath);
+    }
+    return state;
   }
 
   async connectAccount(): Promise<AccountSummary> {
@@ -324,14 +365,174 @@ class TauriDesktopAdapter implements DesktopAdapter {
     return { status: '已提交补充信息，Codex 正在继续执行。' };
   }
   createProject(input: CreateProjectInput): Promise<ProjectSummary> { return this.callNative('ppt_create_project', { input }); }
+  async loadProjectPipeline(projectId: string): Promise<NativePptPipeline> {
+    const pipeline = await this.callNative<NativePptPipeline>('ppt_load_pipeline', { projectId });
+    await this.worker.restoreProject(pipeline);
+    return pipeline;
+  }
+  async attachSource(projectId: string, input: SourceFileInput): Promise<NativePptPipeline> {
+    const pipeline = await this.callNative<NativePptPipeline>('ppt_attach_source', {
+      input: { projectId, ...input },
+    });
+    await this.worker.restoreProject(pipeline);
+    return pipeline;
+  }
+  async analyzeProject(projectId: string): Promise<NativePptPipeline> {
+    const pipeline = await this.loadProjectPipeline(projectId);
+    const output = await this.runStructured<SourceAnalysis>(projectId, [
+      '读取当前项目 sources 目录中的材料，只使用文件内可验证事实。',
+      '返回严格 JSON，结构必须符合 SourceAnalysis：{findings:[{id,statement,sourceIds}],dataPoints:[{id,label,value,unit,sourceIds}],sourceSummaries:[{sourceId,summary}]} 。',
+      '不要使用 Markdown 代码块，不要联网，不要创造数据。',
+    ].join('\n'));
+    return this.applyPipeline(projectId, pipeline, {
+      kind: 'analysis.commit', at: new Date().toISOString(),
+      requestId: `analysis-${pipeline.revision + 1}`, output,
+    });
+  }
+  async saveOutline(projectId: string, outline: PptOutline): Promise<NativePptPipeline> {
+    return this.applyCurrent(projectId, { kind: 'outline.submit', at: new Date().toISOString(), outline });
+  }
+  async generateOutline(projectId: string): Promise<NativePptPipeline> {
+    const pipeline = await this.loadProjectPipeline(projectId);
+    if (!pipeline.analysis) throw new Error('请先完成材料分析。');
+    const outline = await this.runStructured<PptOutline>(projectId, [
+      '依据 sources 中的分析产物生成一份完整 PPT 大纲。默认中文、16:9、商务汇报。',
+      '只返回严格 JSON：{title,slides:[{id,title,purpose,keyMessage,findingIds,dataPointIds}]}。',
+      '每个 findingIds/dataPointIds 必须来自已保存的材料分析，不要 Markdown，不要联网。',
+    ].join('\n'));
+    return this.applyPipeline(projectId, pipeline, { kind: 'outline.submit', at: new Date().toISOString(), outline });
+  }
+  async approveOutline(projectId: string): Promise<NativePptPipeline> {
+    return this.applyCurrent(projectId, { kind: 'outline.approve', at: new Date().toISOString() });
+  }
+  async saveDetails(projectId: string, specs: readonly SlideSpec[]): Promise<NativePptPipeline> {
+    return this.applyCurrent(projectId, { kind: 'details.submit', at: new Date().toISOString(), specs });
+  }
+  async generateDetails(projectId: string): Promise<NativePptPipeline> {
+    const pipeline = await this.loadProjectPipeline(projectId);
+    if (pipeline.outline?.version.status !== 'frozen') throw new Error('请先批准整份大纲。');
+    const specs = await this.runStructured<readonly SlideSpec[]>(projectId, [
+      '依据已批准的 outline 和 source analysis 生成全部页面细化。',
+      '只返回严格 JSON 数组，每页：{id,title,body,findingIds,dataPointIds,tables,charts,shapes,sourceMap,imageGenerationBrief}。',
+      '文案和数据必须有 sourceMap，不要 Markdown，不要联网。',
+    ].join('\n'));
+    return this.applyPipeline(projectId, pipeline, { kind: 'details.submit', at: new Date().toISOString(), specs });
+  }
+  async approveDetails(projectId: string): Promise<NativePptPipeline> {
+    return this.applyCurrent(projectId, { kind: 'details.approve', at: new Date().toISOString() });
+  }
+  async requestVisual(projectId: string, slideId: string): Promise<NativePptPipeline> {
+    return this.applyCurrent(projectId, { kind: 'visual.generate', at: new Date().toISOString(), slideId });
+  }
+  async replaceVisual(projectId: string, slideId: string, imageBase64: string, altText: string): Promise<NativePptPipeline> {
+    return this.applyCurrent(projectId, { kind: 'visual.replace', at: new Date().toISOString(), slideId, imageBase64, altText });
+  }
+  async approveVisual(projectId: string, slideId: string): Promise<NativePptPipeline> {
+    return this.applyCurrent(projectId, { kind: 'visual.approve', at: new Date().toISOString(), slideId });
+  }
+  async reopenVisual(projectId: string, slideId: string): Promise<NativePptPipeline> {
+    return this.applyCurrent(projectId, { kind: 'visual.reopen', at: new Date().toISOString(), slideId });
+  }
+  async proposeProjectMemory(projectId: string): Promise<{ status: string }> {
+    const proposal = await this.runStructured<{ title: string; content: string }>(projectId, [
+      '根据这个 PPT 项目的已批准大纲、细化和视觉决策，提议一条未来可复用的工作偏好。',
+      '只返回严格 JSON：{title,content}。不要 Markdown。',
+      '这只是建议，必须由用户后续明确批准，不要声称已保存为记忆。',
+    ].join('\n'));
+    return this.callNative('memory_propose', proposal);
+  }
   renameProject(projectId: string, name: string): Promise<{ status: string }> { return this.callNative('ppt_rename_project', { projectId, name }); }
-  regenerateSlide(projectId: string, slide: number, comment: string): Promise<RegenerateResult> { return this.callNative('ppt_regenerate_slide', { projectId, slide, comment }); }
-  approveSlide(projectId: string, slide: number, comment: string): Promise<ApprovalResult> { return this.callNative('ppt_approve_slide', { projectId, slide, comment }); }
-  reopenSlide(projectId: string, slide: number): Promise<{ status: string }> { return this.callNative('ppt_reopen_slide', { projectId, slide }); }
-  exportProject(projectId: string, name: string): Promise<{ message: string }> { return this.callNative('ppt_export_project', { projectId, name }); }
+  async regenerateSlide(projectId: string, slide: number, comment: string): Promise<RegenerateResult> {
+    void comment;
+    const pipeline = await this.loadProjectPipeline(projectId);
+    const slideId = pipeline.slideSpecs?.value[slide - 1]?.id;
+    if (!slideId) throw new Error('页码与已批准规格不匹配。');
+    const next = await this.applyPipeline(projectId, pipeline, { kind: 'visual.generate', at: new Date().toISOString(), slideId });
+    return { status: next.blockedCondition?.message ?? '视觉候选已生成。', selectedSlide: slide };
+  }
+  async approveSlide(projectId: string, slide: number, comment: string): Promise<ApprovalResult> {
+    void comment;
+    const pipeline = await this.loadProjectPipeline(projectId);
+    const slideId = pipeline.slideSpecs?.value[slide - 1]?.id;
+    if (!slideId) throw new Error('页码与已批准规格不匹配。');
+    const next = await this.applyPipeline(projectId, pipeline, { kind: 'visual.approve', at: new Date().toISOString(), slideId });
+    const nextSlide = Math.max(1, (next.slideSpecs?.value.findIndex(({ id }) => id === next.currentSlideId) ?? 0) + 1);
+    return { status: next.project.workflowStatus === 'conversion' ? '最后一页已批准，进入可编辑转换。' : `已批准，进入第 ${nextSlide} 页`, nextSlide,
+      ...(next.project.workflowStatus === 'conversion' ? { stage: 'conversion', exportReady: true } : {}) };
+  }
+  async reopenSlide(projectId: string, slide: number): Promise<{ status: string }> {
+    const pipeline = await this.loadProjectPipeline(projectId);
+    const slideId = pipeline.slideSpecs?.value[slide - 1]?.id;
+    if (!slideId) throw new Error('页码与已批准规格不匹配。');
+    await this.applyPipeline(projectId, pipeline, { kind: 'visual.reopen', at: new Date().toISOString(), slideId });
+    return { status: `第 ${slide} 页已重新打开，等待新候选。` };
+  }
+  async exportProject(projectId: string, name: string): Promise<{ message: string }> {
+    const pipeline = await this.loadProjectPipeline(projectId);
+    if (!pipeline.slideSpecs) throw new Error('项目尚无已批准的逐页细化。');
+    const visualBytes: Record<string, string> = {};
+    for (const [index, spec] of pipeline.slideSpecs.value.entries()) {
+      const visual = pipeline.visuals[spec.id]?.at(-1);
+      if (!visual) throw new Error(`第 ${index + 1} 页尚无已批准视觉。`);
+      visualBytes[spec.id] = await this.callNative<string>('ppt_read_artifact', {
+        projectId, relativePath: visual.relativePath,
+      });
+    }
+    const fileName = name.toLowerCase().endsWith('.pptx') ? name : `${name}.pptx`;
+    const completed = await this.applyPipeline(projectId, pipeline, {
+      kind: 'deck.export', at: new Date().toISOString(), fileName, visualBytes,
+    });
+    return { message: `已安全导出 ${completed.exportReceipt?.relativePath ?? fileName}，等待 QA。` };
+  }
   decideApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }> { return this.callNative('approval_decide', { approvalId, decision }); }
   decideMemory(proposalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }> { return this.callNative('memory_decide', { proposalId, decision }); }
-  saveSettings(input: { workspacePath: string; codexPath: string }): Promise<{ status: string }> { return this.callNative('save_desktop_settings', input); }
+  async saveSettings(input: { workspacePath: string; codexPath: string }): Promise<{ status: string }> {
+    const result = await this.callNative<{ status: string }>('save_desktop_settings', input);
+    this.codexPath = input.codexPath;
+    if (this.transport instanceof TauriCodexTransport) await this.transport.setConfiguredPath(input.codexPath);
+    return result;
+  }
+
+  private async applyCurrent(projectId: string, action: NativePipelineAction): Promise<NativePptPipeline> {
+    const pipeline = await this.loadProjectPipeline(projectId);
+    return this.applyPipeline(projectId, pipeline, action);
+  }
+  private async applyPipeline(projectId: string, current: NativePptPipeline, action: NativePipelineAction): Promise<NativePptPipeline> {
+    await this.worker.restoreProject(current);
+    const result: NativePipelineResult = await this.worker.executeProject(projectId, action);
+    return this.callNative<NativePptPipeline>('ppt_commit_pipeline', {
+      input: { projectId, expectedRevision: current.revision, pipeline: result.pipeline, writes: result.writes },
+    });
+  }
+  private async runStructured<T>(projectId: string, prompt: string): Promise<T> {
+    const cwd = await this.callNative<string>('ppt_project_directory', { projectId });
+    await this.client.connect();
+    const id = `ppt-structured-${this.taskCounter++}`;
+    const task = await this.tasks.startTask({ id, cwd, prompt, createdAt: new Date().toISOString() });
+    this.taskIds.add(id);
+    this.taskPrompts.set(id, prompt);
+    const completed = await new Promise<GeneralTask>((resolve, reject) => {
+      let stop = () => {};
+      let stopExit = () => {};
+      const finish = (result: GeneralTask | Error) => {
+        stop(); stopExit();
+        if (result instanceof Error) reject(result); else resolve(result);
+      };
+      const inspect = () => {
+        const current = this.tasks.getTask(task.id);
+        if (!current) return;
+        if (current.status === 'completed') finish(current);
+        else if (['failed', 'cancelled', 'interrupted'].includes(current.status)) finish(new Error(current.error ?? `Codex 任务未完成：${current.status}`));
+      };
+      stop = this.client.onServerMessage(() => inspect());
+      stopExit = this.client.onExit(() => finish(new Error('Codex App Server 在生成结构化内容时退出。')));
+      void Promise.resolve().then(inspect);
+    });
+    const text = completed.transcript.filter(({ role }) => role === 'assistant').at(-1)?.text;
+    if (!text) throw new Error('Codex 没有返回可解析的内容。');
+    try { return JSON.parse(text.replace(/^```json\s*|\s*```$/g, '')) as T; }
+    catch { throw new Error('Codex 返回的内容不是严格 JSON，项目保持在原检查点。'); }
+  }
 
   private callNative<T>(command: string, args?: Record<string, unknown>): Promise<T> { return this.nativeInvoke(command, args) as Promise<T>; }
   private publishThread(threadId: string): void {

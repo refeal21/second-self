@@ -84,3 +84,15 @@ Status: Task 5 engineering and automated acceptance are implemented and verified
 - The current local Codex capability report does not expose ImageGen. Native visual regeneration therefore returns the tested Chinese blocked state and persists the current visual-review checkpoint; it never swaps to an API-key/billed client.
 - The native UI exports only a project with a verified delivery artifact. In the unavailable-ImageGen environment, it reports that no verified artifact exists; the Golden runner is the automated proof of the real exporter/QA path.
 - Keynote is installed but the human open/edit checklist in `docs/qa.md` remains to be performed by the user. Microsoft PowerPoint compatibility is unverified.
+
+## 5C production pipeline correction
+
+The rejected implementation has been replaced on the production path. The packaged Worker now owns the real versioned PPT workflow aggregate and exposes create/restore/snapshot/execute JSON-RPC methods. The Tauri adapter restores the authoritative SQLite snapshot before every action and commits the resulting snapshot plus artifact write intents through Rust. Production no longer calls the simplified Rust slide state machine and no longer renders the fabricated timeline, sources or slide content; the browser-only demo remains isolated.
+
+The native workspace now provides user-selected material attachment, Codex source analysis without network permission, whole-deck outline generation/edit/approval, whole-deck slide-spec generation/edit/approval, sequential ImageGen requests, explicit recoverable ImageGen-unavailable state, user PNG replacement, per-page approval/reopen, editable PPTX export, and an honest pending-QA state. Approved preference snapshots are copied into the aggregate. AI can propose a reusable preference, but it stays only a pending proposal until the user approves it in the memory center.
+
+SQLite durably stores the full aggregate and synchronized versions, approvals with version/slide provenance, task records, artifacts and complete checkpoints. A fresh Worker process restores outline/spec/visual histories, approvals, sources, hashes, export receipt and preference snapshot. Every production artifact is length/SHA-256 checked and written by Rust through held workspace/project directory fds; stale Worker results are rejected before bytes can overwrite newer artifacts. Project-tree creation uses the same fd-relative boundary and has a deterministic concurrent parent-replacement regression test.
+
+The saved Codex binary path is applied as the first resolution candidate immediately. Changing it safely stops the active App Server generation so the next connection starts the configured binary, without restarting the desktop app.
+
+5C verification before commit: repository typecheck/lint and all suites green (core 8, Worker 159, desktop 52, Rust 19 at this checkpoint); packaged 106 MiB arm64 SEA rebuilt and directly executed native project create/snapshot. Task 5D remains responsible for production LibreOffice QA comparison/check expansion, corrected Golden sources/distinct visuals, complete bundled Node license evidence and strengthened process-memory timeline.

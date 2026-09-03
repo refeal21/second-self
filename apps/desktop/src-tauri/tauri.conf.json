@@ -17,6 +17,9 @@
     "active": true,
     "targets": ["app"],
     "externalBin": ["binaries/digital-twin-worker"],
+    "resources": {
+      "../../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+    },
     "macOS": { "minimumSystemVersion": "13.0" }
   }
 }

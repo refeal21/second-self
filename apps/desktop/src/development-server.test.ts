@@ -14,6 +14,9 @@ describe('development server boundary', () => {
     expect(tauriConfig.build.beforeBuildCommand).toBe(
       'pnpm build:tauri-assets',
     );
+    expect(tauriConfig.bundle.resources).toEqual({
+      '../../../THIRD_PARTY_NOTICES.md': 'THIRD_PARTY_NOTICES.md',
+    });
   });
 
   it('uses the same loopback address for Tauri development', () => {

@@ -4,6 +4,7 @@ import {
   type NativeAppServerTransport,
   type NativeJsonRpcMessage,
 } from './desktop-adapter.js';
+import type { WorkflowWorkerGateway } from './workflow-worker-client.js';
 
 class ScriptedNativeServer implements NativeAppServerTransport {
   readonly sent: NativeJsonRpcMessage[] = [];
@@ -112,11 +113,19 @@ describe('native desktop general-task bridge', () => {
       }
       return {};
     });
-    const adapter = createTauriDesktopAdapter(transport, invoke);
+    const worker: WorkflowWorkerGateway = {
+      health: vi.fn(async () => ({
+        protocolVersion: 1 as const,
+        worker: 'digital-twin-workflow-worker' as const,
+        status: 'ready' as const,
+      })),
+    };
+    const adapter = createTauriDesktopAdapter(transport, invoke, worker);
 
     await expect(adapter.loadInitialState()).resolves.toEqual(persisted);
-    expect(invoke).toHaveBeenNthCalledWith(1, 'start_worker_sidecar', undefined);
-    expect(invoke).toHaveBeenNthCalledWith(2, 'load_desktop_state', undefined);
+    expect(worker.health).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledWith('load_desktop_state', undefined);
   });
 
   it('publishes streamed output, usage, and completion from App Server', async () => {

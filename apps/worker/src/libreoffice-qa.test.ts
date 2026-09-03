@@ -194,7 +194,10 @@ describe('LibreOffice presentation QA', () => {
       options: {
         timeoutMs: 30_000,
         maxOutputBytes: 64_000,
-        env: { TMPDIR: '/workspace/project-1/qa/run-1/temp' },
+        env: {
+          TMPDIR: '/workspace/project-1/qa/run-1/temp',
+          FONTCONFIG_FILE: '/workspace/project-1/qa/run-1/fontconfig.xml',
+        },
       },
     });
     expect(commands.commands[1]).toMatchObject({
@@ -214,13 +217,16 @@ describe('LibreOffice presentation QA', () => {
       comparisons: [{ differenceScore: 0 }, { differenceScore: 0.25 }],
     });
     expect(artifacts.writes.has('project-1/qa/qa-round-1.json')).toBe(true);
+    expect(
+      String(artifacts.writes.get('project-1/qa/run-1/fontconfig.xml')),
+    ).toContain('/System/Library/Fonts/Supplemental');
     expect(artifacts.writes.has('project-1/qa/qa-round-1.txt')).toBe(false);
     expect(
       String(artifacts.writes.get('project-1/qa/qa-round-1.json')),
     ).toContain('Blank rendered pages: 2');
   });
 
-  it('persists create-only QA output with one write so no partial second-file dead end exists', async () => {
+  it('persists create-only QA output with one atomic report write when execution is unavailable', async () => {
     const artifacts = new CreateOnlyQaArtifacts();
     artifacts.files.set('project-1/exports/deck.pptx', exportBytes);
     const qa = new LibreOfficeQa(

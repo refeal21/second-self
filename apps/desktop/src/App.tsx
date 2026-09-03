@@ -58,12 +58,19 @@ const workspaceStages = [
 ] as const;
 
 export function App({
-  adapter = createDesktopAdapter(),
+  adapter: providedAdapter,
   initialRoute,
 }: {
   adapter?: DesktopAdapter;
   initialRoute?: Route;
 }) {
+  // The native adapter owns child processes and subscriptions. Construct it
+  // once for the component lifetime; a default-parameter expression would
+  // create a new supervisor on every React render and continuously restart
+  // the Worker sidecar.
+  const [adapter] = useState(
+    () => providedAdapter ?? createDesktopAdapter(),
+  );
   const [route, setRoute] = useState<Route>(
     () => initialRoute ?? routeFromHash() ?? 'dashboard',
   );
@@ -1835,7 +1842,9 @@ function routeFromHash(): Route | null {
 }
 
 function toMessage(error: unknown): string {
-  return error instanceof Error ? error.message : '操作未完成，请稍后重试。';
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string' && error.trim()) return error;
+  return '操作未完成，请稍后重试。';
 }
 
 function collectionMessage(

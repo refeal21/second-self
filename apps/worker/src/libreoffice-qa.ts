@@ -5,7 +5,10 @@ import { basename, delimiter, extname, isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { PNG } from 'pngjs';
-import type { WorkspaceArtifactAccess } from './workspace-artifacts.js';
+import {
+  writeArtifactOrAdoptExact,
+  type WorkspaceArtifactAccess,
+} from './workspace-artifacts.js';
 
 export interface CommandResult {
   exitCode: number;
@@ -365,10 +368,17 @@ export class LibreOfficeQa implements QaRunner {
         }),
       );
     }
+    const fontEnvironment =
+      process.platform === 'darwin'
+        ? await this.#macFontEnvironment(
+            input.projectId,
+            runDirectoryRelative,
+          )
+        : {};
     const commandOptions: CommandRunOptions = {
       timeoutMs: this.#options.commandTimeoutMs ?? 30_000,
       maxOutputBytes: this.#options.maxCommandOutputBytes ?? 64_000,
-      env: { TMPDIR: tempDirectory },
+      env: { TMPDIR: tempDirectory, ...fontEnvironment },
     };
     const conversion = await this.#commands.run(
       soffice,
@@ -478,6 +488,40 @@ export class LibreOfficeQa implements QaRunner {
     return null;
   }
 
+  async #macFontEnvironment(
+    projectId: string,
+    runDirectoryRelative: string,
+  ): Promise<Readonly<Record<'FONTCONFIG_FILE', string>>> {
+    const cache = await this.#artifacts.ensureDirectory(
+      projectId,
+      `${runDirectoryRelative}/font-cache`,
+    );
+    const relativePath = `${runDirectoryRelative}/fontconfig.xml`;
+    const contents = [
+      '<?xml version="1.0"?>',
+      '<!DOCTYPE fontconfig SYSTEM "fonts.dtd">',
+      '<fontconfig>',
+      '  <dir>/System/Library/Fonts</dir>',
+      '  <dir>/System/Library/Fonts/Supplemental</dir>',
+      '  <dir>/Library/Fonts</dir>',
+      `  <cachedir>${escapeXml(cache)}</cachedir>`,
+      '</fontconfig>',
+      '',
+    ].join('\n');
+    await writeArtifactOrAdoptExact(
+      this.#artifacts,
+      projectId,
+      relativePath,
+      contents,
+    );
+    return {
+      FONTCONFIG_FILE: await this.#artifacts.resolvePath(
+        projectId,
+        relativePath,
+      ),
+    };
+  }
+
   async #report(
     input: QaRunInput,
     values: Partial<LibreOfficeQaReport>,
@@ -535,6 +579,15 @@ export class LibreOfficeQa implements QaRunner {
     authenticQaReports.add(frozen);
     return frozen;
   }
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
 }
 
 function deepFreeze<T>(value: T): T {

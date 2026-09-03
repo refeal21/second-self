@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.digitaltwin.workbench",
   "build": {
-    "beforeDevCommand": "pnpm --dir .. dev",
-    "beforeBuildCommand": "pnpm --dir .. build:tauri-assets",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build:tauri-assets",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist"
   },

@@ -8,6 +8,11 @@ import type {
 } from './ppt-project.js';
 import type { WorkspaceArtifacts } from './workspace-artifacts.js';
 
+// Hiragino Sans GB ships with the target macOS installation and is also
+// visible to the bundled headless LibreOffice renderer. Using a Latin-only
+// default such as Aptos turns approved Chinese copy into missing-glyph boxes.
+const editableFontFace = 'Hiragino Sans GB';
+
 export interface ApprovedPptDeck {
   title: string;
   slides: readonly {
@@ -55,8 +60,8 @@ export class PptxGenJsExporter implements PptxExporter {
     pptx.title = deck.title;
     pptx.company = 'Digital Twin Workbench';
     pptx.theme = {
-      headFontFace: 'Aptos Display',
-      bodyFontFace: 'Aptos',
+      headFontFace: editableFontFace,
+      bodyFontFace: editableFontFace,
     };
 
     for (const item of deck.slides) {
@@ -130,7 +135,7 @@ function addEditableSpec(
     y: 0.42,
     w: 11.8,
     h: 0.65,
-    fontFace: 'Aptos Display',
+    fontFace: editableFontFace,
     fontSize: 35,
     bold: true,
     color: '172033',
@@ -149,7 +154,7 @@ function addEditableSpec(
         y: 1.35,
         w: 5.7,
         h: 1.15,
-        fontFace: 'Aptos',
+        fontFace: editableFontFace,
         fontSize: 18,
         color: '344054',
         margin: 2,
@@ -170,7 +175,7 @@ function addEditableSpec(
         y: 2.75 + index * 1.35,
         w: 5.7,
         h: 1.05,
-        fontFace: 'Aptos',
+        fontFace: editableFontFace,
         fontSize: 16,
         color: '172033',
         border: { type: 'solid', color: 'D0D5DD', pt: 1 },
@@ -198,8 +203,8 @@ function addEditableSpec(
         showTitle: false,
         showValue: true,
         chartColors: ['2563EB', '14B8A6', 'F59E0B'],
-        catAxisLabelFontFace: 'Aptos',
-        valAxisLabelFontFace: 'Aptos',
+        catAxisLabelFontFace: editableFontFace,
+        valAxisLabelFontFace: editableFontFace,
       },
     );
   });
@@ -239,7 +244,7 @@ function addEditableShape(
       y: shape.y,
       w: shape.w,
       h: shape.h,
-      fontFace: 'Aptos',
+      fontFace: editableFontFace,
       fontSize: 16,
       color: '172033',
       align: 'center',

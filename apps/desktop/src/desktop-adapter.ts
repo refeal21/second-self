@@ -6,6 +6,10 @@ import {
 } from '../../worker/src/app-server.js';
 import { GeneralTaskManager, type GeneralTask } from '../../worker/src/general-tasks.js';
 import { TauriCodexTransport } from './codex-transport.js';
+import {
+  TauriWorkflowWorkerClient,
+  type WorkflowWorkerGateway,
+} from './workflow-worker-client.js';
 
 export type NativeAppServerTransport = AppServerTransport;
 export type NativeJsonRpcMessage = JsonRpcMessage;
@@ -261,7 +265,11 @@ class TauriDesktopAdapter implements DesktopAdapter {
   private readonly listeners = new Map<string, Set<(task: TaskSummary) => void>>();
   private taskCounter = 1;
 
-  constructor(transport: NativeAppServerTransport, private readonly nativeInvoke: NativeCommandInvoker) {
+  constructor(
+    transport: NativeAppServerTransport,
+    private readonly nativeInvoke: NativeCommandInvoker,
+    private readonly worker: WorkflowWorkerGateway,
+  ) {
     this.client = new CodexAppServerClient(transport);
     this.tasks = new GeneralTaskManager(this.client);
     this.client.onServerMessage((message) => {
@@ -273,7 +281,7 @@ class TauriDesktopAdapter implements DesktopAdapter {
   }
 
   async loadInitialState(): Promise<DesktopInitialState> {
-    await this.nativeInvoke('start_worker_sidecar', undefined);
+    await this.worker.health();
     return this.callNative('load_desktop_state', undefined);
   }
 
@@ -360,8 +368,9 @@ class TauriDesktopAdapter implements DesktopAdapter {
 export function createTauriDesktopAdapter(
   transport: NativeAppServerTransport = new TauriCodexTransport(null),
   nativeInvoke: NativeCommandInvoker = (command, args) => invoke(command, args),
+  worker: WorkflowWorkerGateway = new TauriWorkflowWorkerClient(),
 ): DesktopAdapter {
-  return new TauriDesktopAdapter(transport, nativeInvoke);
+  return new TauriDesktopAdapter(transport, nativeInvoke, worker);
 }
 export function createDesktopAdapter(): DesktopAdapter {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window

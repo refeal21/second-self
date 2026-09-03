@@ -32,6 +32,7 @@ export type {
 export * from './pptx-exporter.js';
 export * from './source-analysis.js';
 export * from './sidecar-rpc.js';
+export * from './golden-project.js';
 export * from './structure-generation.js';
 export * from './visual-generation.js';
 export * from './workspace-artifacts.js';

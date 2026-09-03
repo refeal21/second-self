@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "golden-project",
+  "title": "2026 年经营复盘与增长计划",
+  "language": "zh-CN",
+  "aspectRatio": "16:9",
+  "pageCount": 5,
+  "generatedAt": "2026-09-03T00:00:00.000Z",
+  "sources": [
+    {
+      "fileName": "management-memo.pdf",
+      "sha256": "30ce080a8f171cd769b894243d06e94bb7e14ee839fbe5d7c4ff19407a607ea6",
+      "byteLength": 854
+    },
+    {
+      "fileName": "kpis.csv",
+      "sha256": "704bfc3e11ba5f0240fa8fcdd550f90d59da9ae68a7437a8de9a05f38a51bdca",
+      "byteLength": 187
+    },
+    {
+      "fileName": "market-background.png",
+      "sha256": "ff65086060e661e12c81fdfb68b6973d45fa30778e69073f511ea6db24c68745",
+      "byteLength": 60371
+    },
+    {
+      "fileName": "style-reference.pptx",
+      "sha256": "607d8a64b4950a46861f63d64a3d3f8e20e6cc232f75a2c207e8e8f3c79f1b42",
+      "byteLength": 14941
+    }
+  ]
+}

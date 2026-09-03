@@ -256,6 +256,31 @@ describe('packaged native PPT workflow runtime', () => {
     expect(await pptx.file('ppt/slides/slide2.xml')!.async('string')).toContain(
       '<c:chart',
     );
+
+    result = await runtime.execute('project-native', {
+      kind: 'deck.qa',
+      at: '2026-09-03T02:12:00.000Z',
+      preparation: {
+        status: 'ready', sofficePath: '/Applications/LibreOffice.app/Contents/MacOS/soffice',
+        rendererPath: 'pdftoppm', pdfBase64: Buffer.from('pdf').toString('base64'),
+        pptxBase64: pptxWrite!.contentsBase64,
+        renderedPages: [
+          { fileName: 'rendered-1.png', contentsBase64: imageBase64 },
+          { fileName: 'rendered-2.png', contentsBase64: imageBase64 },
+        ],
+        approvedVisuals: [
+          { slideId: 'slide-cover', relativePath: 'visuals/slide-cover-v2.png', contentsBase64: imageBase64 },
+          { slideId: 'slide-kpi', relativePath: 'visuals/slide-kpi-v1.png', contentsBase64: imageBase64 },
+        ],
+        fontAvailability: { 'Hiragino Sans GB': true },
+      },
+    });
+    expect(result.pipeline.project.workflowStatus).toBe('completed');
+    expect(result.pipeline.qaReport).toMatchObject({ status: 'passed', actualPageCount: 2 });
+    expect(result.writes.map(({ relativePath }) => relativePath)).toEqual(expect.arrayContaining([
+      'qa/run-1/rendered-1.png', 'qa/run-1/rendered-2.png',
+      'qa/qa-round-1.json', 'qa/qa-round-1.txt',
+    ]));
   });
 
   it('restores an authoritative full snapshot into a fresh Worker process', async () => {

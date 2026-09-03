@@ -6,9 +6,11 @@ import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { PNG } from 'pngjs';
 import { createHash } from 'node:crypto';
+import JSZip from 'jszip';
 import {
   LibreOfficeQa,
   LocalCommandRunner,
+  inspectPptxOoxml,
   PngPixelPageComparator,
   QaRepairOrchestrator,
   type CommandResult,
@@ -148,6 +150,44 @@ describe('LibreOffice presentation QA', () => {
     expect(results.map(({ blank }) => blank)).toEqual([true, true, false]);
   });
 
+  it('compares each rendered page with its distinct approved full-slide PNG', async () => {
+    const solid = (red: number, green: number, blue: number) => {
+      const image = new PNG({ width: 2, height: 2 });
+      for (let offset = 0; offset < image.data.length; offset += 4) image.data.set([red, green, blue, 255], offset);
+      return PNG.sync.write(image);
+    };
+    const comparator = new PngPixelPageComparator();
+    const results = await comparator.compare(
+      [
+        { path: 'rendered-1.png', contents: solid(20, 40, 60) },
+        { path: 'rendered-2.png', contents: solid(200, 210, 220) },
+      ],
+      [
+        { path: 'approved-cover.png', contents: solid(20, 40, 60) },
+        { path: 'approved-summary.png', contents: solid(100, 110, 120) },
+      ],
+    );
+    expect(results[0]).toMatchObject({ approvedVisualPath: 'approved-cover.png', differenceScore: 0 });
+    expect(results[1]?.differenceScore).toBeGreaterThan(0.3);
+  });
+
+  it('detects missing OOXML resources, out-of-bounds objects and invalid crops', async () => {
+    const archive = new JSZip();
+    archive.file('ppt/presentation.xml', '<p:presentation><p:sldSz cx="1000" cy="500"/></p:presentation>');
+    archive.file('ppt/slides/slide1.xml', [
+      '<p:sld><p:sp><a:xfrm><a:off x="900" y="10"/><a:ext cx="200" cy="100"/></a:xfrm>',
+      '<a:rPr typeface="Missing Board Font"/><a:srcRect l="60000" r="50000"/></p:sp></p:sld>',
+    ].join(''));
+    archive.file('ppt/slides/_rels/slide1.xml.rels', '<Relationships><Relationship Id="rId1" Target="../media/missing.png"/></Relationships>');
+
+    const result = await inspectPptxOoxml(await archive.generateAsync({ type: 'uint8array' }));
+
+    expect(result).toMatchObject({ slideCount: 1, fonts: ['Missing Board Font'] });
+    expect(result.missingResources).toContain('ppt/media/missing.png');
+    expect(result.outOfBoundsObjects).toEqual(['ppt/slides/slide1.xml#1']);
+    expect(result.cropIssues).toEqual(['ppt/slides/slide1.xml#crop-1']);
+  });
+
   it('detects bundled soffice, converts and renders headlessly, then writes one atomic QA bundle', async () => {
     const commands = new FakeCommandRunner([
       '/Applications/LibreOffice.app/Contents/MacOS/soffice',
@@ -220,7 +260,7 @@ describe('LibreOffice presentation QA', () => {
     expect(
       String(artifacts.writes.get('project-1/qa/run-1/fontconfig.xml')),
     ).toContain('/System/Library/Fonts/Supplemental');
-    expect(artifacts.writes.has('project-1/qa/qa-round-1.txt')).toBe(false);
+    expect(artifacts.writes.has('project-1/qa/qa-round-1.txt')).toBe(true);
     expect(
       String(artifacts.writes.get('project-1/qa/qa-round-1.json')),
     ).toContain('Blank rendered pages: 2');
@@ -246,9 +286,10 @@ describe('LibreOffice presentation QA', () => {
 
     expect(report.status).toBe('blocked');
     expect([...artifacts.writes.keys()]).toEqual([
+      'project-1/qa/qa-round-1.txt',
       'project-1/qa/qa-round-1.json',
     ]);
-    expect(report.textReportPath).toBe(report.jsonReportPath);
+    expect(report.textReportPath).toBe('/workspace/project-1/qa/qa-round-1.txt');
   });
 
   it('returns a capability-unavailable report without attempting conversion when soffice is absent', async () => {

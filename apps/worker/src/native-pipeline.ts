@@ -10,6 +10,12 @@ import {
   type SourceAnalysis,
 } from './ppt-project.js';
 import { PptxGenJsExporter } from './pptx-exporter.js';
+import {
+  formatQaReadableSummary,
+  inspectPptxOoxml,
+  PngPixelPageComparator,
+  type LibreOfficeQaReport,
+} from './libreoffice-qa.js';
 import type {
   WorkspaceArtifactAccess,
 } from './workspace-artifacts.js';
@@ -90,14 +96,14 @@ export interface NativePptPipeline {
   tasks: NativeTaskRecord[];
   blockedCondition: {
     kind: 'capability_unavailable';
-    capability: 'image_gen.imagegen';
+    capability: 'image_gen.imagegen' | 'libreoffice' | 'pdf-renderer' | 'qa-rendering';
     recoverable: true;
-    resumeStage: 'visual_review';
-    slideId: string;
+    resumeStage: 'visual_review' | 'qa';
+    slideId?: string;
     message: string;
   } | null;
   exportReceipt: NativeExportReceipt | null;
-  qaReport: unknown | null;
+  qaReport: LibreOfficeQaReport | null;
 }
 
 export interface NativeArtifactWrite {
@@ -117,6 +123,27 @@ export interface NativePipelineResult {
   message: string;
 }
 
+export type NativeQaPreparation =
+  | {
+      status: 'blocked' | 'failed';
+      issue: string;
+      capability?: 'libreoffice' | 'pdf-renderer' | 'qa-rendering';
+    }
+  | {
+      status: 'ready';
+      sofficePath: string;
+      rendererPath: string;
+      pptxBase64: string;
+      pdfBase64: string;
+      renderedPages: readonly { fileName: string; contentsBase64: string }[];
+      approvedVisuals: readonly {
+        slideId: string;
+        relativePath: string;
+        contentsBase64: string;
+      }[];
+      fontAvailability: Readonly<Record<string, boolean>>;
+    };
+
 export type NativePipelineAction =
   | { kind: 'analysis.commit'; at: string; requestId: string; output: SourceAnalysis }
   | { kind: 'outline.submit'; at: string; outline: PptOutline }
@@ -127,7 +154,8 @@ export type NativePipelineAction =
   | { kind: 'visual.replace'; at: string; slideId: string; imageBase64: string; altText: string }
   | { kind: 'visual.approve'; at: string; slideId: string }
   | { kind: 'visual.reopen'; at: string; slideId: string }
-  | { kind: 'deck.export'; at: string; fileName: string; visualBytes: Record<string, string> };
+  | { kind: 'deck.export'; at: string; fileName: string; visualBytes: Record<string, string> }
+  | { kind: 'deck.qa'; at: string; preparation: NativeQaPreparation };
 
 export interface NativePptRpcRuntimeOptions {
   imageGenAvailable: boolean;
@@ -435,6 +463,145 @@ export class NativePptRpcRuntime {
         message = '可编辑 PPTX 已生成并等待自动 QA。';
         break;
       }
+      case 'deck.qa': {
+        if (state.project.workflowStatus === 'blocked') {
+          if (state.blockedCondition?.resumeStage !== 'qa') {
+            throw new Error('Only a recoverable QA block can retry QA');
+          }
+          state.project.workflowStatus = 'qa';
+          state.blockedCondition = null;
+        }
+        await replayPipeline(state, 'qa');
+        const receipt = state.exportReceipt;
+        if (!receipt || !state.slideSpecs) {
+          throw new Error('QA requires a committed export receipt and approved slide specs');
+        }
+        const round = state.tasks.filter(({ kind }) => kind === 'qa').length + 1;
+        if (action.preparation.status !== 'ready') {
+          const report = createNativeQaReport(state, round, {
+            status: action.preparation.status,
+            issues: [action.preparation.issue],
+          });
+          writes.push(...qaReportWrites(report));
+          state.qaReport = report;
+          state.project.workflowStatus = 'blocked';
+          state.blockedCondition = {
+            kind: 'capability_unavailable',
+            capability: action.preparation.capability ?? 'qa-rendering',
+            recoverable: true,
+            resumeStage: 'qa',
+            message: action.preparation.issue,
+          };
+          message = `自动 QA 暂时无法完成：${action.preparation.issue}`;
+          break;
+        }
+        const preparation = action.preparation;
+        const pptxBytes = decodeBase64(preparation.pptxBase64, 'PPTX');
+        if (hash(pptxBytes) !== receipt.sha256) {
+          throw new Error('Prepared PPTX does not match the committed export receipt');
+        }
+        const inspection = await inspectPptxOoxml(pptxBytes);
+        const specs = state.slideSpecs.value;
+        if (preparation.renderedPages.length !== specs.length) {
+          throw new Error('Prepared rendered pages do not match approved slide count');
+        }
+        if (preparation.approvedVisuals.length !== specs.length) {
+          throw new Error('Prepared approved visuals do not map one-to-one to slides');
+        }
+        const approvedPaths = new Set<string>();
+        const approvedVisuals = preparation.approvedVisuals.map((prepared, index) => {
+          const spec = specs[index]!;
+          const visual = currentVisual(state, spec.id);
+          if (
+            prepared.slideId !== spec.id ||
+            !visual ||
+            visual.version.status !== 'frozen' ||
+            prepared.relativePath !== visual.relativePath
+          ) {
+            throw new Error(`Prepared approved visual does not match ${spec.id}`);
+          }
+          if (approvedPaths.has(prepared.relativePath)) {
+            throw new Error('Every approved slide must use its own persisted visual path');
+          }
+          approvedPaths.add(prepared.relativePath);
+          const contents = decodeBase64(prepared.contentsBase64, `approved visual ${spec.id}`);
+          if (hash(contents) !== visual.sha256) {
+            throw new Error(`Prepared approved visual hash does not match ${spec.id}`);
+          }
+          return { path: prepared.relativePath, contents };
+        });
+        const runDirectory = `qa/run-${round}`;
+        const pages = preparation.renderedPages.map((page, index) => {
+          if (basename(page.fileName) !== page.fileName || !/^rendered-\d+\.png$/.test(page.fileName)) {
+            throw new Error(`Prepared rendered page ${index + 1} has an invalid file name`);
+          }
+          const contents = decodeBase64(page.contentsBase64, `rendered page ${index + 1}`);
+          try {
+            PNG.sync.read(Buffer.from(contents));
+          } catch {
+            throw new Error(`Prepared rendered page ${index + 1} is not a decodable PNG`);
+          }
+          const relativePath = `${runDirectory}/${page.fileName}`;
+          writes.push(createWrite(relativePath, contents, 'qa-rendered-page', receipt.specVersionId));
+          return { path: relativePath, contents };
+        });
+        const comparisons = await new PngPixelPageComparator().compare(pages, approvedVisuals);
+        const blankPages = comparisons.flatMap((comparison, index) => comparison.blank ? [index + 1] : []);
+        const fontChecks = inspection.fonts.map((font) => ({
+          font,
+          available: preparation.fontAvailability[font] === true,
+        }));
+        const issues = [
+          ...(inspection.slideCount === specs.length ? [] : [
+            `OOXML slide count mismatch: expected ${specs.length}, found ${inspection.slideCount}`,
+          ]),
+          ...inspection.missingResources.map((path) => `Missing OOXML resource: ${path}`),
+          ...inspection.outOfBoundsObjects.map((id) => `Out-of-bounds slide object: ${id}`),
+          ...inspection.cropIssues.map((id) => `Invalid image crop: ${id}`),
+          ...fontChecks.filter(({ available }) => !available).map(({ font }) => `Unavailable font: ${font}`),
+          ...(blankPages.length === 0 ? [] : [`Blank rendered pages: ${blankPages.join(', ')}`]),
+          ...comparisons.flatMap((comparison, index) =>
+            comparison.differenceScore !== undefined && comparison.differenceScore > 0.6
+              ? [`Visual difference exceeds threshold on page ${index + 1}: ${comparison.differenceScore}`]
+              : []),
+        ];
+        const pdfBytes = decodeBase64(preparation.pdfBase64, 'rendered PDF');
+        const exportStem = basename(receipt.relativePath, '.pptx');
+        const pdfRelativePath = `${runDirectory}/${exportStem}.pdf`;
+        writes.unshift(createWrite(pdfRelativePath, pdfBytes, 'qa-pdf', receipt.specVersionId));
+        const report = createNativeQaReport(state, round, {
+          status: issues.length === 0 ? 'passed' : 'failed',
+          sofficePath: preparation.sofficePath,
+          rendererPath: preparation.rendererPath,
+          pdfPath: pdfRelativePath,
+          renderedPages: pages.map(({ path }) => path),
+          actualPageCount: pages.length,
+          blankPages,
+          comparisons,
+          fontChecks,
+          outOfBoundsObjects: inspection.outOfBoundsObjects,
+          cropIssues: inspection.cropIssues,
+          missingResources: inspection.missingResources,
+          issues,
+        });
+        writes.push(...qaReportWrites(report));
+        state.qaReport = report;
+        if (report.status === 'passed') {
+          state.project.workflowStatus = 'completed';
+          message = 'LibreOffice 自动 QA 已通过，交付物可用。';
+        } else {
+          state.project.workflowStatus = 'blocked';
+          state.blockedCondition = {
+            kind: 'capability_unavailable',
+            capability: 'qa-rendering',
+            recoverable: true,
+            resumeStage: 'qa',
+            message: `QA 未通过：${issues.join('；')}`,
+          };
+          message = state.blockedCondition.message;
+        }
+        break;
+      }
     }
     const taskKind = taskKindFor(action.kind);
     if (taskKind) {
@@ -468,8 +635,54 @@ function taskKindFor(kind: NativePipelineAction['kind']): NativeTaskRecord['kind
     case 'details.submit': return 'detail_generation';
     case 'visual.generate': return 'visual_generation';
     case 'deck.export': return 'conversion';
+    case 'deck.qa': return 'qa';
     default: return null;
   }
+}
+
+function createNativeQaReport(
+  state: NativePptPipeline,
+  round: number,
+  values: Partial<LibreOfficeQaReport>,
+): LibreOfficeQaReport {
+  const receipt = state.exportReceipt!;
+  return {
+    status: 'blocked',
+    round,
+    projectId: state.project.id,
+    exportPath: receipt.relativePath,
+    exportSha256: receipt.sha256,
+    specVersionId: receipt.specVersionId,
+    visualVersionIds: structuredClone(receipt.visualVersionIds),
+    sofficePath: null,
+    rendererPath: null,
+    pdfPath: null,
+    renderedPages: [],
+    expectedPageCount: state.slideSpecs!.value.length,
+    actualPageCount: 0,
+    blankPages: [],
+    comparisons: [],
+    issues: [],
+    jsonReportPath: `qa/qa-round-${round}.json`,
+    textReportPath: `qa/qa-round-${round}.txt`,
+    ...values,
+  };
+}
+
+function qaReportWrites(report: LibreOfficeQaReport): NativeArtifactWrite[] {
+  const readable = `${formatQaReadableSummary(report)}\n`;
+  const serialized = `${JSON.stringify({ ...report, readableSummary: readable.trimEnd() }, null, 2)}\n`;
+  return [
+    createWrite(report.textReportPath, new TextEncoder().encode(readable), 'qa-report-text', report.specVersionId),
+    createWrite(report.jsonReportPath, new TextEncoder().encode(serialized), 'qa-report-json', report.specVersionId),
+  ];
+}
+
+function decodeBase64(value: string, label: string): Uint8Array {
+  if (typeof value !== 'string' || value.length === 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+    throw new Error(`${label} is not valid base64`);
+  }
+  return new Uint8Array(Buffer.from(value, 'base64'));
 }
 
 async function replaceVisual(
@@ -477,6 +690,7 @@ async function replaceVisual(
   writes: NativeArtifactWrite[],
   input: {
     slideId: string;
+    at: string;
     imageBase64: string;
     altText: string;
     usage: NativeVisualVersion['usage'];
@@ -501,13 +715,16 @@ async function replaceVisual(
   } catch {
     throw new Error('Replacement visual must be a decodable PNG');
   }
-  const sequence = (existing?.version.sequence ?? 0) + 1;
+  const reuseReopenedDraft = existing?.relativePath === '' && existing.byteLength === 0;
+  const sequence = reuseReopenedDraft
+    ? existing.version.sequence
+    : (existing?.version.sequence ?? 0) + 1;
   const version: Version = {
     id: `${state.project.id}-visual-${input.slideId}-v${sequence}`,
     projectId: state.project.id,
     sequence,
     status: 'draft',
-    createdAt: state.project.updatedAt,
+    createdAt: reuseReopenedDraft ? existing!.version.createdAt : input.at,
     frozenAt: null,
   };
   const relativePath = `visuals/${input.slideId}-v${sequence}.png`;
@@ -531,7 +748,7 @@ async function replaceVisual(
     altText: input.altText,
   };
   const history = (state.visuals[input.slideId] ??= []);
-  if (existing && existing.relativePath === '' && existing.byteLength === 0) {
+  if (reuseReopenedDraft) {
     history[history.length - 1] = candidate;
   } else {
     history.push(candidate);
@@ -623,6 +840,13 @@ async function replayPipeline(
     }
   }
   const actual = workflow.projects.getProjectSnapshot(state.project.id).project.workflowStatus;
+  if (
+    ['qa', 'completed'].includes(expected) &&
+    actual === 'conversion' &&
+    state.exportReceipt
+  ) {
+    return workflow;
+  }
   if (actual !== expected) {
     throw new Error(`Persisted pipeline cannot replay ${expected}; reached ${actual}`);
   }

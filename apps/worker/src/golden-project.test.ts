@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
+import { PNG } from 'pngjs';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runGoldenProject } from './golden-project.js';
 
@@ -70,6 +71,9 @@ describe('five-page Chinese Golden Project', () => {
         blankPages: [],
         issues: [],
       });
+      expect(result.qaReport.comparisons).toHaveLength(5);
+      expect(result.qaReport.comparisons.every(({ approvedVisualPath, differenceScore }) =>
+        Boolean(approvedVisualPath) && typeof differenceScore === 'number')).toBe(true);
       expect(result.repairRounds).toBeLessThanOrEqual(2);
 
       const archive = await JSZip.loadAsync(await readFile(result.pptxPath));
@@ -97,6 +101,11 @@ describe('five-page Chinese Golden Project', () => {
       expect((await readFile(result.readableQaPath, 'utf8')).length).toBeGreaterThan(
         40,
       );
+      expect(await readFile(result.qaReport.textReportPath, 'utf8')).toContain('visual difference');
+      const approved = await Promise.all(result.approvedVisualPaths.map((path) => readFile(path)));
+      expect(new Set(approved.map((bytes) => createHash('sha256').update(bytes).digest('hex'))).size).toBe(5);
+      for (const bytes of approved) expect(PNG.sync.read(bytes)).toMatchObject({ width: 1280, height: 720 });
+      expect(await readFile(join(fixtureRoot, 'sources', 'kpis.csv'), 'utf8')).toContain('128,150,18%');
     },
     120_000,
   );

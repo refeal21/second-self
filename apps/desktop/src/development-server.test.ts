@@ -16,6 +16,7 @@ describe('development server boundary', () => {
     );
     expect(tauriConfig.bundle.resources).toEqual({
       '../../../THIRD_PARTY_NOTICES.md': 'THIRD_PARTY_NOTICES.md',
+      'resources/node-runtime': 'licenses/node-runtime',
     });
   });
 

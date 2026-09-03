@@ -304,7 +304,7 @@ function authenticQa(
     new RoundQaCommands(artifacts),
     artifacts,
     new RoundComparator(failedRounds),
-    { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'] },
+    { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'], ooxmlInspector: cleanInspection },
   );
 }
 
@@ -317,7 +317,7 @@ describe('project delivery evidence coordinator', () => {
       new SuccessfulQaCommands(artifacts),
       artifacts,
       undefined,
-      { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'] },
+      { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'], ooxmlInspector: cleanInspection },
     );
 
     expect(
@@ -452,7 +452,7 @@ describe('project delivery evidence coordinator', () => {
       commands,
       artifacts,
       new RoundComparator([]),
-      { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'] },
+      { bundledSoffice: ['soffice'], pdfRenderers: ['pdftoppm'], ooxmlInspector: cleanInspection },
     );
     let interrupt = true;
     const interruptedQa: QaRunner = {
@@ -848,8 +848,18 @@ function qaBundle(
     ],
     issues: [],
     jsonReportPath: '/workspace/project-1/qa/qa-round-1.json',
-    textReportPath: '/workspace/project-1/qa/qa-round-1.json',
+    textReportPath: '/workspace/project-1/qa/qa-round-1.txt',
     ...values,
   };
   return { ...report, readableSummary: formatQaReadableSummary(report) };
+}
+
+async function cleanInspection() {
+  return {
+    slideCount: 1,
+    fonts: [],
+    missingResources: [],
+    outOfBoundsObjects: [],
+    cropIssues: [],
+  };
 }

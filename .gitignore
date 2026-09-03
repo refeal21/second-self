@@ -9,3 +9,4 @@ coverage/
 artifacts/qa/
 artifacts/build/
 apps/desktop/src-tauri/binaries/digital-twin-worker-*
+apps/desktop/src-tauri/resources/node-runtime/

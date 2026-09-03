@@ -37,6 +37,14 @@ pub fn ppt_read_artifact(
 }
 
 #[tauri::command]
+pub fn ppt_prepare_qa(
+    state: State<'_, WorkbenchService>,
+    project_id: String,
+) -> Result<serde_json::Value, String> {
+    state.prepare_qa(&project_id)
+}
+
+#[tauri::command]
 pub fn ppt_attach_source(
     state: State<'_, WorkbenchService>,
     input: AttachSourceInput,

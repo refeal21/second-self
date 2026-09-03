@@ -6,6 +6,7 @@
     "build:worker-sidecar": "node scripts/build-worker-sidecar.mjs",
     "generate:golden-fixtures": "node apps/worker/scripts/generate-golden-fixtures.mjs",
     "golden:qa": "pnpm --filter @digital-twin/worker exec tsx scripts/run-golden-project.ts",
+    "smoke:packaged-worker": "node scripts/smoke-packaged-worker.mjs",
     "dev": "pnpm --filter @digital-twin/desktop tauri dev",
     "dev:web": "pnpm --parallel --filter @digital-twin/desktop --filter @digital-twin/worker dev",
     "typecheck": "pnpm -r typecheck",

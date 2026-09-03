@@ -14,6 +14,7 @@ import {
   type NativePptPipeline,
 } from '../../worker/src/native-pipeline.js';
 import {
+  createDistinctApprovedVisual,
   goldenOutline,
   goldenSlideSpecs,
   goldenSourceAnalysis,
@@ -85,6 +86,23 @@ function nativePersistenceHarness() {
       return structuredClone(state.pipeline);
     }
     if (command === 'ppt_read_artifact') return state.files.get(String(args?.relativePath));
+    if (command === 'ppt_prepare_qa') {
+      const specs = state.pipeline.slideSpecs?.value ?? [];
+      const approvedVisuals = specs.map(({ id }) => {
+        const relativePath = state.pipeline.visuals[id]!.at(-1)!.relativePath;
+        return { slideId: id, relativePath, contentsBase64: state.files.get(relativePath)! };
+      });
+      return {
+        status: 'ready', sofficePath: '/mock/soffice', rendererPath: '/mock/pdftoppm',
+        pptxBase64: state.files.get(state.pipeline.exportReceipt!.relativePath)!,
+        pdfBase64: Buffer.from('%PDF-mock').toString('base64'),
+        renderedPages: approvedVisuals.map((visual, index) => ({
+          fileName: `rendered-${index + 1}.png`, contentsBase64: visual.contentsBase64,
+        })),
+        approvedVisuals,
+        fontAvailability: { 'Hiragino Sans GB': true },
+      };
+    }
     if (command === 'memory_propose') return { status: '偏好建议等待用户批准' };
     throw new Error(`Unexpected native command: ${command}`);
   });
@@ -112,8 +130,9 @@ describe('production-equivalent UI adapter → App Server → Worker → Rust pe
     pipeline = await restarted.requestVisual('project-e2e', 'slide-cover');
     expect(pipeline).toMatchObject({ project: { workflowStatus: 'blocked' }, blockedCondition: { recoverable: true } });
 
-    const imageBase64 = (await readFile(resolve('../..', 'fixtures/golden-project/sources/market-background.png'))).toString('base64');
-    for (const spec of goldenSlideSpecs()) {
+    const background = new Uint8Array(await readFile(resolve('../..', 'fixtures/golden-project/sources/market-background.png')));
+    for (const [index, spec] of goldenSlideSpecs().entries()) {
+      const imageBase64 = Buffer.from(createDistinctApprovedVisual(background, index)).toString('base64');
       pipeline = await restarted.replaceVisual('project-e2e', spec.id, imageBase64, `用户替换 ${spec.id}`);
       pipeline = await restarted.approveVisual('project-e2e', spec.id);
     }
@@ -123,5 +142,10 @@ describe('production-equivalent UI adapter → App Server → Worker → Rust pe
     expect(native.state.files.get('exports/五页经营复盘.pptx')).toBeTruthy();
     expect(native.state.pipeline.approvals).toHaveLength(7);
     expect(native.state.pipeline.tasks.some(({ kind }) => kind === 'conversion')).toBe(true);
+    pipeline = await restarted.runProjectQa('project-e2e');
+    expect(pipeline.project.workflowStatus).toBe('completed');
+    expect(pipeline.qaReport).toMatchObject({ status: 'passed', actualPageCount: 5 });
+    expect(new Set(pipeline.qaReport!.comparisons.map(({ approvedVisualPath }) => approvedVisualPath)).size).toBe(5);
+    expect(native.state.files.get('qa/qa-round-1.txt')).toContain('TGlicmVPZmZpY2UgUUE');
   });
 });

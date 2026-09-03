@@ -42,6 +42,7 @@ pub fn run() {
             tauri_workbench::ppt_load_pipeline,
             tauri_workbench::ppt_project_directory,
             tauri_workbench::ppt_read_artifact,
+            tauri_workbench::ppt_prepare_qa,
             tauri_workbench::ppt_attach_source,
             tauri_workbench::ppt_commit_pipeline,
             tauri_workbench::ppt_rename_project,

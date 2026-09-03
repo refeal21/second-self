@@ -1,11 +1,14 @@
 use std::{
-    fs,
+    env, fs,
+    io::Read,
     path::{Path, PathBuf},
+    process::{Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -336,6 +339,223 @@ impl WorkbenchService {
 
     pub fn read_artifact(&self, project_id: &str, relative_path: &str) -> Result<String, String> {
         use base64::Engine;
+        let bytes = self.read_artifact_bytes(project_id, relative_path)?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn prepare_qa(&self, project_id: &str) -> Result<Value, String> {
+        let pipeline = self.load_pipeline(project_id)?;
+        let workflow_status = pipeline
+            .pointer("/project/workflowStatus")
+            .and_then(Value::as_str);
+        let retrying_qa = workflow_status == Some("blocked")
+            && pipeline
+                .pointer("/blockedCondition/resumeStage")
+                .and_then(Value::as_str)
+                == Some("qa");
+        if workflow_status != Some("qa") && !retrying_qa {
+            return Err("Project is not at the QA checkpoint".into());
+        }
+        let Some(soffice) = find_executable(&[
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+            "/Applications/LibreOfficeDev.app/Contents/MacOS/soffice",
+            "soffice",
+        ]) else {
+            return Ok(serde_json::json!({
+                "status": "blocked",
+                "capability": "libreoffice",
+                "issue": "LibreOffice soffice executable is unavailable; install LibreOffice and retry QA."
+            }));
+        };
+        let Some(renderer) = find_executable(&["pdftoppm"]) else {
+            return Ok(serde_json::json!({
+                "status": "blocked",
+                "capability": "pdf-renderer",
+                "issue": "PDF renderer pdftoppm is unavailable; install Poppler and retry QA."
+            }));
+        };
+        self.prepare_qa_with_tools(project_id, &pipeline, &soffice, &renderer)
+    }
+
+    fn prepare_qa_with_tools(
+        &self,
+        project_id: &str,
+        pipeline: &Value,
+        soffice: &Path,
+        renderer: &Path,
+    ) -> Result<Value, String> {
+        use base64::Engine;
+        let receipt = pipeline
+            .get("exportReceipt")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "QA checkpoint has no committed export receipt".to_string())?;
+        let export_path = receipt
+            .get("relativePath")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Export receipt path is invalid".to_string())?;
+        let pptx = self.read_artifact_bytes(project_id, export_path)?;
+        let expected_hash = receipt
+            .get("sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Export receipt hash is invalid".to_string())?;
+        if sha256(&pptx) != expected_hash {
+            return Err("Persisted PPTX does not match its export receipt".into());
+        }
+        let specs = pipeline
+            .pointer("/slideSpecs/value")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "QA checkpoint has no approved slide specs".to_string())?;
+        let mut approved_visuals = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let slide_id = spec
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Approved slide spec id is invalid".to_string())?;
+            let visual = pipeline
+                .get("visuals")
+                .and_then(|value| value.get(slide_id))
+                .and_then(Value::as_array)
+                .and_then(|versions| versions.last())
+                .ok_or_else(|| format!("Approved visual is missing for {slide_id}"))?;
+            if visual.pointer("/version/status").and_then(Value::as_str) != Some("frozen") {
+                return Err(format!("Current visual is not approved for {slide_id}"));
+            }
+            let relative_path = visual
+                .get("relativePath")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("Approved visual path is invalid for {slide_id}"))?;
+            let contents = self.read_artifact_bytes(project_id, relative_path)?;
+            let expected_visual_hash = visual
+                .get("sha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("Approved visual hash is invalid for {slide_id}"))?;
+            if sha256(&contents) != expected_visual_hash {
+                return Err(format!(
+                    "Persisted visual does not match its hash for {slide_id}"
+                ));
+            }
+            approved_visuals.push(serde_json::json!({
+                "slideId": slide_id,
+                "relativePath": relative_path,
+                "contentsBase64": base64::engine::general_purpose::STANDARD.encode(contents),
+            }));
+        }
+
+        const MAX_PPTX_BYTES: usize = 64 * 1024 * 1024;
+        const MAX_VISUAL_BYTES: usize = 32 * 1024 * 1024;
+        const MAX_PDF_BYTES: usize = 128 * 1024 * 1024;
+        const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
+        if pptx.len() > MAX_PPTX_BYTES {
+            return Err("QA PPTX exceeds the 64 MiB preparation limit".into());
+        }
+        if approved_visuals.iter().any(|visual| {
+            visual
+                .get("contentsBase64")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.len() > MAX_VISUAL_BYTES * 2)
+        }) {
+            return Err("An approved visual exceeds the QA preparation limit".into());
+        }
+
+        let temp = QaTempDirectory::create()?;
+        let input_path = temp.path.join("input.pptx");
+        fs::write(&input_path, &pptx)
+            .map_err(|error| format!("QA temporary PPTX cannot be written: {error}"))?;
+        let profile = temp.path.join("profile");
+        fs::create_dir(&profile)
+            .map_err(|error| format!("QA LibreOffice profile cannot be created: {error}"))?;
+        let command_temp = temp.path.join("temp");
+        fs::create_dir(&command_temp)
+            .map_err(|error| format!("QA process temp directory cannot be created: {error}"))?;
+        let profile_uri = format!("file://{}", profile.to_string_lossy());
+        let mut conversion_command = Command::new(soffice);
+        conversion_command
+            .arg(format!("-env:UserInstallation={profile_uri}"))
+            .args(["--headless", "--convert-to", "pdf", "--outdir"])
+            .arg(&temp.path)
+            .arg(&input_path)
+            .current_dir(&temp.path)
+            .env("TMPDIR", &command_temp);
+        let conversion = run_bounded_command(conversion_command, Duration::from_secs(30), 16_384)
+            .map_err(|error| format!("LibreOffice QA cannot start: {error}"))?;
+        if conversion.timed_out || !conversion.status.success() {
+            return Ok(qa_preparation_failure(
+                "LibreOffice conversion",
+                &conversion,
+            ));
+        }
+        let pdf_path = temp.path.join("input.pdf");
+        if !pdf_path.is_file() {
+            return Ok(serde_json::json!({
+                "status": "failed",
+                "capability": "qa-rendering",
+                "issue": "LibreOffice reported success but did not create a PDF."
+            }));
+        }
+        let render_prefix = temp.path.join("rendered");
+        let mut render_command = Command::new(renderer);
+        render_command
+            .args(["-png", "-r", "144"])
+            .arg(&pdf_path)
+            .arg(&render_prefix)
+            .current_dir(&temp.path)
+            .env("TMPDIR", &command_temp);
+        let rendering = run_bounded_command(render_command, Duration::from_secs(30), 16_384)
+            .map_err(|error| format!("PDF renderer cannot start: {error}"))?;
+        if rendering.timed_out || !rendering.status.success() {
+            return Ok(qa_preparation_failure("PDF rendering", &rendering));
+        }
+        let mut page_paths = fs::read_dir(&temp.path)
+            .map_err(|error| format!("QA render directory cannot be listed: {error}"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("rendered-") && name.ends_with(".png"))
+            })
+            .collect::<Vec<_>>();
+        page_paths.sort_by_key(|path| rendered_page_number(path).unwrap_or(usize::MAX));
+        let rendered_pages = page_paths
+            .into_iter()
+            .map(|path| {
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| "Rendered page file name is invalid".to_string())?;
+                let contents = read_bounded_file(&path, MAX_PAGE_BYTES, "Rendered page")?;
+                Ok(serde_json::json!({
+                    "fileName": file_name,
+                    "contentsBase64": base64::engine::general_purpose::STANDARD.encode(contents),
+                }))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let pdf = read_bounded_file(&pdf_path, MAX_PDF_BYTES, "Rendered QA PDF")?;
+        let hiragino_available = [
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/Supplemental/Hiragino Sans GB.ttc",
+        ]
+        .iter()
+        .any(|path| Path::new(path).is_file());
+        Ok(serde_json::json!({
+            "status": "ready",
+            "sofficePath": soffice.to_string_lossy(),
+            "rendererPath": renderer.to_string_lossy(),
+            "pptxBase64": base64::engine::general_purpose::STANDARD.encode(pptx),
+            "pdfBase64": base64::engine::general_purpose::STANDARD.encode(pdf),
+            "renderedPages": rendered_pages,
+            "approvedVisuals": approved_visuals,
+            "fontAvailability": {
+                "Hiragino Sans GB": hiragino_available,
+            }
+        }))
+    }
+
+    fn read_artifact_bytes(
+        &self,
+        project_id: &str,
+        relative_path: &str,
+    ) -> Result<Vec<u8>, String> {
         validate_worker_relative_path(relative_path)?;
         let workspace = self.workspace()?;
         let project = fs::canonicalize(workspace.join(project_id))
@@ -348,8 +568,7 @@ impl WorkbenchService {
         if !path.starts_with(&project) {
             return Err("Artifact is outside the project".into());
         }
-        let bytes = fs::read(path).map_err(|error| format!("Artifact cannot be read: {error}"))?;
-        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        fs::read(path).map_err(|error| format!("Artifact cannot be read: {error}"))
     }
 
     pub fn attach_source(&self, input: AttachSourceInput) -> Result<Value, String> {
@@ -894,4 +1113,227 @@ fn validate_worker_relative_path(value: &str) -> Result<(), String> {
         return Err("Worker artifact path is outside the project artifact directories".into());
     }
     Ok(())
+}
+
+fn find_executable(candidates: &[&str]) -> Option<PathBuf> {
+    for candidate in candidates {
+        let path = Path::new(candidate);
+        if path.is_absolute() && is_executable_file(path) {
+            return Some(path.to_path_buf());
+        }
+        if !path.is_absolute() {
+            if let Some(path_value) = env::var_os("PATH") {
+                for directory in env::split_paths(&path_value) {
+                    let resolved = directory.join(path);
+                    if is_executable_file(&resolved) {
+                        return Some(resolved);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn rendered_page_number(path: &Path) -> Option<usize> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("rendered-")?
+        .strip_suffix(".png")?
+        .parse()
+        .ok()
+}
+
+fn qa_preparation_failure(label: &str, output: &BoundedCommandOutput) -> Value {
+    let detail = if output.stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout)
+    } else {
+        String::from_utf8_lossy(&output.stderr)
+    };
+    let detail = detail.chars().take(2_000).collect::<String>();
+    serde_json::json!({
+        "status": "failed",
+        "capability": "qa-rendering",
+        "issue": if output.timed_out {
+            format!("{label} timed out: {detail}")
+        } else {
+            format!("{label} failed ({}): {detail}", output.status)
+        },
+    })
+}
+
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+fn run_bounded_command(
+    mut command: Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<BoundedCommandOutput, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("QA command cannot be spawned: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "QA command stdout pipe is unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "QA command stderr pipe is unavailable".to_string())?;
+    let stdout_reader = thread::spawn(move || read_capped(stdout, max_output_bytes));
+    let stderr_reader = thread::spawn(move || read_capped(stderr, max_output_bytes));
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("QA command wait failed: {error}"))?
+        {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            terminate_command_group(&mut child, libc::SIGTERM);
+            thread::sleep(Duration::from_millis(250));
+            if child.try_wait().ok().flatten().is_none() {
+                terminate_command_group(&mut child, libc::SIGKILL);
+            } else {
+                #[cfg(unix)]
+                unsafe {
+                    // The root can exit on TERM while a descendant survives.
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+            }
+            break child
+                .wait()
+                .map_err(|error| format!("Timed-out QA command cannot be reaped: {error}"))?;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "QA stdout reader panicked".to_string())??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "QA stderr reader panicked".to_string())??;
+    Ok(BoundedCommandOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn terminate_command_group(child: &mut std::process::Child, signal: i32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), signal);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        let _ = child.kill();
+    }
+}
+
+fn read_capped(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, String> {
+    let mut captured = Vec::with_capacity(limit.min(16_384));
+    let mut buffer = [0_u8; 8_192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("QA command output cannot be read: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(captured.len());
+        captured.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+    Ok(captured)
+}
+
+fn read_bounded_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u8>, String> {
+    let length = fs::metadata(path)
+        .map_err(|error| format!("{label} cannot be inspected: {error}"))?
+        .len();
+    if length > max_bytes as u64 {
+        return Err(format!("{label} exceeds the byte limit"));
+    }
+    fs::read(path).map_err(|error| format!("{label} cannot be read: {error}"))
+}
+
+struct QaTempDirectory {
+    path: PathBuf,
+}
+
+impl QaTempDirectory {
+    fn create() -> Result<Self, String> {
+        let path = env::temp_dir().join(next_identifier("digital-twin-qa"));
+        fs::create_dir(&path)
+            .map_err(|error| format!("QA temporary directory cannot be created: {error}"))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for QaTempDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod qa_command_tests {
+    use super::*;
+
+    #[test]
+    fn qa_command_output_is_capped_by_bytes() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "yes x | head -c 50000"]);
+        let output = run_bounded_command(command, Duration::from_secs(2), 1_024)
+            .expect("bounded command runs");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 1_024);
+        assert!(output.stderr.len() <= 1_024);
+        assert!(!output.timed_out);
+    }
+
+    #[test]
+    fn qa_command_times_out_and_reaps_its_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 5"]);
+        let started = Instant::now();
+        let output = run_bounded_command(command, Duration::from_millis(50), 1_024)
+            .expect("timed-out command is reaped");
+        assert!(output.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 }

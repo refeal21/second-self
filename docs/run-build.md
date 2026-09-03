@@ -70,6 +70,18 @@ codesign -dv --verbose=4 'apps/desktop/src-tauri/target/release/bundle/macos/Dig
 
 应看到主程序和 `digital-twin-worker` 都是 arm64 Mach-O。签名应为 ad-hoc/linker-signed、没有 TeamIdentifier；这不是 Developer ID 签名，也没有 Apple 公证。不要把此构建当作可公开分发的安装包。
 
+Worker SEA 使用当前 Node 22 可执行文件构建，同时把该 Node 发行版的完整 `LICENSE`（其中包含依赖许可证和第三方声明）以及精确版本复制到 `.app/Contents/Resources/licenses/node-runtime/`。若构建机器上的匹配 LICENSE 缺失，构建会直接失败。
+
 ## 只读账号冒烟测试
 
 打开 `.app`，进入“通用任务”，点击“检查连接”。该操作只启动 `codex app-server --listen stdio://`，发送 `initialize` / `initialized` / `account/read`，不会创建 thread/turn，也不会为了测试消耗一个模型回合。账户状态应显示本机 Codex 已登录的 ChatGPT 计划。
+
+## 打包 Worker 的完整流程冒烟测试
+
+先运行 `pnpm golden:qa` 生成确定性的五页输入，再运行：
+
+```bash
+pnpm smoke:packaged-worker
+```
+
+该命令直接执行 `.app/Contents/MacOS/digital-twin-worker`，走完材料分析结果提交、整份大纲/细化批准、五页顺序视觉批准、进程重启恢复、PPTX 导出和 `deck.qa`，并要求最终状态为 `completed`。它不会调用付费 API；QA 输入来自本地 Golden 产物。

@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { PNG } from 'pngjs';
 import {
   createProductionPptWorkflow,
   type PptOutline,
@@ -89,17 +90,14 @@ export async function runGoldenProject(
       ],
       runImageGenTurn: async ({ slideId }) => ({
         status: 'generated' as const,
-        image: background,
+        image: createDistinctApprovedVisual(
+          background,
+          slideIds.indexOf(slideId as (typeof slideIds)[number]),
+        ),
         mediaType: 'image/png' as const,
-        usage:
-          slideId === 'slide-chart'
-            ? ('text_free_background' as const)
-            : ('full_slide_reference' as const),
-        textFree: slideId === 'slide-chart',
-        altText:
-          slideId === 'slide-chart'
-            ? '无文字的蓝色抽象市场背景'
-            : `第 ${slideIds.indexOf(slideId as (typeof slideIds)[number]) + 1} 页批准视觉参考`,
+        usage: 'text_free_background' as const,
+        textFree: true,
+        altText: `第 ${slideIds.indexOf(slideId as (typeof slideIds)[number]) + 1} 页独立的无文字完整幻灯片视觉`,
       }),
     },
     repairer: {
@@ -172,12 +170,7 @@ export async function runGoldenProject(
       projectId,
       slideId,
       decidedAt,
-      slideId === 'slide-chart'
-        ? {
-            classification: 'text_free_background',
-            approvedForEmbedding: true,
-          }
-        : { classification: 'reference_only', approvedForEmbedding: false },
+      { classification: 'text_free_background', approvedForEmbedding: true },
     );
     approvedVisualPaths.push(generated.asset.artifactPath);
     if (index === 0) {
@@ -275,6 +268,13 @@ export function goldenSourceAnalysis(): SourceAnalysis {
         unit: '天',
         sourceIds: ['source-kpis'],
       },
+      {
+        id: 'data-revenue-plan',
+        label: '2027 计划营业收入',
+        value: 150,
+        unit: '百万元',
+        sourceIds: ['source-kpis'],
+      },
     ],
     sourceMap: [
       {
@@ -284,8 +284,8 @@ export function goldenSourceAnalysis(): SourceAnalysis {
       },
       {
         sourceId: 'source-kpis',
-        title: '2025—2026 核心经营指标',
-        locator: '第 2—5 行',
+        title: '2025—2027 核心经营指标',
+        locator: '第 2—5 行及 2027 计划列',
       },
       {
         sourceId: 'source-market',
@@ -348,7 +348,7 @@ export function goldenOutline(): PptOutline {
         purpose: '以可编辑图表和无文字背景说明下一阶段路径',
         sourceIds: ['source-kpis', 'source-market'],
         findingIds: ['finding-priority'],
-        dataPointIds: ['data-revenue'],
+        dataPointIds: ['data-revenue', 'data-revenue-plan'],
       },
     ],
   };
@@ -362,8 +362,8 @@ export function goldenSlideSpecs(): readonly SlideSpec[] {
   };
   const kpiCitation = {
     sourceId: 'source-kpis',
-    title: '2025—2026 核心经营指标',
-    locator: '第 2—5 行',
+    title: '2025—2027 核心经营指标',
+    locator: '第 2—5 行及 2027 计划列',
   };
   return [
     {
@@ -469,7 +469,7 @@ export function goldenSlideSpecs(): readonly SlideSpec[] {
     {
       id: 'slide-table',
       title: '经营指标对比与效率改善',
-      body: ['所有表格文本和数值来自已批准规格，可独立编辑。'],
+      body: ['表格文本和数值来自已批准规格，可独立编辑。'],
       dataPointIds: [
         'data-revenue',
         'data-margin',
@@ -498,7 +498,7 @@ export function goldenSlideSpecs(): readonly SlideSpec[] {
       title: '增长路径：规模提升与效率优化并行',
       body: ['2027 年继续扩大收入规模，并把交付效率转化为增长空间。'],
       findingIds: ['finding-priority'],
-      dataPointIds: ['data-revenue'],
+      dataPointIds: ['data-revenue', 'data-revenue-plan'],
       tables: [],
       charts: [
         {
@@ -533,6 +533,26 @@ export function goldenSlideSpecs(): readonly SlideSpec[] {
       imageGenerationBrief: '无文字的蓝色抽象市场背景，保留图表可读区域。',
     },
   ];
+}
+
+export function createDistinctApprovedVisual(background: Uint8Array, index: number): Uint8Array {
+  const source = PNG.sync.read(Buffer.from(background));
+  const accents = [
+    [37, 99, 235], [20, 184, 166], [245, 158, 11], [139, 92, 246], [14, 116, 144],
+  ] as const;
+  const accent = accents[index] ?? accents[0];
+  const png = new PNG({ width: source.width, height: source.height });
+  for (let offset = 0; offset < source.data.length; offset += 4) {
+    const pixel = offset / 4;
+    const x = pixel % source.width;
+    const y = Math.floor(pixel / source.width);
+    const band = y < 18 + index * 3 || x < 8 + index * 2;
+    png.data[offset] = band ? accent[0] : Math.round(source.data[offset]! * 0.97 + accent[0] * 0.03);
+    png.data[offset + 1] = band ? accent[1] : Math.round(source.data[offset + 1]! * 0.97 + accent[1] * 0.03);
+    png.data[offset + 2] = band ? accent[2] : Math.round(source.data[offset + 2]! * 0.97 + accent[2] * 0.03);
+    png.data[offset + 3] = 255;
+  }
+  return new Uint8Array(PNG.sync.write(png));
 }
 
 async function rejects(action: () => Promise<unknown>): Promise<boolean> {

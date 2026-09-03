@@ -83,6 +83,8 @@ export function NativeWorkspacePage({
   }
 
   const status = pipeline.project.workflowStatus;
+  const visualBlocked = status === 'blocked' && pipeline.blockedCondition?.resumeStage === 'visual_review';
+  const qaBlocked = status === 'blocked' && pipeline.blockedCondition?.resumeStage === 'qa';
   const currentVisual = pipeline.currentSlideId
     ? pipeline.visuals[pipeline.currentSlideId]?.at(-1)
     : undefined;
@@ -101,7 +103,7 @@ export function NativeWorkspacePage({
       <div className="workspace-layout">
         <aside className="workflow-rail" aria-label="PPT 工作流">
           <ol>{['intake','source_analysis','outline_review','detail_review','visual_review','conversion','qa','completed'].map((stage, index) => (
-            <li key={stage} className={stage === status || (status === 'blocked' && stage === 'visual_review') ? 'is-current' : ''}>
+            <li key={stage} className={stage === status || (visualBlocked && stage === 'visual_review') || (qaBlocked && stage === 'qa') ? 'is-current' : ''}>
               <span className="stage-mark">{index + 1}</span>{stageLabel(stage)}
             </li>
           ))}</ol>
@@ -137,7 +139,7 @@ export function NativeWorkspacePage({
               <button className="button button-primary" disabled={busy || pipeline.slideSpecs.version.status !== 'draft'} onClick={() => void update(() => adapter.approveDetails(projectId), '全部页面细化已批准并冻结。')}>批准全部细化</button>
             </div>
           </StageCard>}
-          {(status === 'visual_review' || status === 'blocked') && <StageCard title={`5. 逐页视觉·${currentSpec?.title ?? pipeline.currentSlideId}`}>
+          {(status === 'visual_review' || visualBlocked) && <StageCard title={`5. 逐页视觉·${currentSpec?.title ?? pipeline.currentSlideId}`}>
             <p>{currentSpec?.imageGenerationBrief}</p>
             {pipeline.blockedCondition && <p className="capability-note">{pipeline.blockedCondition.message}不会切换到收费 API。</p>}
             {currentVisual?.relativePath && <dl><dt>当前候选</dt><dd>{currentVisual.relativePath}</dd><dt>SHA-256</dt><dd>{currentVisual.sha256}</dd></dl>}
@@ -151,9 +153,19 @@ export function NativeWorkspacePage({
             <p>已批准规格是文字和数据真源，完整页 PNG 只作视觉参考。</p>
             <button className="button button-primary" disabled={busy} onClick={() => void update(async () => { await adapter.exportProject(projectId, projectName); return adapter.loadProjectPipeline(projectId); }, '可编辑 PPTX 已生成，正在等待 QA。')}>导出可编辑 PPTX</button>
           </StageCard>}
-          {status === 'qa' && <StageCard title="7. 自动 QA">
+          {(status === 'qa' || qaBlocked) && <StageCard title="7. 自动 QA">
             <p>导出产物：{pipeline.exportReceipt?.relativePath}</p>
-            <p>尚未完成 LibreOffice 验证。工作流保持在 QA，不会显示虚假完成。</p>
+            {pipeline.qaReport && <pre>{JSON.stringify(pipeline.qaReport, null, 2)}</pre>}
+            {qaBlocked && <p className="capability-note">{pipeline.blockedCondition?.message}</p>}
+            <button className="button button-primary" disabled={busy} onClick={() => void update(
+              () => adapter.runProjectQa(projectId),
+              'LibreOffice QA 已执行并保存报告。',
+            )}>{qaBlocked ? '修复环境后重试 QA' : '运行 LibreOffice 自动 QA'}</button>
+          </StageCard>}
+          {status === 'completed' && <StageCard title="交付完成">
+            <p>可编辑 PPTX：{pipeline.exportReceipt?.relativePath}</p>
+            <p>QA 报告：{pipeline.qaReport?.textReportPath}</p>
+            <p>逐页比较、字体、越界、裁切、空白页和缺失资源检查均已通过。</p>
           </StageCard>}
         </section>
         <aside className="review-inspector">

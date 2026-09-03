@@ -126,6 +126,7 @@ export interface DesktopAdapter {
   replaceVisual(projectId: string, slideId: string, imageBase64: string, altText: string): Promise<NativePptPipeline>;
   approveVisual(projectId: string, slideId: string): Promise<NativePptPipeline>;
   reopenVisual(projectId: string, slideId: string): Promise<NativePptPipeline>;
+  runProjectQa(projectId: string): Promise<NativePptPipeline>;
   proposeProjectMemory(projectId: string): Promise<{ status: string }>;
   renameProject(projectId: string, name: string): Promise<{ status: string }>;
   regenerateSlide(projectId: string, slide: number, comment: string): Promise<RegenerateResult>;
@@ -265,6 +266,7 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
     async replaceVisual() { throw new Error('演示模式不会写入视觉文件。'); },
     async approveVisual() { throw new Error('演示模式不会保存生产审批。'); },
     async reopenVisual() { throw new Error('演示模式不会改动生产版本。'); },
+    async runProjectQa() { throw new Error('演示模式不会伪造 LibreOffice QA。'); },
     async proposeProjectMemory() { throw new Error('演示模式不会创建生产偏好建议。'); },
     async renameProject(_projectId, name) { return { status: `演示数据：项目已重命名为“${name}”。` }; },
     async regenerateSlide(_projectId, slide) {
@@ -381,7 +383,7 @@ class TauriDesktopAdapter implements DesktopAdapter {
     const pipeline = await this.loadProjectPipeline(projectId);
     const output = await this.runStructured<SourceAnalysis>(projectId, [
       '读取当前项目 sources 目录中的材料，只使用文件内可验证事实。',
-      '返回严格 JSON，结构必须符合 SourceAnalysis：{findings:[{id,statement,sourceIds}],dataPoints:[{id,label,value,unit,sourceIds}],sourceSummaries:[{sourceId,summary}]} 。',
+      '返回严格 JSON，结构必须符合 SourceAnalysis：{findings:[{id,text,sourceIds}],dataPoints:[{id,label,value,unit,sourceIds}],sourceMap:[{sourceId,title,locator,url?}]}。',
       '不要使用 Markdown 代码块，不要联网，不要创造数据。',
     ].join('\n'));
     return this.applyPipeline(projectId, pipeline, {
@@ -397,7 +399,7 @@ class TauriDesktopAdapter implements DesktopAdapter {
     if (!pipeline.analysis) throw new Error('请先完成材料分析。');
     const outline = await this.runStructured<PptOutline>(projectId, [
       '依据 sources 中的分析产物生成一份完整 PPT 大纲。默认中文、16:9、商务汇报。',
-      '只返回严格 JSON：{title,slides:[{id,title,purpose,keyMessage,findingIds,dataPointIds}]}。',
+      '只返回严格 JSON：{title,slides:[{id,title,purpose,sourceIds,findingIds,dataPointIds}]}。',
       '每个 findingIds/dataPointIds 必须来自已保存的材料分析，不要 Markdown，不要联网。',
     ].join('\n'));
     return this.applyPipeline(projectId, pipeline, { kind: 'outline.submit', at: new Date().toISOString(), outline });
@@ -432,6 +434,16 @@ class TauriDesktopAdapter implements DesktopAdapter {
   }
   async reopenVisual(projectId: string, slideId: string): Promise<NativePptPipeline> {
     return this.applyCurrent(projectId, { kind: 'visual.reopen', at: new Date().toISOString(), slideId });
+  }
+  async runProjectQa(projectId: string): Promise<NativePptPipeline> {
+    const pipeline = await this.loadProjectPipeline(projectId);
+    const preparation = await this.callNative<Extract<NativePipelineAction, { kind: 'deck.qa' }>['preparation']>(
+      'ppt_prepare_qa',
+      { projectId },
+    );
+    return this.applyPipeline(projectId, pipeline, {
+      kind: 'deck.qa', at: new Date().toISOString(), preparation,
+    });
   }
   async proposeProjectMemory(projectId: string): Promise<{ status: string }> {
     const proposal = await this.runStructured<{ title: string; content: string }>(projectId, [

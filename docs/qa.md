@@ -26,7 +26,8 @@ pnpm golden:qa
 - 标题、正文、表格、图表、基础色块分别存在于 OOXML，可独立编辑。
 - 复杂背景只作为图片嵌入；参考图片中的文字不会和可编辑文字重复。
 - LibreOffice 使用项目局部 Fontconfig 与 macOS `Hiragino Sans GB` 渲染全部五页。
-- 页数为 5，无空白页、缺失资源、越界或裁切报告；自动修复轮数不超过 2。
+- 每个 LibreOffice 渲染页与其对应的、互不相同的批准全页 PNG 做像素归一化比较，差异分数必须不高于 `0.6`。
+- 页数为 5，所用字体可用，并且无空白页、缺失 OOXML 资源、对象越界或非法裁切；自动修复轮数不超过 2。
 
 主要输出：
 
@@ -34,7 +35,9 @@ pnpm golden:qa
 artifacts/qa/golden-project/golden-project/exports/golden-management-report.pptx
 artifacts/qa/golden-project/golden-project/exports/source-map.json
 artifacts/qa/golden-project/golden-project/qa/qa-summary.txt
-artifacts/qa/golden-project/golden-project/qa/run-1/qa-report.json
+artifacts/qa/golden-project/golden-project/qa/qa-round-1.json
+artifacts/qa/golden-project/golden-project/qa/qa-round-1.txt
+artifacts/qa/golden-project/golden-project/qa/run-1/golden-management-report.pdf
 artifacts/qa/golden-project/golden-project/qa/run-1/rendered-1.png … rendered-5.png
 ```
 
@@ -53,11 +56,13 @@ artifacts/qa/golden-project/golden-project/qa/run-1/rendered-1.png … rendered-
 
 ## 内存验收
 
-2026-09-03 在当前 Apple Silicon Mac 的 release `.app` 上，以 100 ms 间隔对应用根 PID 及全部后代进程求 RSS 总和：
+2026-09-03 在当前 Apple Silicon Mac 的最新 release `.app` 上，以 100 ms 间隔对应用根 PID 及全部后代进程求 RSS 总和。报告的峰值样本同时保存每个 PID、PPID、RSS 与完整命令，并为每个采样点保留用户操作标签和 PID 列表：
 
-- 空闲且已连接 Codex：峰值 224.2 MiB（应用 + 内嵌 Worker + Codex App Server）。
-- 创建并打开一个本地 PPT 项目：8 秒窗口峰值 223.4 MiB，同样包含上述全部子进程。
-- 两项均远低于 4096 MiB 门槛。
+- 从最新 bundle 重新启动应用，打开一个真实持久化 PPT 项目后采样 8 秒：峰值 `130.6 MiB`。
+- 峰值进程是主应用 PID `6909`（`92,784 KiB`）和内嵌 Worker PID `6940`（`40,944 KiB`）；该窗口没有启动 Codex App Server，因为项目停留在材料阶段。
+- `artifacts/qa/memory-one-project-v2.json` 保存 60 个 `one-project-open` 时间线样本，低于 4096 MiB 门槛。
+
+PID 会在每次复测时变化，应以新报告中的 `rootPid`、`peakProcesses` 和 `operationTimeline` 为准；上述 PID 只用于标识本次验收证据。
 
 复测命令：
 
@@ -65,7 +70,8 @@ artifacts/qa/golden-project/golden-project/qa/run-1/rendered-1.png … rendered-
 node scripts/measure-process-tree-rss.mjs \
   --pid <digital-twin-desktop-pid> \
   --duration 8000 \
-  --output artifacts/qa/memory-one-project.json
+  --operation one-project-open \
+  --output artifacts/qa/memory-one-project-v2.json
 ```
 
 macOS RSS 会随缓存波动；判定应使用同一 release 构建、相同子进程范围重新测量。

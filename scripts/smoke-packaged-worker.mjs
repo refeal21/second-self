@@ -1,0 +1,119 @@
+import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { readFile } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
+import { basename, join, resolve } from 'node:path';
+
+const repository = resolve(import.meta.dirname, '..');
+const binary = process.argv[2] ?? join(
+  repository,
+  'apps/desktop/src-tauri/target/release/bundle/macos/Digital Twin Workbench.app/Contents/MacOS/digital-twin-worker',
+);
+const goldenRoot = join(repository, 'artifacts/qa/golden-project/golden-project');
+const fixtureRoot = join(repository, 'fixtures/golden-project/sources');
+const at = '2026-09-03T04:00:00.000Z';
+let requestId = 1;
+
+function start() {
+  const child = spawn(binary, [], { stdio: ['pipe', 'pipe', 'inherit'] });
+  const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
+  return {
+    child,
+    async call(method, params) {
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId++, method, params })}\n`);
+      const next = await lines.next();
+      if (next.done) throw new Error('Packaged Worker closed stdout');
+      const response = JSON.parse(next.value);
+      if (response.error) throw new Error(JSON.stringify(response.error));
+      return response.result;
+    },
+  };
+}
+
+async function stop(worker) {
+  if (worker.child.exitCode !== null || worker.child.signalCode !== null) return;
+  const exited = once(worker.child, 'exit');
+  worker.child.kill('SIGTERM');
+  await exited;
+}
+
+const outline = JSON.parse(await readFile(join(goldenRoot, 'outline/outline-v1.json'), 'utf8'));
+const { specs } = JSON.parse(await readFile(join(goldenRoot, 'slide-specs/slide-specs-v1.json'), 'utf8'));
+const { output: analysis } = JSON.parse(await readFile(join(goldenRoot, 'sources/analysis-golden-analysis.json'), 'utf8'));
+const sourceInputs = [
+  ['source-report', 'management-memo.pdf', 'application/pdf'],
+  ['source-kpis', 'kpis.csv', 'text/csv'],
+  ['source-market', 'market-background.png', 'image/png'],
+  ['source-style', 'style-reference.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+];
+
+let worker = start();
+try {
+  const created = await worker.call('ppt.project.create', {
+    id: 'project-packaged-smoke', name: '五页经营复盘', goal: '验证打包 Worker 完整链路', at,
+    createdAt: at, preferenceSnapshot: [],
+  });
+  created.pipeline.sources = await Promise.all(sourceInputs.map(async ([id, fileName, mediaType]) => {
+    const bytes = await readFile(join(fixtureRoot, fileName));
+    return {
+      id, fileName, mediaType, relativePath: `sources/${fileName}`,
+      sha256: createHash('sha256').update(bytes).digest('hex'), byteLength: bytes.byteLength,
+    };
+  }));
+  await worker.call('ppt.project.restore', { pipeline: created.pipeline });
+  const execute = (action) => worker.call('ppt.project.execute', {
+    projectId: 'project-packaged-smoke', action,
+  });
+  let result = await execute({ kind: 'analysis.commit', at, requestId: 'analysis-packaged', output: analysis });
+  result = await execute({ kind: 'outline.submit', at, outline });
+  result = await execute({ kind: 'outline.approve', at });
+  result = await execute({ kind: 'details.submit', at, specs });
+  result = await execute({ kind: 'details.approve', at });
+
+  await stop(worker);
+  worker = start();
+  await worker.call('ppt.project.restore', { pipeline: result.pipeline });
+  const executeRestored = (action) => worker.call('ppt.project.execute', {
+    projectId: 'project-packaged-smoke', action,
+  });
+  const visualBytes = {};
+  const approvedVisuals = [];
+  for (const spec of specs) {
+    const relativePath = `visuals/${spec.id}-v1.png`;
+    const contentsBase64 = (await readFile(join(goldenRoot, relativePath))).toString('base64');
+    visualBytes[spec.id] = contentsBase64;
+    result = await executeRestored({ kind: 'visual.replace', at, slideId: spec.id, imageBase64: contentsBase64, altText: `批准视觉 ${spec.id}` });
+    result = await executeRestored({ kind: 'visual.approve', at, slideId: spec.id });
+    approvedVisuals.push({ slideId: spec.id, relativePath, contentsBase64 });
+  }
+  result = await executeRestored({ kind: 'deck.export', at, fileName: 'packaged-smoke.pptx', visualBytes });
+  const pptx = result.writes.find(({ kind }) => kind === 'pptx');
+  if (!pptx) throw new Error('Packaged Worker did not return a PPTX write intent');
+  const renderedPages = await Promise.all(specs.map(async (_spec, index) => ({
+    fileName: `rendered-${index + 1}.png`,
+    contentsBase64: (await readFile(join(goldenRoot, `qa/run-1/rendered-${index + 1}.png`))).toString('base64'),
+  })));
+  result = await executeRestored({ kind: 'deck.qa', at, preparation: {
+    status: 'ready', sofficePath: 'golden-soffice', rendererPath: 'golden-pdftoppm',
+    pptxBase64: pptx.contentsBase64,
+    pdfBase64: (await readFile(join(goldenRoot, 'qa/run-1/golden-management-report.pdf'))).toString('base64'),
+    renderedPages, approvedVisuals, fontAvailability: { 'Hiragino Sans GB': true },
+  } });
+  const report = result.pipeline.qaReport;
+  if (result.pipeline.project.workflowStatus !== 'completed' || report?.status !== 'passed') {
+    throw new Error(`Packaged Worker full smoke failed: ${report?.issues?.join('; ') ?? 'missing report'}`);
+  }
+  process.stdout.write(`${JSON.stringify({
+    binary,
+    architecture: process.arch,
+    workflowStatus: result.pipeline.project.workflowStatus,
+    restartRestoredRevision: result.pipeline.revision,
+    pages: report.actualPageCount,
+    distinctApprovedVisuals: new Set(report.comparisons.map(({ approvedVisualPath }) => approvedVisualPath)).size,
+    maxDifferenceScore: Math.max(...report.comparisons.map(({ differenceScore }) => differenceScore ?? 1)),
+    writes: result.writes.map(({ relativePath }) => relativePath),
+  }, null, 2)}\n`);
+} finally {
+  await stop(worker);
+}

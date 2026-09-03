@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmod, copyFile, mkdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
@@ -14,10 +14,23 @@ const outputBinary = join(binaryDirectory, `digital-twin-worker-${triple}${exten
 const bundledJavaScript = join(buildDirectory, 'worker-sidecar.cjs');
 const seaBlob = join(buildDirectory, 'worker-sidecar.blob');
 const seaConfig = join(buildDirectory, 'sea-config.json');
+const runtimeResourceDirectory = join(repository, 'apps', 'desktop', 'src-tauri', 'resources', 'node-runtime');
+const nodeDistributionRoot = resolve(dirname(process.execPath), '..');
+const nodeLicenseSource = join(nodeDistributionRoot, 'LICENSE');
 
 await rm(buildDirectory, { recursive: true, force: true });
 await mkdir(buildDirectory, { recursive: true });
 await mkdir(binaryDirectory, { recursive: true });
+await rm(runtimeResourceDirectory, { recursive: true, force: true });
+await mkdir(runtimeResourceDirectory, { recursive: true });
+const nodeLicense = await readFile(nodeLicenseSource, 'utf8').catch(() => {
+  throw new Error(`The matching Node distribution LICENSE is missing: ${nodeLicenseSource}`);
+});
+if (!nodeLicense.includes('third-party software notices')) {
+  throw new Error('Node distribution LICENSE does not contain its bundled third-party notices');
+}
+await writeFile(join(runtimeResourceDirectory, 'LICENSE-and-third-party-notices.txt'), nodeLicense);
+await writeFile(join(runtimeResourceDirectory, 'VERSION.txt'), `${process.version}\n`);
 await build({
   entryPoints: [join(repository, 'apps', 'worker', 'src', 'sidecar-cli.ts')],
   outfile: bundledJavaScript,

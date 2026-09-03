@@ -78,6 +78,9 @@ importers:
       '@digital-twin/core':
         specifier: workspace:*
         version: link:../../packages/core
+      jszip:
+        specifier: 3.10.1
+        version: 3.10.1
       pngjs:
         specifier: 7.0.0
         version: 7.0.0
@@ -91,9 +94,6 @@ importers:
       '@types/pngjs':
         specifier: 6.0.5
         version: 6.0.5
-      jszip:
-        specifier: 3.10.1
-        version: 3.10.1
       tsx:
         specifier: ^4.20.5
         version: 4.23.13

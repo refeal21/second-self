@@ -148,6 +148,11 @@ export class PptDeliveryCoordinator {
           exportSha256: receipt.sha256,
           specVersionId: receipt.specVersionId,
           visualVersionIds: receipt.visualVersionIds,
+          approvedVisualPaths: Object.entries(receipt.visualVersionIds).map(([slideId, versionId]) => {
+            const sequence = versionId.match(/-v(\d+)$/)?.[1];
+            if (!sequence) throw new Error(`Approved visual version is invalid for ${slideId}`);
+            return `visuals/${slideId}-v${sequence}.png`;
+          }),
         };
         const report =
           (await this.#recoverQaBundle(input, receipt)) ??
@@ -340,7 +345,7 @@ function validateQaBundle(
     !sameStringRecord(candidate.visualVersionIds, input.visualVersionIds) ||
     candidate.expectedPageCount !== input.expectedPageCount ||
     candidate.jsonReportPath !== expectedPath ||
-    candidate.textReportPath !== expectedPath ||
+    candidate.textReportPath !== expectedPath.replace(/\.json$/, '.txt') ||
     !isNullableString(candidate.sofficePath) ||
     !isNullableString(candidate.rendererPath) ||
     !isNullableString(candidate.pdfPath) ||

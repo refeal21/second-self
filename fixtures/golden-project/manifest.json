@@ -14,8 +14,8 @@
     },
     {
       "fileName": "kpis.csv",
-      "sha256": "704bfc3e11ba5f0240fa8fcdd550f90d59da9ae68a7437a8de9a05f38a51bdca",
-      "byteLength": 187
+      "sha256": "a9ce0ae034d722f974c51e0bad064d8cc7e3c61793818bcfe97c3eb1e5250685",
+      "byteLength": 205
     },
     {
       "fileName": "market-background.png",
@@ -24,7 +24,7 @@
     },
     {
       "fileName": "style-reference.pptx",
-      "sha256": "607d8a64b4950a46861f63d64a3d3f8e20e6cc232f75a2c207e8e8f3c79f1b42",
+      "sha256": "ed5e74978e86f71e859eb55c7eb87b0c0a9de60569627092f6fec012b103ef8e",
       "byteLength": 14941
     }
   ]

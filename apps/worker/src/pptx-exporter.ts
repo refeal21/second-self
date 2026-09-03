@@ -64,7 +64,7 @@ export class PptxGenJsExporter implements PptxExporter {
       bodyFontFace: editableFontFace,
     };
 
-    for (const item of deck.slides) {
+    for (const [slideIndex, item] of deck.slides.entries()) {
       const slide = pptx.addSlide();
       slide.background = { color: 'F7F9FC' };
       const visual = item.visual;
@@ -82,7 +82,7 @@ export class PptxGenJsExporter implements PptxExporter {
           item.spec.charts.length > 0,
         );
       }
-      addEditableSpec(pptx, slide, item.spec);
+      addEditableSpec(pptx, slide, item.spec, slideIndex === 0);
       if (item.spec.sourceMap.length > 0)
         slide.addNotes(sourceNotes(item.spec));
     }
@@ -129,6 +129,7 @@ function addEditableSpec(
   pptx: PptxGenJS,
   slide: PptxGenJS.Slide,
   spec: SlideSpec,
+  isCover: boolean,
 ): void {
   slide.addText(spec.title, {
     x: 0.75,
@@ -136,7 +137,7 @@ function addEditableSpec(
     w: 11.8,
     h: 0.65,
     fontFace: editableFontFace,
-    fontSize: 35,
+    fontSize: isCover ? 50 : 35,
     bold: true,
     color: '172033',
     margin: 0,
@@ -145,17 +146,19 @@ function addEditableSpec(
 
   if (spec.body.length > 0) {
     slide.addText(
-      spec.body.map((text) => ({
-        text,
-        options: { bullet: { indent: 16 }, breakLine: true },
-      })),
+      isCover
+        ? spec.body.join('\n')
+        : spec.body.map((text) => ({
+            text,
+            options: { bullet: { indent: 16 }, breakLine: true },
+          })),
       {
         x: 0.8,
         y: 1.35,
         w: 5.7,
         h: 1.15,
         fontFace: editableFontFace,
-        fontSize: 18,
+        fontSize: isCover ? 24 : 18,
         color: '344054',
         margin: 2,
         breakLine: false,

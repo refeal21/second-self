@@ -7,6 +7,7 @@ const options = parseArgs(process.argv.slice(2));
 const rootPid = Number(options.pid);
 const durationMs = Number(options.duration ?? 5_000);
 const intervalMs = Number(options.interval ?? 100);
+const operation = String(options.operation ?? 'unspecified');
 if (!Number.isInteger(rootPid) || rootPid <= 0) {
   throw new Error('Usage: measure-process-tree-rss.mjs --pid <positive pid> [--duration 5000] [--output report.json]');
 }
@@ -24,13 +25,22 @@ while (Date.now() < deadline) {
     (sum, pid) => sum + (processes.get(pid)?.rssKiB ?? 0),
     0,
   );
-  samples.push({ elapsedMs: Date.now() - startedAt.getTime(), rssKiB, pids: [...pids].sort((a, b) => a - b) });
+  samples.push({
+    elapsedMs: Date.now() - startedAt.getTime(),
+    operation,
+    rssKiB,
+    pids: [...pids].sort((a, b) => a - b),
+    processes: [...pids]
+      .map((pid) => ({ pid, ...processes.get(pid) }))
+      .filter((process) => process.ppid !== undefined)
+      .sort((left, right) => left.pid - right.pid),
+  });
   await new Promise((resolveWait) => setTimeout(resolveWait, intervalMs));
 }
 
 const peak = samples.reduce((best, sample) => sample.rssKiB > best.rssKiB ? sample : best, samples[0]);
 const report = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   measuredAt: startedAt.toISOString(),
   rootPid,
   durationMs,
@@ -39,6 +49,13 @@ const report = {
   peakRssKiB: peak?.rssKiB ?? 0,
   peakRssMiB: Math.round(((peak?.rssKiB ?? 0) / 1024) * 10) / 10,
   peakPids: peak?.pids ?? [],
+  peakProcesses: peak?.processes ?? [],
+  operationTimeline: samples.map(({ elapsedMs, operation: sampleOperation, rssKiB, pids }) => ({
+    elapsedMs,
+    operation: sampleOperation,
+    rssKiB,
+    pids,
+  })),
   gateMiB: 4096,
   passed: (peak?.rssKiB ?? Number.POSITIVE_INFINITY) < 4096 * 1024,
 };
@@ -51,12 +68,18 @@ if (options.output) {
 process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 
 function readProcesses() {
-  const rows = execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,rss='], { encoding: 'utf8' });
+  const rows = execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,rss=,command='], { encoding: 'utf8' });
   const processes = new Map();
   for (const row of rows.trim().split('\n')) {
-    const [pidText, ppidText, rssText] = row.trim().split(/\s+/);
+    const match = row.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
+    if (!match) continue;
+    const [, pidText, ppidText, rssText, command] = match;
     const pid = Number(pidText);
-    if (Number.isInteger(pid)) processes.set(pid, { ppid: Number(ppidText), rssKiB: Number(rssText) });
+    if (Number.isInteger(pid)) processes.set(pid, {
+      ppid: Number(ppidText),
+      rssKiB: Number(rssText),
+      command,
+    });
   }
   return processes;
 }

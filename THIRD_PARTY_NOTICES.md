@@ -6,7 +6,7 @@ The application links, bundles, or uses the following principal third-party comp
 
 | Component | Use | License |
 | --- | --- | --- |
-| Node.js 22 | Runtime embedded in the Worker single executable | MIT; Node binary distributions also include third-party notices |
+| Node.js 22 | Runtime embedded in the Worker single executable | MIT plus the dependency licenses/notices carried in the matching Node distribution `LICENSE` |
 | Tauri and Tauri plugins | macOS shell, IPC, bundling and process supervision | Apache-2.0 OR MIT |
 | React / React DOM | Desktop WebView UI | MIT |
 | PptxGenJS | Editable PPTX generation | MIT |
@@ -16,6 +16,8 @@ The application links, bundles, or uses the following principal third-party comp
 | serde / serde_json | Rust serialization | Apache-2.0 OR MIT |
 | Vite, Vitest, TypeScript, tsx, esbuild | Development, testing and build tooling | MIT |
 | LibreOffice | External, user-installed QA renderer; not bundled | MPL-2.0 |
+
+The app bundle contains the exact `LICENSE` from the Node executable used to build the SEA, including Node's dependency license and third-party notice sections, at `Contents/Resources/licenses/node-runtime/LICENSE-and-third-party-notices.txt`. Its matching version is recorded beside it in `VERSION.txt`; the build fails instead of packaging an unmatched or incomplete notice.
 
 Upstream license texts:
 

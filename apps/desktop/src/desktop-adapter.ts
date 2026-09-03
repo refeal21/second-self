@@ -23,6 +23,11 @@ export interface ProjectSummary {
   stage: string;
   progress: number;
   updatedAt: string;
+  workflowStatus?: string;
+  selectedSlide?: number;
+  slides?: Array<{ page: number; status: 'approved' | 'waiting' | 'pending' }>;
+  exportReady?: boolean;
+  slideNotice?: string;
 }
 export interface ApprovalSummary {
   id: string;
@@ -89,6 +94,7 @@ export interface CreateProjectInput { name: string; goal: string }
 export interface DesktopAdapter {
   readonly mode: DesktopAdapterMode;
   readonly initialState: DesktopInitialState;
+  loadInitialState(): Promise<DesktopInitialState>;
   connectAccount(): Promise<AccountSummary>;
   startLogin(): Promise<{ message: string }>;
   startTask(prompt: string): Promise<TaskSummary>;
@@ -163,6 +169,7 @@ const nativeInitialState: DesktopInitialState = {
 
 export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): DesktopAdapter {
   let counter = 1;
+  const initialState = structuredClone(demoInitialState);
   const tasks = new Map<string, TaskSummary>();
   const listeners = new Map<string, Set<(task: TaskSummary) => void>>();
   const delay = async (key: keyof NonNullable<DemoAdapterOptions['delays']>) => {
@@ -171,7 +178,8 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
   };
   return {
     mode: 'demo',
-    initialState: structuredClone(demoInitialState),
+    initialState,
+    async loadInitialState() { return structuredClone(initialState); },
     async connectAccount() { return structuredClone(demoInitialState.account); },
     async startLogin() { return { message: '演示数据：浏览器登录流程已准备好。' }; },
     async startTask(prompt) {
@@ -264,6 +272,11 @@ class TauriDesktopAdapter implements DesktopAdapter {
     this.client.onExit(() => this.publishAll());
   }
 
+  async loadInitialState(): Promise<DesktopInitialState> {
+    await this.nativeInvoke('start_worker_sidecar', undefined);
+    return this.callNative('load_desktop_state', undefined);
+  }
+
   async connectAccount(): Promise<AccountSummary> {
     await this.client.connect();
     const account = await this.client.readAccount();
@@ -312,7 +325,7 @@ class TauriDesktopAdapter implements DesktopAdapter {
   decideMemory(proposalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }> { return this.callNative('memory_decide', { proposalId, decision }); }
   saveSettings(input: { workspacePath: string; codexPath: string }): Promise<{ status: string }> { return this.callNative('save_desktop_settings', input); }
 
-  private callNative<T>(command: string, args: Record<string, unknown>): Promise<T> { return this.nativeInvoke(command, args) as Promise<T>; }
+  private callNative<T>(command: string, args?: Record<string, unknown>): Promise<T> { return this.nativeInvoke(command, args) as Promise<T>; }
   private publishThread(threadId: string): void {
     for (const taskId of this.taskIds) if (this.tasks.getTask(taskId)?.threadId === threadId) this.publish(taskId);
   }

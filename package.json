@@ -3,6 +3,7 @@
   "private": true,
   "packageManager": "pnpm@11.19.0",
   "scripts": {
+    "build:worker-sidecar": "node scripts/build-worker-sidecar.mjs",
     "dev": "pnpm --filter @digital-twin/desktop tauri dev",
     "dev:web": "pnpm --parallel --filter @digital-twin/desktop --filter @digital-twin/worker dev",
     "typecheck": "pnpm -r typecheck",
@@ -15,7 +16,9 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",
+    "esbuild": "0.28.2",
     "eslint": "^9.36.0",
+    "postject": "1.0.0-alpha.6",
     "typescript": "^5.9.2",
     "typescript-eslint": "^8.44.1",
     "vitest": "^3.2.4"

@@ -87,6 +87,25 @@ export function App({
   }, []);
 
   useEffect(() => {
+    // The browser demo state is already complete and is intentionally mutable for
+    // the lifetime of the preview. Only the native shell has a second, durable
+    // source of truth that must replace the bootstrap placeholder.
+    if (adapter.mode !== 'tauri') return;
+    let active = true;
+    void adapter
+      .loadInitialState()
+      .then((state) => {
+        if (active) dispatch({ type: 'state-loaded', state });
+      })
+      .catch((error: unknown) => {
+        if (active) setNotice({ kind: 'error', text: toMessage(error) });
+      });
+    return () => {
+      active = false;
+    };
+  }, [adapter]);
+
+  useEffect(() => {
     if (!task) return;
     return adapter.subscribeTask(task.id, setTask);
   }, [adapter, task?.id]);

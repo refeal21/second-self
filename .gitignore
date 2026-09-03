@@ -7,4 +7,5 @@ coverage/
 *.log
 .superpowers/
 artifacts/qa/
-
+artifacts/build/
+apps/desktop/src-tauri/binaries/digital-twin-worker-*

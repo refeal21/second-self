@@ -132,3 +132,13 @@ Task 4: fix round 3 review found one scoped loaded-empty rendering defect: `Memo
 Task 4: Ruling: collection availability and collection cardinality are independent UI states — `loaded + []` renders the explicit successful empty state `当前没有偏好记忆。`, while unavailable/loading retain their honest status messages.
 
 Task 4: fix round 3 implementation complete pending review (focused RED 1 failure → GREEN 1/1; desktop 43/43; desktop lint/typecheck/build and `git diff --check` green).
+
+Task 5: Ruling: package the TypeScript workflow Worker as a Node Single Executable Application behind Tauri `bundle.externalBin` — this preserves the reviewed TypeScript implementation while removing any separately installed Node.js runtime requirement; the Apple Silicon sidecar is approximately 106 MiB and is rebuilt for the active Rust host triple — if the SEA mechanism changes in a future Node release, only the repeatable sidecar build script and packaging adapter need replacement.
+
+Task 5: Ruling: Rust remains the sole durable authority for project/settings/approval/preference/checkpoint state and workspace writes; the browser demo adapter never performs asynchronous hydration, while the Tauri adapter starts the supervised sidecar and replaces its unavailable bootstrap state from SQLite — this prevents browser sample data from appearing as native success and prevents hydration races from overwriting in-session demo edits.
+
+Task 5: Ruling: actual artifact writes use directory-file-descriptor traversal with `openat(O_NOFOLLOW)`, same-directory temporary files, `fsync`, and atomic `renameat` — a prior path string validation remains useful for diagnostics but is not treated as the write authorization boundary; macOS/Unix is the MVP target.
+
+Task 5: Ruling: ImageGen absence is a typed capability result and an explicit recoverable project error with `billedApiFallback: false`; native regeneration persists the visual-review checkpoint notice and never substitutes an OpenAI API-key client or a fake visual.
+
+Task 5A checkpoint implementation complete pending commit (Worker JSON-RPC 5/5 plus process integration 2/2 including controlled crash/restart; core 8/8, Worker 154/154, desktop 45/45, Rust 17/17; repository typecheck/lint, Rust fmt, desktop production build, SEA rebuild/smoke, and `git diff --check` green). Task 5B remains: deterministic Golden Project, real delivery export/LibreOffice evidence, live Codex read-only smoke, app bundle/launch/memory/network audits, and operational/license documentation.

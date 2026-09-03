@@ -17,6 +17,35 @@ describe('desktop workbench interactions', () => {
 
   afterEach(() => cleanup());
 
+  it('hydrates the production shell from the adapter durable state', async () => {
+    const demo = createDemoDesktopAdapter();
+    const adapter = { ...demo, mode: 'tauri' as const } as DesktopAdapter;
+    const persisted = structuredClone(adapter.initialState);
+    persisted.projects[0] = {
+      ...persisted.projects[0]!,
+      id: 'persisted-project',
+      name: '重启后恢复的项目',
+      selectedSlide: 2,
+      slides: [
+        { page: 1, status: 'approved' },
+        { page: 2, status: 'waiting' },
+        { page: 3, status: 'pending' },
+        { page: 4, status: 'pending' },
+        { page: 5, status: 'pending' },
+      ],
+    };
+    adapter.initialState.projects = [];
+    adapter.initialState.collections.projects = 'loading';
+    adapter.loadInitialState = vi.fn(async () => persisted);
+
+    render(<App adapter={adapter} initialRoute="projects" />);
+
+    expect(
+      await screen.findByRole('button', { name: /重启后恢复的项目/ }),
+    ).toBeInTheDocument();
+    expect(adapter.loadInitialState).toHaveBeenCalledTimes(1);
+  });
+
   it('navigates between dashboard sections with an accessible current item', async () => {
     const user = userEvent.setup();
     render(<App adapter={createDemoDesktopAdapter()} />);
@@ -388,6 +417,9 @@ describe('desktop workbench interactions', () => {
           approvals: 'unavailable',
           memories: 'unavailable',
         },
+      },
+      async loadInitialState() {
+        return structuredClone(this.initialState);
       },
     } as DesktopAdapter;
     render(<App adapter={nativeLike} initialRoute="approvals" />);

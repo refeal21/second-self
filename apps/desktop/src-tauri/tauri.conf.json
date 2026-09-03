@@ -5,7 +5,7 @@
   "identifier": "com.digitaltwin.workbench",
   "build": {
     "beforeDevCommand": "pnpm --dir .. dev",
-    "beforeBuildCommand": "pnpm --dir .. build",
+    "beforeBuildCommand": "pnpm --dir .. build:tauri-assets",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist"
   },
@@ -13,5 +13,10 @@
     "windows": [{ "title": "Digital Twin Workbench", "width": 1440, "height": 960 }],
     "security": { "csp": null }
   },
-  "bundle": { "active": false }
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "externalBin": ["binaries/digital-twin-worker"],
+    "macOS": { "minimumSystemVersion": "13.0" }
+  }
 }

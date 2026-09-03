@@ -57,6 +57,7 @@ export interface WorkbenchState {
 type SlideMutationResult = RegenerateResult | ApprovalResult | { status: string };
 
 export type WorkbenchAction =
+  | { type: 'state-loaded'; state: DesktopInitialState }
   | { type: 'account-updated'; account: AccountSummary }
   | { type: 'project-selected'; projectId: string }
   | { type: 'project-created'; project: ProjectSummary }
@@ -121,6 +122,8 @@ export function workbenchReducer(
   action: WorkbenchAction,
 ): WorkbenchState {
   switch (action.type) {
+    case 'state-loaded':
+      return createWorkbenchState(action.state);
     case 'account-updated':
       return { ...state, account: action.account };
     case 'project-selected':
@@ -298,6 +301,21 @@ function updateProject(
 }
 
 function toWorkbenchProject(project: ProjectSummary): WorkbenchProject {
+  if (
+    project.slides?.length === 5 &&
+    project.selectedSlide !== undefined &&
+    project.workflowStatus !== undefined
+  ) {
+    return {
+      ...structuredClone(project),
+      workflowStage: stageId(project.stage),
+      selectedSlide: clampSlide(project.selectedSlide),
+      slides: structuredClone(project.slides),
+      exportReady: project.exportReady === true,
+      slideNotice: project.slideNotice ?? '',
+      pendingMutation: null,
+    };
+  }
   const visual = project.stage === '视觉审批';
   return {
     ...structuredClone(project),

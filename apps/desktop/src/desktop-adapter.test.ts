@@ -67,6 +67,58 @@ async function runningNativeTask() {
 }
 
 describe('native desktop general-task bridge', () => {
+  it('loads persisted collections through the native command boundary', async () => {
+    const transport = new ScriptedNativeServer();
+    const persisted = {
+      account: { email: null, plan: null, status: 'unavailable' },
+      projects: [
+        {
+          id: 'persisted-1',
+          name: '已保存项目',
+          goal: '重启后恢复',
+          stage: '视觉审批',
+          workflowStatus: 'visual_review',
+          progress: 60,
+          selectedSlide: 2,
+          slides: [
+            { page: 1, status: 'approved' },
+            { page: 2, status: 'waiting' },
+            { page: 3, status: 'pending' },
+            { page: 4, status: 'pending' },
+            { page: 5, status: 'pending' },
+          ],
+          exportReady: false,
+          slideNotice: '等待审批',
+          updatedAt: 'unix:1',
+        },
+      ],
+      approvals: [],
+      memories: [],
+      runtime: {
+        status: 'unavailable',
+        detail: '等待连接本机 Codex App Server',
+        model: null,
+        address: null,
+        uptime: null,
+        queue: null,
+      },
+      collections: { projects: 'loaded', approvals: 'loaded', memories: 'loaded' },
+      settings: { workspacePath: '/tmp/workspace', codexPath: '' },
+    } as const;
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'load_desktop_state') return persisted;
+      if (command === 'start_worker_sidecar') {
+        return { generation: 1, pid: 10, protocolVersion: 1 };
+      }
+      return {};
+    });
+    const adapter = createTauriDesktopAdapter(transport, invoke);
+
+    await expect(adapter.loadInitialState()).resolves.toEqual(persisted);
+    expect(invoke).toHaveBeenNthCalledWith(1, 'start_worker_sidecar', undefined);
+    expect(invoke).toHaveBeenNthCalledWith(2, 'load_desktop_state', undefined);
+  });
+
   it('publishes streamed output, usage, and completion from App Server', async () => {
     const { adapter, task, transport } = await runningNativeTask();
     const updates: typeof task[] = [];

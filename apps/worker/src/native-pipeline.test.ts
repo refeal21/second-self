@@ -121,7 +121,7 @@ const specs = [
 describe('packaged native PPT workflow runtime', () => {
   it('executes the real legal stages, blocks unavailable ImageGen, accepts replacements, and exports editable PPTX', async () => {
     const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
-    runtime.restore(intakePipeline());
+    await runtime.restore(intakePipeline());
 
     let result = await runtime.execute('project-native', {
       kind: 'analysis.commit',
@@ -142,6 +142,16 @@ describe('packaged native PPT workflow runtime', () => {
     expect(result.pipeline.project.workflowStatus).toBe('outline_review');
     expect(result.pipeline.outline?.version.status).toBe('draft');
 
+    const editedOutline = structuredClone(outline);
+    editedOutline.slides[0]!.title = '经营复盘（用户修改）';
+    result = await runtime.execute('project-native', {
+      kind: 'outline.submit',
+      at: '2026-09-03T02:02:30.000Z',
+      outline: editedOutline,
+    });
+    expect(result.pipeline.outline?.value.slides[0]?.title).toBe('经营复盘（用户修改）');
+    expect(result.pipeline.outline?.version).toMatchObject({ sequence: 1, status: 'draft' });
+
     result = await runtime.execute('project-native', {
       kind: 'outline.approve',
       at: '2026-09-03T02:03:00.000Z',
@@ -155,6 +165,16 @@ describe('packaged native PPT workflow runtime', () => {
       specs,
     });
     expect(result.pipeline.slideSpecs?.version.status).toBe('draft');
+
+    const editedSpecs = structuredClone(specs);
+    editedSpecs[0]!.body = ['用户修改后的管理层汇报'];
+    result = await runtime.execute('project-native', {
+      kind: 'details.submit',
+      at: '2026-09-03T02:04:30.000Z',
+      specs: editedSpecs,
+    });
+    expect(result.pipeline.slideSpecs?.value[0]?.body).toEqual(['用户修改后的管理层汇报']);
+    expect(result.pipeline.slideSpecs?.version).toMatchObject({ sequence: 1, status: 'draft' });
 
     result = await runtime.execute('project-native', {
       kind: 'details.approve',
@@ -285,7 +305,7 @@ describe('packaged native PPT workflow runtime', () => {
 
   it('restores an authoritative full snapshot into a fresh Worker process', async () => {
     const first = new NativePptRpcRuntime({ imageGenAvailable: false });
-    first.restore(intakePipeline());
+    await first.restore(intakePipeline());
     await first.execute('project-native', {
       kind: 'analysis.commit',
       at: '2026-09-03T02:01:00.000Z',
@@ -309,11 +329,31 @@ describe('packaged native PPT workflow runtime', () => {
     const persisted = first.snapshot('project-native');
 
     const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
-    const restored = restarted.restore(persisted);
+    const restored = await restarted.restore(persisted);
 
     expect(restored).toEqual(persisted);
     expect(restored.outline?.value.slides).toHaveLength(2);
     expect(restored.slideSpecs?.value[1]?.charts[0]?.id).toBe('chart-revenue');
     expect(restored.preferenceSnapshot[0]?.content).toBe('关键数字优先使用图表。');
+  });
+
+  it('restores analysis provenance after Rust JSON object-key canonicalization', async () => {
+    const first = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await first.restore(intakePipeline());
+    const result = await first.execute('project-native', {
+      kind: 'analysis.commit',
+      at: '2026-09-03T02:01:00.000Z',
+      requestId: 'request-analysis',
+      output: analysis,
+    });
+    const persisted = structuredClone(result.pipeline);
+    persisted.analysis!.output = {
+      dataPoints: persisted.analysis!.output.dataPoints,
+      findings: persisted.analysis!.output.findings,
+      sourceMap: persisted.analysis!.output.sourceMap,
+    };
+
+    const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await expect(restarted.restore(persisted)).resolves.toEqual(persisted);
   });
 });

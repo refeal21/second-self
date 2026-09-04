@@ -7,7 +7,7 @@ import {
 import { assertStrictIdentifier } from './identifiers.js';
 import {
   NativePptRpcRuntime,
-  type NativePipelineAction,
+  parseNativePipelineAction,
   type NativePptPipeline,
   type NativePreferenceSnapshot,
 } from './native-pipeline.js';
@@ -130,7 +130,15 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
     }
     case 'ppt.project.restore': {
       const input = requireRecord(params);
-      return nativePptRuntime.restore(input.pipeline as NativePptPipeline);
+      try {
+        return await nativePptRuntime.restore(input.pipeline as NativePptPipeline);
+      } catch (error) {
+        throw new InvalidParams(
+          error instanceof Error
+            ? error.message
+            : 'Native PPT pipeline snapshot is invalid',
+        );
+      }
     }
     case 'ppt.project.snapshot': {
       const input = requireRecord(params);
@@ -138,9 +146,17 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
     }
     case 'ppt.project.execute': {
       const input = requireRecord(params);
+      let action;
+      try {
+        action = parseNativePipelineAction(input.action);
+      } catch (error) {
+        throw new InvalidParams(
+          error instanceof Error ? error.message : 'Native PPT action is invalid',
+        );
+      }
       return nativePptRuntime.execute(
         requireString(input.projectId, 'projectId'),
-        input.action as NativePipelineAction,
+        action,
       );
     }
     case 'test.crash':

@@ -157,6 +157,60 @@ export type NativePipelineAction =
   | { kind: 'deck.export'; at: string; fileName: string; visualBytes: Record<string, string> }
   | { kind: 'deck.qa'; at: string; preparation: NativeQaPreparation };
 
+export function parseNativePipelineAction(value: unknown): NativePipelineAction {
+  const action = requireRecordValue(value, 'action');
+  const kind = requireStringValue(action.kind, 'action.kind');
+  requireStringValue(action.at, 'action.at');
+  switch (kind) {
+    case 'analysis.commit':
+      requireExactKeys(action, ['kind', 'at', 'requestId', 'output'], 'analysis.commit');
+      requireIdentifier(requireStringValue(action.requestId, 'action.requestId'), 'request id');
+      validateSourceAnalysisValue(action.output);
+      break;
+    case 'outline.submit':
+      requireExactKeys(action, ['kind', 'at', 'outline'], 'outline.submit');
+      validateOutlineValue(action.outline);
+      break;
+    case 'outline.approve':
+    case 'details.approve':
+      requireExactKeys(action, ['kind', 'at'], kind);
+      break;
+    case 'details.submit':
+      requireExactKeys(action, ['kind', 'at', 'specs'], 'details.submit');
+      validateSlideSpecsValue(action.specs);
+      break;
+    case 'visual.generate':
+    case 'visual.approve':
+    case 'visual.reopen':
+      requireExactKeys(action, ['kind', 'at', 'slideId'], kind);
+      requireIdentifier(requireStringValue(action.slideId, 'action.slideId'), 'slide id');
+      break;
+    case 'visual.replace':
+      requireExactKeys(action, ['kind', 'at', 'slideId', 'imageBase64', 'altText'], kind);
+      requireIdentifier(requireStringValue(action.slideId, 'action.slideId'), 'slide id');
+      requireBase64Value(action.imageBase64, 'action.imageBase64');
+      requireStringValue(action.altText, 'action.altText');
+      break;
+    case 'deck.export': {
+      requireExactKeys(action, ['kind', 'at', 'fileName', 'visualBytes'], kind);
+      requireStringValue(action.fileName, 'action.fileName');
+      const bytes = requireRecordValue(action.visualBytes, 'action.visualBytes');
+      for (const [slideId, encoded] of Object.entries(bytes)) {
+        requireIdentifier(slideId, 'slide id');
+        requireBase64Value(encoded, `action.visualBytes.${slideId}`);
+      }
+      break;
+    }
+    case 'deck.qa':
+      requireExactKeys(action, ['kind', 'at', 'preparation'], kind);
+      validateQaPreparationValue(action.preparation);
+      break;
+    default:
+      throw new Error(`Unknown native pipeline action: ${kind}`);
+  }
+  return structuredClone(action) as unknown as NativePipelineAction;
+}
+
 export interface NativePptRpcRuntimeOptions {
   imageGenAvailable: boolean;
   generateVisual?: (slideId: string, spec: SlideSpec) => Promise<{
@@ -217,8 +271,9 @@ export class NativePptRpcRuntime {
     return structuredClone(pipeline);
   }
 
-  restore(input: NativePptPipeline): NativePptPipeline {
+  async restore(input: NativePptPipeline): Promise<NativePptPipeline> {
     validatePipeline(input);
+    await validateRestoredPipeline(input);
     const copy = structuredClone(input);
     this.#projects.set(copy.project.id, copy);
     return structuredClone(copy);
@@ -269,12 +324,19 @@ export class NativePptRpcRuntime {
         break;
       }
       case 'outline.submit': {
-        const workflow = await replayPipeline(state, 'source_analysis');
+        const editingDraft = state.project.workflowStatus === 'outline_review'
+          && state.outline?.version.status === 'draft';
+        const replayState = editingDraft
+          ? { ...structuredClone(state), outline: null,
+              project: { ...state.project, workflowStatus: 'source_analysis' as const } }
+          : state;
+        const workflow = await replayPipeline(replayState, 'source_analysis');
         const service = new (await import('./structure-generation.js')).OutlineGenerationService(
           workflow.projects,
           { generate: async () => structuredClone(action.outline) },
         );
-        const version = await service.generate(projectId);
+        const generatedVersion = await service.generate(projectId);
+        const version = editingDraft ? structuredClone(state.outline!.version) : generatedVersion;
         state.outline = { version, value: structuredClone(action.outline) };
         state.project.workflowStatus = 'outline_review';
         writes.push(createWrite('outline/outline-v1.json', jsonBytes(action.outline), 'outline', version.id));
@@ -602,6 +664,8 @@ export class NativePptRpcRuntime {
         }
         break;
       }
+      default:
+        throw new Error(`Unknown native pipeline action: ${String((action as { kind?: unknown }).kind)}`);
     }
     const taskKind = taskKindFor(action.kind);
     if (taskKind) {
@@ -883,24 +947,554 @@ class MemoryArtifacts implements WorkspaceArtifactAccess {
   }
 }
 
+function requireRecordValue(value: unknown, field: string): Record<string, unknown> {
+  if (!isRecordValue(value)) throw new Error(`${field} must be an object`);
+  return value;
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function requireStringValue(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value.length === 0) throw new Error(`${field} must be a non-empty string`);
+  return value;
+}
+
+function requireExactKeys(value: Record<string, unknown>, keys: readonly string[], field: string): void {
+  const expected = new Set(keys);
+  const actual = Object.keys(value);
+  if (actual.length !== expected.size || actual.some((key) => !expected.has(key))) {
+    throw new Error(`${field} contains missing or unknown fields`);
+  }
+}
+
+function requireStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) {
+    throw new Error(`${field} must be a string array`);
+  }
+  return value;
+}
+
+function requireBase64Value(value: unknown, field: string): string {
+  const encoded = requireStringValue(value, field);
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    throw new Error(`${field} must be canonical base64`);
+  }
+  return encoded;
+}
+
+function validateSourceAnalysisValue(value: unknown): asserts value is SourceAnalysis {
+  const analysis = requireRecordValue(value, 'source analysis');
+  requireExactKeys(analysis, ['findings', 'dataPoints', 'sourceMap'], 'source analysis');
+  if (!Array.isArray(analysis.findings) || !Array.isArray(analysis.dataPoints) || !Array.isArray(analysis.sourceMap)) {
+    throw new Error('Source analysis collections are invalid');
+  }
+  const findingIds = new Set<string>();
+  for (const itemValue of analysis.findings) {
+    const item = requireRecordValue(itemValue, 'source finding');
+    requireExactKeys(item, ['id', 'text', 'sourceIds'], 'source finding');
+    const id = requireStringValue(item.id, 'source finding id');
+    requireIdentifier(id, 'finding id');
+    if (findingIds.has(id)) throw new Error('Source finding identifiers must be unique');
+    findingIds.add(id);
+    requireStringValue(item.text, 'source finding text');
+    requireStringArray(item.sourceIds, 'source finding sourceIds');
+  }
+  const dataPointIds = new Set<string>();
+  for (const itemValue of analysis.dataPoints) {
+    const item = requireRecordValue(itemValue, 'source data point');
+    const allowed = ['id', 'label', 'value', ...(itemValue.unit === undefined ? [] : ['unit']),
+      ...(itemValue.sourceIds === undefined ? [] : ['sourceIds'])];
+    requireExactKeys(item, allowed, 'source data point');
+    const id = requireStringValue(item.id, 'source data point id');
+    requireIdentifier(id, 'data point id');
+    if (dataPointIds.has(id)) throw new Error('Source data point identifiers must be unique');
+    dataPointIds.add(id);
+    requireStringValue(item.label, 'source data point label');
+    if (typeof item.value !== 'string' && (typeof item.value !== 'number' || !Number.isFinite(item.value))) {
+      throw new Error('Source data point value is invalid');
+    }
+    if (item.unit !== undefined) requireStringValue(item.unit, 'source data point unit');
+    if (item.sourceIds !== undefined) requireStringArray(item.sourceIds, 'source data point sourceIds');
+  }
+  const citationIds = new Set<string>();
+  for (const citationValue of analysis.sourceMap) {
+    const citation = requireRecordValue(citationValue, 'source citation');
+    requireExactKeys(citation, ['sourceId', 'title', 'locator', ...(citation.url === undefined ? [] : ['url'])], 'source citation');
+    const sourceId = requireStringValue(citation.sourceId, 'source citation sourceId');
+    requireIdentifier(sourceId, 'source id');
+    if (citationIds.has(sourceId)) throw new Error('Source analysis citations must be unique');
+    citationIds.add(sourceId);
+    requireStringValue(citation.title, 'source citation title');
+    requireStringValue(citation.locator, 'source citation locator');
+    if (citation.url !== undefined) requireStringValue(citation.url, 'source citation url');
+  }
+}
+
+function validateOutlineValue(value: unknown): asserts value is PptOutline {
+  const outline = requireRecordValue(value, 'outline');
+  requireExactKeys(outline, ['title', 'slides'], 'outline');
+  requireStringValue(outline.title, 'outline title');
+  if (!Array.isArray(outline.slides) || outline.slides.length === 0) throw new Error('Outline slides are required');
+  const ids = new Set<string>();
+  for (const slideValue of outline.slides) {
+    const slide = requireRecordValue(slideValue, 'outline slide');
+    requireExactKeys(slide, ['id', 'title', 'purpose',
+      ...(slide.sourceIds === undefined ? [] : ['sourceIds']),
+      ...(slide.findingIds === undefined ? [] : ['findingIds']),
+      ...(slide.dataPointIds === undefined ? [] : ['dataPointIds'])], 'outline slide');
+    const id = requireStringValue(slide.id, 'outline slide id');
+    requireIdentifier(id, 'slide id');
+    if (ids.has(id)) throw new Error('Outline slide identifiers must be unique');
+    ids.add(id);
+    requireStringValue(slide.title, 'outline slide title');
+    requireStringValue(slide.purpose, 'outline slide purpose');
+    if (slide.sourceIds !== undefined) requireStringArray(slide.sourceIds, 'outline slide sourceIds');
+    if (slide.findingIds !== undefined) requireStringArray(slide.findingIds, 'outline slide findingIds');
+    if (slide.dataPointIds !== undefined) requireStringArray(slide.dataPointIds, 'outline slide dataPointIds');
+  }
+}
+
+function validateSlideSpecsValue(value: unknown): asserts value is readonly SlideSpec[] {
+  if (!Array.isArray(value) || value.length === 0) throw new Error('Slide specs must be a non-empty array');
+  const ids = new Set<string>();
+  for (const specValue of value) {
+    const spec = requireRecordValue(specValue, 'slide spec');
+    requireExactKeys(spec, ['id', 'title', 'body', 'tables', 'charts', 'shapes', 'sourceMap', 'imageGenerationBrief',
+      ...(spec.findingIds === undefined ? [] : ['findingIds']),
+      ...(spec.dataPointIds === undefined ? [] : ['dataPointIds'])], 'slide spec');
+    const id = requireStringValue(spec.id, 'slide spec id');
+    requireIdentifier(id, 'slide id');
+    if (ids.has(id)) throw new Error('Slide spec identifiers must be unique');
+    ids.add(id);
+    requireStringValue(spec.title, 'slide spec title');
+    requireStringArray(spec.body, 'slide spec body');
+    if (spec.findingIds !== undefined) requireStringArray(spec.findingIds, 'slide spec findingIds');
+    if (spec.dataPointIds !== undefined) requireStringArray(spec.dataPointIds, 'slide spec dataPointIds');
+    if (!Array.isArray(spec.tables) || !Array.isArray(spec.charts) || !Array.isArray(spec.shapes)
+      || !Array.isArray(spec.sourceMap)) throw new Error('Slide spec nested collections are invalid');
+    requireStringValue(spec.imageGenerationBrief, 'slide spec imageGenerationBrief');
+    const nestedIds = new Set<string>();
+    for (const tableValue of spec.tables) {
+      const table = requireRecordValue(tableValue, 'slide table');
+      requireExactKeys(table, ['id', 'headers', 'rows'], 'slide table');
+      const nestedId = requireStringValue(table.id, 'slide table id');
+      requireIdentifier(nestedId, 'slide object id');
+      if (nestedIds.has(nestedId)) throw new Error('Slide nested identifiers must be unique');
+      nestedIds.add(nestedId);
+      const headers = requireStringArray(table.headers, 'slide table headers');
+      if (!Array.isArray(table.rows) || !table.rows.every((row) => Array.isArray(row)
+        && row.length === headers.length && row.every((cell) => typeof cell === 'string'))) {
+        throw new Error('Slide table rows are invalid');
+      }
+    }
+    for (const chartValue of spec.charts) {
+      const chart = requireRecordValue(chartValue, 'slide chart');
+      requireExactKeys(chart, ['id', 'type', 'categories', 'series'], 'slide chart');
+      const nestedId = requireStringValue(chart.id, 'slide chart id');
+      requireIdentifier(nestedId, 'slide object id');
+      if (nestedIds.has(nestedId)) throw new Error('Slide nested identifiers must be unique');
+      nestedIds.add(nestedId);
+      if (!['bar', 'line', 'pie'].includes(String(chart.type))) throw new Error('Slide chart type is invalid');
+      const categories = requireStringArray(chart.categories, 'slide chart categories');
+      if (!Array.isArray(chart.series) || !chart.series.every((seriesValue) => {
+        if (!isRecordValue(seriesValue)) return false;
+        try { requireExactKeys(seriesValue, ['name', 'values'], 'chart series'); } catch { return false; }
+        return typeof seriesValue.name === 'string' && Array.isArray(seriesValue.values)
+          && seriesValue.values.length === categories.length && seriesValue.values.every(Number.isFinite);
+      })) throw new Error('Slide chart series are invalid');
+    }
+    for (const shapeValue of spec.shapes) {
+      const shape = requireRecordValue(shapeValue, 'slide shape');
+      requireExactKeys(shape, ['id', 'type', 'x', 'y', 'w', 'h',
+        ...(shape.fill === undefined ? [] : ['fill']), ...(shape.line === undefined ? [] : ['line']),
+        ...(shape.text === undefined ? [] : ['text'])], 'slide shape');
+      const nestedId = requireStringValue(shape.id, 'slide shape id');
+      requireIdentifier(nestedId, 'slide object id');
+      if (nestedIds.has(nestedId)) throw new Error('Slide nested identifiers must be unique');
+      nestedIds.add(nestedId);
+      if (!['rect', 'ellipse', 'line'].includes(String(shape.type))
+        || ![shape.x, shape.y, shape.w, shape.h].every((number) => typeof number === 'number' && Number.isFinite(number) && number >= 0)) {
+        throw new Error('Slide shape geometry is invalid');
+      }
+      for (const optional of [shape.fill, shape.line, shape.text]) {
+        if (optional !== undefined && typeof optional !== 'string') throw new Error('Slide shape style is invalid');
+      }
+    }
+    for (const citation of spec.sourceMap) validateCitationValue(citation);
+  }
+}
+
+function validateCitationValue(value: unknown): void {
+  const citation = requireRecordValue(value, 'slide citation');
+  requireExactKeys(citation, ['sourceId', 'title', 'locator', ...(citation.url === undefined ? [] : ['url'])], 'slide citation');
+  requireIdentifier(requireStringValue(citation.sourceId, 'slide citation sourceId'), 'source id');
+  requireStringValue(citation.title, 'slide citation title');
+  requireStringValue(citation.locator, 'slide citation locator');
+  if (citation.url !== undefined) requireStringValue(citation.url, 'slide citation url');
+}
+
+function validateQaPreparationValue(value: unknown): asserts value is NativeQaPreparation {
+  const preparation = requireRecordValue(value, 'QA preparation');
+  if (preparation.status === 'blocked' || preparation.status === 'failed') {
+    requireExactKeys(preparation, ['status', 'issue', ...(preparation.capability === undefined ? [] : ['capability'])], 'QA preparation');
+    requireStringValue(preparation.issue, 'QA issue');
+    if (preparation.capability !== undefined && !['libreoffice', 'pdf-renderer', 'qa-rendering'].includes(String(preparation.capability))) {
+      throw new Error('QA capability is invalid');
+    }
+    return;
+  }
+  if (preparation.status !== 'ready') throw new Error('QA preparation status is invalid');
+  requireExactKeys(preparation, ['status', 'sofficePath', 'rendererPath', 'pptxBase64', 'pdfBase64',
+    'renderedPages', 'approvedVisuals', 'fontAvailability'], 'QA preparation');
+  requireStringValue(preparation.sofficePath, 'QA sofficePath');
+  requireStringValue(preparation.rendererPath, 'QA rendererPath');
+  requireBase64Value(preparation.pptxBase64, 'QA pptxBase64');
+  requireBase64Value(preparation.pdfBase64, 'QA pdfBase64');
+  if (!Array.isArray(preparation.renderedPages) || !Array.isArray(preparation.approvedVisuals)) {
+    throw new Error('QA page collections are invalid');
+  }
+  for (const pageValue of preparation.renderedPages) {
+    const page = requireRecordValue(pageValue, 'QA rendered page');
+    requireExactKeys(page, ['fileName', 'contentsBase64'], 'QA rendered page');
+    requireStringValue(page.fileName, 'QA rendered page fileName');
+    requireBase64Value(page.contentsBase64, 'QA rendered page contents');
+  }
+  for (const visualValue of preparation.approvedVisuals) {
+    const visual = requireRecordValue(visualValue, 'QA approved visual');
+    requireExactKeys(visual, ['slideId', 'relativePath', 'contentsBase64'], 'QA approved visual');
+    requireIdentifier(requireStringValue(visual.slideId, 'QA visual slideId'), 'slide id');
+    requireStringValue(visual.relativePath, 'QA visual relativePath');
+    requireBase64Value(visual.contentsBase64, 'QA visual contents');
+  }
+  const fonts = requireRecordValue(preparation.fontAvailability, 'QA fontAvailability');
+  if (Object.values(fonts).some((available) => typeof available !== 'boolean')) throw new Error('QA font availability is invalid');
+}
+
+function validateVersionValue(value: unknown, projectId: string, expectedId: string, sequence: number): void {
+  const version = requireRecordValue(value, 'version');
+  requireExactKeys(version, ['id', 'projectId', 'sequence', 'status', 'createdAt', 'frozenAt'], 'version');
+  if (version.id !== expectedId || version.projectId !== projectId || version.sequence !== sequence
+    || !['draft', 'frozen'].includes(String(version.status)) || typeof version.createdAt !== 'string'
+    || (version.status === 'draft' && version.frozenAt !== null)
+    || (version.status === 'frozen' && typeof version.frozenAt !== 'string')) {
+    throw new Error('Version provenance is invalid');
+  }
+}
+
+function validateSourceAnalysisReferences(analysis: SourceAnalysis, sourceIds: ReadonlySet<string>): void {
+  const cited = new Set(analysis.sourceMap.map(({ sourceId }) => sourceId));
+  for (const sourceId of cited) if (!sourceIds.has(sourceId)) throw new Error('Analysis cites an unattached source');
+  for (const item of [...analysis.findings, ...analysis.dataPoints]) {
+    for (const sourceId of item.sourceIds ?? []) {
+      if (!sourceIds.has(sourceId) || !cited.has(sourceId)) throw new Error('Analysis evidence references an unattached source');
+    }
+  }
+}
+
+function validateOutlineReferences(outline: PptOutline, analysis: SourceAnalysis): void {
+  const sources = new Set(analysis.sourceMap.map(({ sourceId }) => sourceId));
+  const findings = new Set(analysis.findings.map(({ id }) => id));
+  const dataPoints = new Set(analysis.dataPoints.map(({ id }) => id));
+  for (const slide of outline.slides) {
+    if ((slide.sourceIds ?? []).some((id) => !sources.has(id))
+      || (slide.findingIds ?? []).some((id) => !findings.has(id))
+      || (slide.dataPointIds ?? []).some((id) => !dataPoints.has(id))) {
+      throw new Error('Outline provenance references unknown analysis evidence');
+    }
+  }
+}
+
+function validateSlideSpecReferences(specs: readonly SlideSpec[], analysis: SourceAnalysis): void {
+  const sources = new Set(analysis.sourceMap.map(({ sourceId }) => sourceId));
+  const findings = new Set(analysis.findings.map(({ id }) => id));
+  const dataPoints = new Set(analysis.dataPoints.map(({ id }) => id));
+  for (const spec of specs) {
+    if (spec.sourceMap.some(({ sourceId }) => !sources.has(sourceId))
+      || (spec.findingIds ?? []).some((id) => !findings.has(id))
+      || (spec.dataPointIds ?? []).some((id) => !dataPoints.has(id))) {
+      throw new Error('Slide-spec provenance references unknown analysis evidence');
+    }
+  }
+}
+
+function validateCheckpointShape(value: NativePptPipeline, specIds: ReadonlySet<string>): void {
+  let effective = value.project.workflowStatus;
+  if (value.project.workflowStatus === 'blocked') {
+    const blocked = requireRecordValue(value.blockedCondition, 'blocked condition');
+    requireExactKeys(blocked, ['kind', 'capability', 'recoverable', 'resumeStage', 'message',
+      ...(blocked.slideId === undefined ? [] : ['slideId'])], 'blocked condition');
+    if (blocked.kind !== 'capability_unavailable' || blocked.recoverable !== true
+      || !['visual_review', 'qa'].includes(String(blocked.resumeStage))
+      || !['image_gen.imagegen', 'libreoffice', 'pdf-renderer', 'qa-rendering'].includes(String(blocked.capability))
+      || typeof blocked.message !== 'string') throw new Error('Blocked checkpoint is invalid');
+    effective = blocked.resumeStage as WorkflowStatus;
+    if (effective === 'visual_review' && (blocked.capability !== 'image_gen.imagegen'
+      || typeof blocked.slideId !== 'string' || blocked.slideId !== value.currentSlideId)) {
+      throw new Error('Visual blocked checkpoint provenance is invalid');
+    }
+    if (effective === 'qa' && blocked.slideId !== undefined) throw new Error('QA blocked checkpoint cannot bind a slide');
+  } else if (value.blockedCondition !== null) {
+    throw new Error('Non-blocked project cannot retain a blocked condition');
+  }
+  const rank = ['intake', 'source_analysis', 'outline_review', 'detail_review', 'visual_review', 'conversion', 'qa', 'completed'].indexOf(effective);
+  if (rank < 0) throw new Error('Checkpoint stage is invalid');
+  if ((rank >= 1) !== Boolean(value.analysis)) throw new Error('Checkpoint analysis milestone is inconsistent');
+  if ((rank >= 2) !== Boolean(value.outline)) throw new Error('Checkpoint outline milestone is inconsistent');
+  if (effective === 'outline_review' && value.outline?.version.status !== 'draft') throw new Error('Outline review requires a draft outline');
+  if (rank >= 3 && value.outline?.version.status !== 'frozen') throw new Error('Later checkpoints require a frozen outline');
+  if (rank < 3 && value.slideSpecs !== null) throw new Error('Slide specs exist before detail review');
+  if (effective === 'detail_review' && value.slideSpecs?.version.status === 'frozen') throw new Error('Detail review cannot contain frozen specs');
+  if (rank >= 4 && value.slideSpecs?.version.status !== 'frozen') throw new Error('Later checkpoints require frozen slide specs');
+  if (rank < 4 && (Object.keys(value.visuals).length > 0 || value.currentSlideId !== null)) {
+    throw new Error('Visual state exists before visual review');
+  }
+  if (rank >= 4 && (typeof value.currentSlideId !== 'string' || !specIds.has(value.currentSlideId))) {
+    throw new Error('Visual checkpoint current slide is invalid');
+  }
+  const allVisualsFrozen = [...specIds].every((slideId) => currentVisual(value, slideId)?.version.status === 'frozen');
+  if (rank >= 5 && !allVisualsFrozen) throw new Error('Conversion and later checkpoints require every visual approval');
+  if (rank < 6 && value.exportReceipt !== null) throw new Error('Export receipt exists before QA');
+  if (rank >= 6) validateExportReceiptValue(value);
+  if (rank < 7 && effective !== 'qa' && value.qaReport !== null) throw new Error('QA report exists before QA');
+  if (effective === 'qa' && value.project.workflowStatus !== 'blocked' && value.qaReport !== null) {
+    throw new Error('Active QA checkpoint cannot contain a prior report');
+  }
+  if (value.project.workflowStatus === 'blocked' && effective === 'qa') {
+    validateQaReportValue(value, false);
+  } else if (effective === 'completed') {
+    validateQaReportValue(value, true);
+  } else if (value.qaReport !== null) {
+    throw new Error('Checkpoint contains an unexpected QA report');
+  }
+}
+
+function validateExportReceiptValue(value: NativePptPipeline): void {
+  const receipt = requireRecordValue(value.exportReceipt, 'export receipt') as unknown as NativeExportReceipt;
+  requireExactKeys(receipt as unknown as Record<string, unknown>, [
+    'relativePath', 'sha256', 'byteLength', 'specVersionId', 'visualVersionIds',
+  ], 'export receipt');
+  if (!value.slideSpecs || receipt.relativePath !== `exports/${basename(receipt.relativePath)}`
+    || !/\.pptx$/i.test(receipt.relativePath) || !/^[a-f0-9]{64}$/.test(receipt.sha256)
+    || !Number.isSafeInteger(receipt.byteLength) || receipt.byteLength <= 0
+    || receipt.specVersionId !== value.slideSpecs.version.id) throw new Error('Export receipt provenance is invalid');
+  const visualIds = requireRecordValue(receipt.visualVersionIds, 'export visual versions');
+  const specs = value.slideSpecs.value;
+  if (Object.keys(visualIds).length !== specs.length || specs.some(({ id }) => visualIds[id] !== currentVisual(value, id)?.version.id)) {
+    throw new Error('Export receipt visual provenance is invalid');
+  }
+}
+
+function validateQaReportValue(value: NativePptPipeline, mustPass: boolean): void {
+  const report = requireRecordValue(value.qaReport, 'QA report') as unknown as LibreOfficeQaReport;
+  const receipt = value.exportReceipt!;
+  if (report.projectId !== value.project.id || report.exportPath !== receipt.relativePath
+    || report.exportSha256 !== receipt.sha256 || report.specVersionId !== receipt.specVersionId
+    || JSON.stringify(report.visualVersionIds) !== JSON.stringify(receipt.visualVersionIds)
+    || !Number.isSafeInteger(report.round) || report.round < 1
+    || report.expectedPageCount !== value.slideSpecs!.value.length
+    || !Array.isArray(report.renderedPages) || !Array.isArray(report.blankPages)
+    || !Array.isArray(report.comparisons) || !Array.isArray(report.issues)
+    || report.jsonReportPath !== `qa/qa-round-${report.round}.json`
+    || report.textReportPath !== `qa/qa-round-${report.round}.txt`) {
+    throw new Error('QA report provenance is invalid');
+  }
+  if (mustPass) {
+    const approvedPaths = value.slideSpecs!.value.map(({ id }) => currentVisual(value, id)!.relativePath);
+    if (report.status !== 'passed' || report.actualPageCount !== report.expectedPageCount
+      || report.renderedPages.length !== report.expectedPageCount
+      || report.comparisons.length !== report.expectedPageCount || report.blankPages.length !== 0
+      || report.issues.length !== 0 || !report.sofficePath || !report.rendererPath || !report.pdfPath
+      || report.comparisons.some((comparison, index) => comparison.blank
+        || comparison.approvedVisualPath !== approvedPaths[index]
+        || typeof comparison.differenceScore !== 'number' || comparison.differenceScore > 0.6)) {
+      throw new Error('Completed checkpoint lacks a passing QA proof');
+    }
+  } else if (!['blocked', 'failed'].includes(report.status)) {
+    throw new Error('Blocked QA checkpoint has an invalid report status');
+  }
+}
+
+async function validateRestoredPipeline(value: NativePptPipeline): Promise<void> {
+  const expected = value.project.workflowStatus === 'blocked'
+    ? value.blockedCondition!.resumeStage
+    : value.project.workflowStatus;
+  await replayPipeline(value, expected);
+}
+
 function validatePipeline(value: NativePptPipeline): void {
-  if (!value || value.schemaVersion !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 1) {
+  if (!isRecordValue(value) || value.schemaVersion !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 1) {
     throw new Error('Native PPT pipeline schema is invalid');
   }
+  requireExactKeys(value, [
+    'schemaVersion', 'revision', 'project', 'preferenceSnapshot', 'sources', 'analysis',
+    'outline', 'slideSpecs', 'visuals', 'currentSlideId', 'approvals', 'tasks',
+    'blockedCondition', 'exportReceipt', 'qaReport',
+  ], 'pipeline');
+  const project = requireRecordValue(value.project, 'project');
+  requireExactKeys(project, ['id', 'name', 'goal', 'workflowStatus', 'createdAt', 'updatedAt'], 'project');
   requireIdentifier(value.project.id, 'project id');
   requireNonEmpty(value.project.name, 'project name');
   requireNonEmpty(value.project.goal, 'project goal');
-  if (!Array.isArray(value.sources) || !Array.isArray(value.approvals) || !Array.isArray(value.tasks)) {
+  requireStringValue(value.project.createdAt, 'project.createdAt');
+  requireStringValue(value.project.updatedAt, 'project.updatedAt');
+  const stages = ['intake', 'source_analysis', 'outline_review', 'detail_review', 'visual_review', 'conversion', 'qa', 'completed', 'blocked'];
+  if (!stages.includes(value.project.workflowStatus)) throw new Error('Native PPT workflow status is invalid');
+  if (!Array.isArray(value.preferenceSnapshot) || !Array.isArray(value.sources)
+    || !Array.isArray(value.approvals) || !Array.isArray(value.tasks)) {
     throw new Error('Native PPT pipeline collections are invalid');
+  }
+  const preferenceIds = new Set<string>();
+  for (const preference of value.preferenceSnapshot) {
+    const item = requireRecordValue(preference, 'preference snapshot');
+    requireExactKeys(item, ['proposalId', 'title', 'content', 'approvedAt'], 'preference snapshot');
+    const proposalId = requireStringValue(item.proposalId, 'preference proposalId');
+    if (preferenceIds.has(proposalId)) throw new Error('Preference snapshot identifiers must be unique');
+    preferenceIds.add(proposalId);
+    requireStringValue(item.title, 'preference title');
+    requireStringValue(item.content, 'preference content');
+    requireStringValue(item.approvedAt, 'preference approvedAt');
   }
   const ids = new Set<string>();
   for (const source of value.sources) {
+    const item = requireRecordValue(source, 'source');
+    requireExactKeys(item, ['id', 'fileName', 'mediaType', 'relativePath', 'sha256', 'byteLength'], 'source');
     requireIdentifier(source.id, 'source id');
-    if (ids.has(source.id) || basename(source.fileName) !== source.fileName || !/^[a-f0-9]{64}$/.test(source.sha256)) {
+    if (ids.has(source.id) || basename(source.fileName) !== source.fileName
+      || !source.relativePath.startsWith('sources/') || basename(source.relativePath) === source.relativePath
+      || !/^[a-f0-9]{64}$/.test(source.sha256)
+      || !Number.isSafeInteger(source.byteLength) || source.byteLength < 0
+      || typeof source.mediaType !== 'string' || source.mediaType.length === 0) {
       throw new Error('Native source metadata is invalid');
     }
     ids.add(source.id);
   }
+
+  if (value.analysis) {
+    const analysis = requireRecordValue(value.analysis, 'analysis');
+    requireExactKeys(analysis, ['requestId', 'output', 'artifactRelativePath', 'sha256'], 'analysis');
+    requireIdentifier(value.analysis.requestId, 'request id');
+    validateSourceAnalysisValue(value.analysis.output);
+    validateSourceAnalysisReferences(value.analysis.output, ids);
+    const expectedPath = `sources/${value.analysis.requestId}-analysis.json`;
+    if (value.analysis.artifactRelativePath !== expectedPath) throw new Error('Analysis artifact path is invalid');
+    const expectedHash = hash(jsonBytes({
+      projectId: value.project.id,
+      requestId: value.analysis.requestId,
+      sourceIds: value.sources.map(({ id }) => id),
+      output: value.analysis.output,
+    }));
+    if (value.analysis.sha256 !== expectedHash) throw new Error('Analysis evidence hash is invalid');
+  }
+
+  if (value.outline) {
+    const outline = requireRecordValue(value.outline, 'outline version');
+    requireExactKeys(outline, ['version', 'value'], 'outline version');
+    validateVersionValue(value.outline.version, value.project.id, `${value.project.id}-outline-v1`, 1);
+    validateOutlineValue(value.outline.value);
+    if (!value.analysis) throw new Error('Outline requires validated source analysis');
+    validateOutlineReferences(value.outline.value, value.analysis.output);
+  }
+
+  if (value.slideSpecs) {
+    const details = requireRecordValue(value.slideSpecs, 'slide-spec version');
+    requireExactKeys(details, ['version', 'value'], 'slide-spec version');
+    validateVersionValue(value.slideSpecs.version, value.project.id, `${value.project.id}-slide-specs-v1`, 1);
+    validateSlideSpecsValue(value.slideSpecs.value);
+    if (!value.outline || value.outline.version.status !== 'frozen' || !value.analysis) {
+      throw new Error('Slide specs require a frozen outline and source analysis');
+    }
+    const outlineIds = value.outline.value.slides.map(({ id }) => id);
+    const specIds = value.slideSpecs.value.map(({ id }) => id);
+    if (outlineIds.length !== specIds.length || outlineIds.some((id, index) => id !== specIds[index])) {
+      throw new Error('Slide specs must preserve the approved outline order and identifiers');
+    }
+    validateSlideSpecReferences(value.slideSpecs.value, value.analysis.output);
+  }
+
+  const visualRecord = requireRecordValue(value.visuals, 'visuals');
+  const specIds = new Set(value.slideSpecs?.value.map(({ id }) => id) ?? []);
+  const frozenVisualKeys = new Set<string>();
+  let draftVisualCount = 0;
+  for (const [slideId, historyValue] of Object.entries(visualRecord)) {
+    if (!specIds.has(slideId) || !Array.isArray(historyValue) || historyValue.length === 0) {
+      throw new Error('Visual history references an unknown slide');
+    }
+    historyValue.forEach((entry, index) => {
+      const visual = requireRecordValue(entry, 'visual version') as unknown as NativeVisualVersion;
+      requireExactKeys(visual as unknown as Record<string, unknown>, [
+        'slideId', 'version', 'relativePath', 'sha256', 'byteLength', 'usage', 'textFree', 'altText',
+      ], 'visual version');
+      if (visual.slideId !== slideId) throw new Error('Visual slide identifier is inconsistent');
+      const sequence = index + 1;
+      validateVersionValue(visual.version, value.project.id, `${value.project.id}-visual-${slideId}-v${sequence}`, sequence);
+      if (!['full_slide_reference', 'text_free_background', 'complex_visual'].includes(visual.usage)
+        || typeof visual.textFree !== 'boolean' || typeof visual.altText !== 'string') {
+        throw new Error('Visual metadata is invalid');
+      }
+      if (visual.version.status === 'frozen') {
+        if (visual.relativePath !== `visuals/${slideId}-v${sequence}.png`
+          || !/^[a-f0-9]{64}$/.test(visual.sha256)
+          || !Number.isSafeInteger(visual.byteLength) || visual.byteLength <= 0) {
+          throw new Error('Frozen visual artifact provenance is invalid');
+        }
+        frozenVisualKeys.add(`visual_review|${visual.version.id}|${slideId}`);
+      } else {
+        draftVisualCount += 1;
+        if (index !== historyValue.length - 1) throw new Error('Only the current visual version may remain draft');
+        const placeholder = visual.relativePath === '' && visual.sha256 === '' && visual.byteLength === 0;
+        const candidate = visual.relativePath === `visuals/${slideId}-v${sequence}.png`
+          && /^[a-f0-9]{64}$/.test(visual.sha256)
+          && Number.isSafeInteger(visual.byteLength) && visual.byteLength > 0;
+        if (!placeholder && !candidate) throw new Error('Draft visual artifact provenance is invalid');
+      }
+    });
+  }
+  if (draftVisualCount > 1) throw new Error('Only one visual draft may be active');
+
+  const expectedApprovalKeys = new Set<string>();
+  if (value.outline?.version.status === 'frozen') expectedApprovalKeys.add(`outline_review|${value.outline.version.id}|`);
+  if (value.slideSpecs?.version.status === 'frozen') expectedApprovalKeys.add(`detail_review|${value.slideSpecs.version.id}|`);
+  for (const key of frozenVisualKeys) expectedApprovalKeys.add(key);
+  const approvalIds = new Set<string>();
+  const actualApprovalKeys = new Set<string>();
+  for (const approvalValue of value.approvals) {
+    const approval = requireRecordValue(approvalValue, 'approval') as unknown as Approval;
+    requireExactKeys(approval as unknown as Record<string, unknown>, [
+      'id', 'projectId', 'versionId', 'stage', 'status', 'decidedAt', ...(approval.slideId === undefined ? [] : ['slideId']),
+    ], 'approval');
+    if (typeof approval.id !== 'string' || approvalIds.has(approval.id)
+      || approval.projectId !== value.project.id || approval.status !== 'approved'
+      || !['outline_review', 'detail_review', 'visual_review'].includes(approval.stage)
+      || typeof approval.versionId !== 'string' || typeof approval.decidedAt !== 'string') {
+      throw new Error('Approval provenance is invalid');
+    }
+    approvalIds.add(approval.id);
+    actualApprovalKeys.add(`${approval.stage}|${approval.versionId}|${approval.slideId ?? ''}`);
+  }
+  if (actualApprovalKeys.size !== expectedApprovalKeys.size
+    || [...expectedApprovalKeys].some((key) => !actualApprovalKeys.has(key))) {
+    throw new Error('Approvals do not exactly match frozen versions');
+  }
+
+  const taskIds = new Set<string>();
+  for (const taskValue of value.tasks) {
+    const task = requireRecordValue(taskValue, 'task') as unknown as NativeTaskRecord;
+    requireExactKeys(task as unknown as Record<string, unknown>, [
+      'id', 'kind', 'status', 'createdAt', 'updatedAt', 'error',
+    ], 'task');
+    if (typeof task.id !== 'string' || taskIds.has(task.id)
+      || !['source_analysis', 'outline_generation', 'detail_generation', 'visual_generation', 'conversion', 'qa'].includes(task.kind)
+      || !['queued', 'running', 'completed', 'blocked', 'failed'].includes(task.status)
+      || typeof task.createdAt !== 'string' || typeof task.updatedAt !== 'string'
+      || (task.error !== null && typeof task.error !== 'string')) {
+      throw new Error('Task record is invalid');
+    }
+    taskIds.add(task.id);
+  }
+
+  validateCheckpointShape(value, specIds);
 }
 
 function requireCurrentSlide(state: NativePptPipeline, slideId: string): void {
@@ -940,7 +1534,17 @@ function hash(contents: Uint8Array): string {
 }
 
 function jsonBytes(value: unknown): Uint8Array {
-  return new TextEncoder().encode(`${JSON.stringify(value, null, 2)}\n`);
+  return new TextEncoder().encode(`${JSON.stringify(canonicalJson(value), null, 2)}\n`);
+}
+
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (isRecordValue(value)) {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, canonicalJson(value[key])]),
+    );
+  }
+  return value;
 }
 
 function requireIdentifier(value: string, field: string): void {

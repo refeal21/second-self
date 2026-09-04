@@ -29,6 +29,17 @@ pnpm --filter @digital-twin/desktop tauri build --bundles app
 
 不要删除单轮目录中的 PDF、rendered PNG、comparison PNG 或 JSON 后继续复用 receipt；恢复逻辑会校验路径、字节与哈希并拒绝不完整证据。可删除整个忽略提交的 Golden 输出目录后重新运行 `pnpm golden:qa`。
 
+## 生产 harness 失败
+
+先确认最新 `.app`、Golden 产物、LibreOffice 和 pdftoppm 均存在，再重新运行：
+
+```bash
+pnpm build:production-harness
+pnpm harness:production
+```
+
+`production-harness` 与 RSS sampler 只在 `acceptance-harness` Cargo feature 下构建，不会打包进 `.app`。harness 必须使用 `.app/Contents/MacOS/digital-twin-worker`，如果只看到 TypeScript Worker 或内存假数据库，应视为无效验收。失败现场保留在 `artifacts/qa/production-harness/`；不要用复制 Golden 渲染图的方式绕过 LibreOffice/pdftoppm。
+
 ## 工作区路径被拒绝
 
 工作区内禁止 `..`、绝对逃逸、已有或断裂符号链接，以及运行中被替换成链接的父目录。这是安全边界，不应通过关闭校验绕过。将材料复制到真实的工作区子目录，或在设置中选择一个不经过符号链接的目录。

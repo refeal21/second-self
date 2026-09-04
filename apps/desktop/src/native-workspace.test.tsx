@@ -1,7 +1,7 @@
 /* @vitest-environment jsdom */
 
 import '@testing-library/jest-dom/vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { createNativePipeline, type NativePptPipeline } from '../../worker/src/native-pipeline.js';
@@ -54,5 +54,88 @@ describe('native PPT QA workspace', () => {
     expect(runProjectQa).toHaveBeenCalledWith(initial.project.id);
     expect(await screen.findByText('交付完成')).toBeInTheDocument();
     expect(screen.getByText(/qa\/qa-round-1\.txt/)).toBeInTheDocument();
+  });
+
+  it('edits, saves, and approves the whole outline through the production adapter contract', async () => {
+    const user = userEvent.setup();
+    const initial = createNativePipeline({
+      id: 'project-outline-ui', name: '经营复盘', goal: '管理层决策',
+      createdAt: '2026-09-04T00:00:00.000Z',
+    });
+    initial.project.workflowStatus = 'outline_review';
+    initial.outline = {
+      version: { id: 'project-outline-ui-outline-v1', projectId: initial.project.id,
+        sequence: 1, status: 'draft', createdAt: initial.project.createdAt, frozenAt: null },
+      value: { title: '经营复盘', slides: [{ id: 'slide-cover', title: '旧标题',
+        purpose: '建立主题', sourceIds: ['source-kpis'] }] },
+    };
+    const saved = structuredClone(initial);
+    saved.revision = 2;
+    saved.outline!.value.slides[0]!.title = '用户修改后的标题';
+    const approved = structuredClone(saved);
+    approved.revision = 3;
+    approved.outline!.version.status = 'frozen';
+    approved.outline!.version.frozenAt = '2026-09-04T00:02:00.000Z';
+    approved.project.workflowStatus = 'detail_review';
+    const base = createDemoDesktopAdapter();
+    const saveOutline = vi.fn(async () => saved);
+    const approveOutline = vi.fn(async () => approved);
+    const adapter = { ...base, mode: 'tauri' as const,
+      loadProjectPipeline: vi.fn(async () => initial), saveOutline, approveOutline } satisfies DesktopAdapter;
+    render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
+      projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
+
+    const editor = await screen.findByRole('textbox');
+    const edited = structuredClone(initial.outline.value);
+    edited.slides[0]!.title = '用户修改后的标题';
+    fireEvent.change(editor, { target: { value: JSON.stringify(edited) } });
+    await user.click(screen.getByRole('button', { name: '保存修改' }));
+    expect(saveOutline).toHaveBeenCalledWith(initial.project.id, edited);
+    expect(await screen.findByDisplayValue(/用户修改后的标题/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '批准整份大纲' }));
+    expect(approveOutline).toHaveBeenCalledWith(initial.project.id);
+    expect(await screen.findByText('4. 生成全部页面细化')).toBeInTheDocument();
+  });
+
+  it('edits, saves, and approves the whole slide-spec document', async () => {
+    const user = userEvent.setup();
+    const initial = createNativePipeline({
+      id: 'project-details-ui', name: '经营复盘', goal: '管理层决策',
+      createdAt: '2026-09-04T00:00:00.000Z',
+    });
+    initial.project.workflowStatus = 'detail_review';
+    initial.slideSpecs = {
+      version: { id: 'project-details-ui-slide-specs-v1', projectId: initial.project.id,
+        sequence: 1, status: 'draft', createdAt: initial.project.createdAt, frozenAt: null },
+      value: [{ id: 'slide-cover', title: '封面', body: ['旧文案'], tables: [], charts: [],
+        shapes: [], sourceMap: [], imageGenerationBrief: '无文字封面' }],
+    };
+    const saved = structuredClone(initial);
+    saved.revision = 2;
+    saved.slideSpecs!.value[0]!.body = ['用户修改后的文案'];
+    const approved = structuredClone(saved);
+    approved.revision = 3;
+    approved.slideSpecs!.version.status = 'frozen';
+    approved.slideSpecs!.version.frozenAt = '2026-09-04T00:02:00.000Z';
+    approved.project.workflowStatus = 'visual_review';
+    approved.currentSlideId = 'slide-cover';
+    const base = createDemoDesktopAdapter();
+    const saveDetails = vi.fn(async () => saved);
+    const approveDetails = vi.fn(async () => approved);
+    const adapter = { ...base, mode: 'tauri' as const,
+      loadProjectPipeline: vi.fn(async () => initial), saveDetails, approveDetails } satisfies DesktopAdapter;
+    render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
+      projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
+
+    const editor = await screen.findByRole('textbox');
+    const edited = structuredClone(initial.slideSpecs.value);
+    edited[0]!.body = ['用户修改后的文案'];
+    fireEvent.change(editor, { target: { value: JSON.stringify(edited) } });
+    await user.click(screen.getByRole('button', { name: '保存修改' }));
+    expect(saveDetails).toHaveBeenCalledWith(initial.project.id, edited);
+    expect(await screen.findByDisplayValue(/用户修改后的文案/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '批准全部细化' }));
+    expect(approveDetails).toHaveBeenCalledWith(initial.project.id);
+    expect(await screen.findByText(/5\. 逐页视觉/)).toBeInTheDocument();
   });
 });

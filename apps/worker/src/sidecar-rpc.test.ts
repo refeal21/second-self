@@ -131,4 +131,49 @@ describe('worker sidecar JSON-RPC boundary', () => {
     })))!);
     expect(snapshot.result).toEqual(created.result.pipeline);
   });
+
+  it('rejects a forged completed restore atomically and preserves the prior aggregate', async () => {
+    const projectId = 'sidecar-forged-restore';
+    const created = JSON.parse((await handleWorkerRpcLine(JSON.stringify({
+      jsonrpc: '2.0', id: 20, method: 'ppt.project.create',
+      params: { id: projectId, name: '真实检查点', goal: '拒绝伪造恢复',
+        createdAt: '2026-09-04T00:00:00.000Z', preferenceSnapshot: [] },
+    })))!);
+    const forged = structuredClone(created.result.pipeline);
+    forged.project.workflowStatus = 'completed';
+    forged.revision = 99;
+
+    const rejected = JSON.parse((await handleWorkerRpcLine(JSON.stringify({
+      jsonrpc: '2.0', id: 21, method: 'ppt.project.restore', params: { pipeline: forged },
+    })))!);
+    expect(rejected).toMatchObject({ error: { code: -32602 } });
+
+    const snapshot = JSON.parse((await handleWorkerRpcLine(JSON.stringify({
+      jsonrpc: '2.0', id: 22, method: 'ppt.project.snapshot', params: { projectId },
+    })))!);
+    expect(snapshot.result).toEqual(created.result.pipeline);
+  });
+
+  it('rejects unknown and malformed actions without incrementing revision', async () => {
+    const projectId = 'sidecar-invalid-action';
+    const created = JSON.parse((await handleWorkerRpcLine(JSON.stringify({
+      jsonrpc: '2.0', id: 30, method: 'ppt.project.create',
+      params: { id: projectId, name: '动作边界', goal: '拒绝未知动作',
+        createdAt: '2026-09-04T00:00:00.000Z', preferenceSnapshot: [] },
+    })))!);
+    for (const [id, action] of [
+      [31, { kind: 'unknown.action', at: '2026-09-04T00:01:00.000Z' }],
+      [32, { kind: 'visual.approve', at: 123, slideId: false }],
+    ] as const) {
+      const rejected = JSON.parse((await handleWorkerRpcLine(JSON.stringify({
+        jsonrpc: '2.0', id, method: 'ppt.project.execute', params: { projectId, action },
+      })))!);
+      expect(rejected).toMatchObject({ error: { code: -32602 } });
+    }
+    const snapshot = JSON.parse((await handleWorkerRpcLine(JSON.stringify({
+      jsonrpc: '2.0', id: 33, method: 'ppt.project.snapshot', params: { projectId },
+    })))!);
+    expect(snapshot.result.revision).toBe(1);
+    expect(snapshot.result).toEqual(created.result.pipeline);
+  });
 });

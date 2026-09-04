@@ -22,7 +22,11 @@ pnpm typecheck
 pnpm lint
 pnpm golden:qa
 pnpm --filter @digital-twin/desktop tauri build --bundles app
+pnpm build:production-harness
+pnpm harness:production
 ```
+
+最后两条命令执行确定性的生产边界验收：真实前端 Tauri adapter、编译后的 Rust Workbench 服务、SQLite 重启、`.app` 内嵌 Worker SEA、Rust 原子产物写入和真实 LibreOffice/pdftoppm QA。只有 Codex 的结构化生成响应由本地脚本固定，不会调用模型或收费 API。
 
 生成的个人开发构建位于：
 

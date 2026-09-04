@@ -20,11 +20,14 @@ function start() {
   const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
   return {
     child,
-    async call(method, params) {
+    async rawCall(method, params) {
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId++, method, params })}\n`);
       const next = await lines.next();
       if (next.done) throw new Error('Packaged Worker closed stdout');
-      const response = JSON.parse(next.value);
+      return JSON.parse(next.value);
+    },
+    async call(method, params) {
+      const response = await this.rawCall(method, params);
       if (response.error) throw new Error(JSON.stringify(response.error));
       return response.result;
     },
@@ -50,6 +53,39 @@ const sourceInputs = [
 
 let worker = start();
 try {
+  const adversarial = await worker.call('ppt.project.create', {
+    id: 'project-packaged-boundary', name: '打包边界回归', goal: '拒绝跳过审批和未知动作',
+    createdAt: at, preferenceSnapshot: [],
+  });
+  const forged = structuredClone(adversarial.pipeline);
+  forged.project.workflowStatus = 'completed';
+  forged.revision = 99;
+  const forgedResponse = await worker.rawCall('ppt.project.restore', { pipeline: forged });
+  if (forgedResponse.error?.code !== -32602) {
+    throw new Error(`Packaged Worker accepted a forged completed restore: ${JSON.stringify(forgedResponse)}`);
+  }
+  const unknownResponse = await worker.rawCall('ppt.project.execute', {
+    projectId: 'project-packaged-boundary',
+    action: { kind: 'unknown.action', at },
+  });
+  if (unknownResponse.error?.code !== -32602) {
+    throw new Error(`Packaged Worker accepted an unknown action: ${JSON.stringify(unknownResponse)}`);
+  }
+  const malformedResponse = await worker.rawCall('ppt.project.execute', {
+    projectId: 'project-packaged-boundary',
+    action: { kind: 'visual.approve', at: 123, slideId: false },
+  });
+  if (malformedResponse.error?.code !== -32602) {
+    throw new Error(`Packaged Worker accepted a malformed action: ${JSON.stringify(malformedResponse)}`);
+  }
+  const boundarySnapshot = await worker.call('ppt.project.snapshot', {
+    projectId: 'project-packaged-boundary',
+  });
+  if (boundarySnapshot.revision !== adversarial.pipeline.revision
+    || boundarySnapshot.project.workflowStatus !== 'intake') {
+    throw new Error('Packaged Worker mutated state after rejecting adversarial input');
+  }
+
   const created = await worker.call('ppt.project.create', {
     id: 'project-packaged-smoke', name: '五页经营复盘', goal: '验证打包 Worker 完整链路', at,
     createdAt: at, preferenceSnapshot: [],
@@ -112,6 +148,9 @@ try {
     pages: report.actualPageCount,
     distinctApprovedVisuals: new Set(report.comparisons.map(({ approvedVisualPath }) => approvedVisualPath)).size,
     maxDifferenceScore: Math.max(...report.comparisons.map(({ differenceScore }) => differenceScore ?? 1)),
+    forgedRestoreRejectedAtomically: true,
+    unknownActionRejectedAtomically: true,
+    malformedActionRejectedAtomically: true,
     writes: result.writes.map(({ relativePath }) => relativePath),
   }, null, 2)}\n`);
 } finally {

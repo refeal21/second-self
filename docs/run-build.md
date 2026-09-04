@@ -85,3 +85,23 @@ pnpm smoke:packaged-worker
 ```
 
 该命令直接执行 `.app/Contents/MacOS/digital-twin-worker`，走完材料分析结果提交、整份大纲/细化批准、五页顺序视觉批准、进程重启恢复、PPTX 导出和 `deck.qa`，并要求最终状态为 `completed`。它不会调用付费 API；QA 输入来自本地 Golden 产物。
+
+## 打包生产边界验收
+
+先生成 Golden 产物并构建最新 `.app`，然后运行：
+
+```bash
+pnpm build:production-harness
+pnpm harness:production
+```
+
+第一条命令以 `acceptance-harness` Cargo feature 编译 `production-harness` 和原生 RSS sampler；这些测试二进制不会进入最终 `.app`。第二条命令使用生产 `createTauriDesktopAdapter`，通过与 Tauri commands 共用的 Rust Workbench service delegates 执行：项目创建与附件、SQLite 提交和重启、打包 SEA 恢复、两次整份编辑/审批、五页 ImageGen 明确阻塞与用户替换、顺序视觉审批、Rust fd 边界导出，以及真实 LibreOffice/pdftoppm QA。
+
+为保持确定性且不花费模型回合，只有 Codex 的结构化生成响应由本地脚本固定；adapter、Worker、Rust、SQLite、文件写入和 QA 都使用生产实现。结果写入：
+
+```text
+artifacts/qa/production-harness/result.json
+artifacts/qa/production-harness/memory.json
+```
+
+项目 ID 每次运行都会重新生成，因此 PPTX 和 QA 报告的精确绝对路径以 `result.json` 的 `exportPath` 与 `readableReportPath` 为准。

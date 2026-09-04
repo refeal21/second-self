@@ -16,7 +16,14 @@ pub fn ppt_load_pipeline(
     state: State<'_, WorkbenchService>,
     project_id: String,
 ) -> Result<serde_json::Value, String> {
-    state.load_pipeline(&project_id)
+    ppt_load_pipeline_service(&state, project_id)
+}
+
+pub fn ppt_load_pipeline_service(
+    service: &WorkbenchService,
+    project_id: String,
+) -> Result<serde_json::Value, String> {
+    service.load_pipeline(&project_id)
 }
 
 #[tauri::command]
@@ -24,7 +31,14 @@ pub fn ppt_project_directory(
     state: State<'_, WorkbenchService>,
     project_id: String,
 ) -> Result<String, String> {
-    state.project_directory(&project_id)
+    ppt_project_directory_service(&state, project_id)
+}
+
+pub fn ppt_project_directory_service(
+    service: &WorkbenchService,
+    project_id: String,
+) -> Result<String, String> {
+    service.project_directory(&project_id)
 }
 
 #[tauri::command]
@@ -33,7 +47,15 @@ pub fn ppt_read_artifact(
     project_id: String,
     relative_path: String,
 ) -> Result<String, String> {
-    state.read_artifact(&project_id, &relative_path)
+    ppt_read_artifact_service(&state, project_id, relative_path)
+}
+
+pub fn ppt_read_artifact_service(
+    service: &WorkbenchService,
+    project_id: String,
+    relative_path: String,
+) -> Result<String, String> {
+    service.read_artifact(&project_id, &relative_path)
 }
 
 #[tauri::command]
@@ -41,7 +63,14 @@ pub fn ppt_prepare_qa(
     state: State<'_, WorkbenchService>,
     project_id: String,
 ) -> Result<serde_json::Value, String> {
-    state.prepare_qa(&project_id)
+    ppt_prepare_qa_service(&state, project_id)
+}
+
+pub fn ppt_prepare_qa_service(
+    service: &WorkbenchService,
+    project_id: String,
+) -> Result<serde_json::Value, String> {
+    service.prepare_qa(&project_id)
 }
 
 #[tauri::command]
@@ -49,7 +78,14 @@ pub fn ppt_attach_source(
     state: State<'_, WorkbenchService>,
     input: AttachSourceInput,
 ) -> Result<serde_json::Value, String> {
-    state.attach_source(input)
+    ppt_attach_source_service(&state, input)
+}
+
+pub fn ppt_attach_source_service(
+    service: &WorkbenchService,
+    input: AttachSourceInput,
+) -> Result<serde_json::Value, String> {
+    service.attach_source(input)
 }
 
 #[tauri::command]
@@ -57,7 +93,14 @@ pub fn ppt_commit_pipeline(
     state: State<'_, WorkbenchService>,
     input: PipelineCommitInput,
 ) -> Result<serde_json::Value, String> {
-    state.commit_pipeline(input)
+    ppt_commit_pipeline_service(&state, input)
+}
+
+pub fn ppt_commit_pipeline_service(
+    service: &WorkbenchService,
+    input: PipelineCommitInput,
+) -> Result<serde_json::Value, String> {
+    service.commit_pipeline(input)
 }
 
 #[derive(Serialize)]
@@ -69,7 +112,13 @@ pub struct MessageResult {
 pub fn load_desktop_state(
     state: State<'_, WorkbenchService>,
 ) -> Result<DesktopInitialState, String> {
-    state.initial_state()
+    load_desktop_state_service(&state)
+}
+
+pub fn load_desktop_state_service(
+    service: &WorkbenchService,
+) -> Result<DesktopInitialState, String> {
+    service.initial_state()
 }
 
 #[tauri::command]
@@ -77,7 +126,14 @@ pub fn ppt_create_project(
     state: State<'_, WorkbenchService>,
     input: CreateProjectInput,
 ) -> Result<ProjectSummary, String> {
-    state.create_project(input)
+    ppt_create_project_service(&state, input)
+}
+
+pub fn ppt_create_project_service(
+    service: &WorkbenchService,
+    input: CreateProjectInput,
+) -> Result<ProjectSummary, String> {
+    service.create_project(input)
 }
 
 #[tauri::command]
@@ -168,8 +224,16 @@ pub fn memory_propose(
     title: String,
     content: String,
 ) -> Result<StatusResult, String> {
+    memory_propose_service(&state, title, content)
+}
+
+pub fn memory_propose_service(
+    service: &WorkbenchService,
+    title: String,
+    content: String,
+) -> Result<StatusResult, String> {
     Ok(StatusResult {
-        status: state.propose_memory(title, content)?,
+        status: service.propose_memory(title, content)?,
     })
 }
 

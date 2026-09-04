@@ -142,3 +142,52 @@ Status: implemented and verified against every finding in `task-5-review-finding
 - This Codex environment does not expose ImageGen. The production flow therefore proves the required recoverable block and user-replacement continuation; there is no API-key or paid fallback.
 - Keynote is installed, but the human open/edit checklist remains for the user. Microsoft PowerPoint compatibility was not tested.
 - The personal `.app` is ad-hoc/unsigned and not notarized, exactly as scoped; strict deep signature verification is not claimed.
+
+## 5E fix round 2 — authoritative final acceptance
+
+This section supersedes the rejected packaged-E2E and operation-timeline claims above. The earlier `memory-one-project-v2.json` proves only its identically labelled steady-state window; it is not evidence for project creation or restart peaks.
+
+### Restore and action boundary
+
+- `ppt.project.restore` now parses and validates the complete aggregate before replacing process state: exact schema, project/preference/source metadata, source-analysis file/hash/provenance, outline and detail version order, visual history and hashes, approval-to-frozen-version bindings, tasks, checkpoint, blocked state, export receipt and QA provenance, plus legal replay and cross-field stage invariants.
+- A forged `completed` snapshot is rejected as JSON-RPC invalid params and the prior aggregate is byte-for-byte unchanged. Recursive canonical JSON hashing also makes Rust `serde_json` key-order normalization safe across SQLite restart.
+- The JSON-RPC action boundary is an explicit discriminated union with exact allowed keys and nested value validation. Unknown or malformed actions return invalid params. The runtime also has a rejecting exhaustive default before task creation or revision increment.
+- Packaged SEA regressions exercise forged restore, unknown action and malformed action against the exact Worker embedded in the final `.app`, and assert atomic revision/state preservation.
+
+### Whole-deck editing
+
+- Saving an edited outline at `outline_review` now updates the expected mutable draft without trying to replay past the existing draft. Approval still freezes that version and cannot be skipped.
+- Worker and production UI tests both execute generate → edit → save → approve for the whole outline and the equivalent whole-deck detail document.
+
+### Deterministic packaged production harness
+
+The authoritative harness uses the real `createTauriDesktopAdapter`, compiled Rust Workbench functions shared by Tauri commands, persisted SQLite with process reopen, the final `.app` embedded SEA over newline JSON-RPC, Rust hash-bound held-fd artifact writes, and real LibreOffice/pdftoppm export QA. Only Codex structured generation is scripted to make the run deterministic and free of model-turn spending.
+
+The run creates and attaches Golden inputs, executes source analysis, edits and approves the whole outline and detail deck, restarts Rust/SQLite and Worker, restores the complete checkpoint, records an honest ImageGen-unavailable block for every slide, continues through five user-uploaded distinct replacements and sequential approvals, exports, runs QA, restarts again and reopens the completed project. The result records revision `29`, workflow `completed`, five comparison pages with maximum normalized difference `0.106718`, and SQLite counts of 7 versions, 7 approvals, 12 tasks and 23 artifacts.
+
+### Operation and memory evidence
+
+The native macOS libproc sampler receives timestamped harness events and samples immediately at create, open, quit/close, Rust+SQLite+Worker restart, reopen and stable-window boundaries, as well as the intervening workflow operations. Its 60 samples list PID/PPID/RSS/executable path for Node, compiled Rust harness, sampler, `.app` embedded SEA, LibreOffice and pdftoppm. The conservative full-harness peak is `484.4 MiB`, below the `4096 MiB` target. This is not presented as a GUI-only idle-RSS measurement.
+
+### Authoritative artifacts
+
+- production result: `artifacts/qa/production-harness/result.json`
+- operation/RSS evidence: `artifacts/qa/production-harness/memory.json`
+- editable PPTX: use `result.json` → `exportPath` because the production project ID is generated per run
+- readable QA: use `result.json` → `readableReportPath`; the adjacent `qa-round-1.json` is the structured report
+
+### Fresh verification after the final bundle
+
+- TypeScript typecheck and ESLint are green for core, Worker, desktop and the production harness script.
+- Vitest is green: core 8/8, Worker 165/165 and desktop 55/55. Rust unit/integration is 21/21; Rust formatting and release harness-bin checks are green.
+- Fresh Golden QA is `completed`, 5/5, all skip guards true, five distinct comparison paths, maximum difference `0.045109`, no issue/blank/font/bounds/crop/resource failure. Presentations `slides_test.py` reports no overflow for both Golden and production-harness PPTX files.
+- Fresh SEA and `.app` builds are green. The 125 MiB app contains only the arm64 main and embedded Worker executables in `Contents/MacOS`; their source/bundle Worker SHA-256 values match. Signature is ad-hoc with no TeamIdentifier.
+- The final embedded SEA smoke reaches `completed` and rejects forged restore, unknown action and malformed action atomically. The final production harness result is `completed` at revision 29 with real SQLite restart, embedded-Worker restart and real LibreOffice/pdftoppm QA.
+- The bundled Node v22.21.1 notice is byte-identical to the build runtime's 143,299-byte `LICENSE`, with exact `VERSION.txt`. Static source and executable scans find no `OPENAI_API_KEY`, `api.openai.com` or production HTTP listener implementation; Vite's documented `127.0.0.1:1420` remains development-only.
+- `git diff --check` is green and no `.pnpm-store/`, root `tsx` dependency or lockfile churn is present.
+
+### Residual boundaries
+
+- Live ImageGen is unavailable, so the accepted production path persists a recoverable block and requires user replacement PNGs. There is no paid/API-key fallback.
+- Codex generation is scripted only in deterministic acceptance. The existing live `initialize` + `account/read` smoke remains the read-only proof of local ChatGPT/Codex login and does not spend a model turn.
+- Keynote open/edit remains the documented human check. PowerPoint compatibility, Developer ID signing and notarization are not claimed.

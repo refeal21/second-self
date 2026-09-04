@@ -56,25 +56,28 @@ artifacts/qa/golden-project/golden-project/qa/run-1/rendered-1.png … rendered-
 
 ## 内存验收
 
-2026-09-03 在当前 Apple Silicon Mac 的最新 release `.app` 上，以 100 ms 间隔对应用根 PID 及全部后代进程求 RSS 总和。报告的峰值样本同时保存每个 PID、PPID、RSS 与完整命令，并为每个采样点保留用户操作标签和 PID 列表：
+2026-09-04 在当前 Apple Silicon Mac 的最新 release `.app` 和生产验收边界上，以 100 ms 间隔记录整条验收进程树。原生 sampler 接收真实时间戳操作事件，并在每个事件到达时立即采样，再持续覆盖稳定窗口。权威证据为：
 
-- 从最新 bundle 重新启动应用，打开一个真实持久化 PPT 项目后采样 8 秒：峰值 `130.6 MiB`。
-- 峰值进程是主应用 PID `6909`（`92,784 KiB`）和内嵌 Worker PID `6940`（`40,944 KiB`）；该窗口没有启动 Codex App Server，因为项目停留在材料阶段。
-- `artifacts/qa/memory-one-project-v2.json` 保存 60 个 `one-project-open` 时间线样本，低于 4096 MiB 门槛。
+- `artifacts/qa/production-harness/memory.json`：60 个样本，峰值 `484.4 MiB`，低于 4096 MiB 门槛。
+- 时间线实际覆盖 `create-project`、`open-project`、`quit-worker-close-sqlite`、`restart-rust-sqlite-worker`、`reopen-project-after-restart` 和 `stable-sampling-window`，还覆盖材料、两次整体审批、五页视觉、导出与 QA。
+- 每个样本保存 PID、PPID、RSS 和可执行文件路径；观测到 Node 驱动器、编译后的 Rust Workbench harness、`.app` 内嵌 SEA Worker、LibreOffice 和 pdftoppm。
 
-PID 会在每次复测时变化，应以新报告中的 `rootPid`、`peakProcesses` 和 `operationTimeline` 为准；上述 PID 只用于标识本次验收证据。
+这个数值是包含验收驱动器、Rust 服务、Worker 与 QA 子进程的保守生产 harness 窗口，不等于只启动图形 `.app` 的空闲占用。旧 `memory-one-project-v2.json` 的 60 个同标签样本只能证明当时 `one-project-open` 稳态，不能证明创建或重启峰值，因此不再作为完整操作时间线的验收依据。
 
 复测命令：
 
 ```bash
-node scripts/measure-process-tree-rss.mjs \
-  --pid <digital-twin-desktop-pid> \
-  --duration 8000 \
-  --operation one-project-open \
-  --output artifacts/qa/memory-one-project-v2.json
+pnpm build:production-harness
+pnpm harness:production
 ```
 
-macOS RSS 会随缓存波动；判定应使用同一 release 构建、相同子进程范围重新测量。
+macOS RSS 会随缓存波动；判定应使用同一 release 构建、同一 production harness 进程范围重新测量，并以新报告里的 `operationEvents`、`samples` 和 `peakProcesses` 为准。
+
+## 生产边界端到端验收
+
+`artifacts/qa/production-harness/result.json` 是打包生产路径的确定性证据。它使用真实 production adapter、编译后的 Rust Workbench/Tauri service delegates、SQLite、`.app` 内嵌 SEA、Rust held-fd/`O_NOFOLLOW`/原子写入和真实 LibreOffice/pdftoppm；只有 Codex 结构化生成结果由脚本固定。
+
+验收要求包括：完成状态、SQLite 与 Worker 双重重启恢复、五张互不相同的批准全页 PNG、逐页比较分数、真实可读 `.txt` 报告、版本/审批/任务/产物行数，以及重启后的完整 provenance。该 harness 不能替代 Keynote 人工检查，也不声称验证 Microsoft PowerPoint。
 
 ## 运行时与配置审计
 

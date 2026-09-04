@@ -123,7 +123,7 @@ describe('worker sidecar process integration', () => {
       const contentsBase64 = Buffer.from(createDistinctApprovedVisual(background, index)).toString('base64');
       visualBytes[spec.id] = contentsBase64;
       result = await execute(restarted, {
-        kind: 'visual.replace', at: createdAt, slideId: spec.id, contentsBase64,
+        kind: 'visual.replace', at: createdAt, slideId: spec.id,
         imageBase64: contentsBase64, altText: `独立批准视觉 ${index + 1}`,
       });
       result = await execute(restarted, { kind: 'visual.approve', at: createdAt, slideId: spec.id });

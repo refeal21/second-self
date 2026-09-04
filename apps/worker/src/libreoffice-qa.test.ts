@@ -1,8 +1,6 @@
-import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { PNG } from 'pngjs';
 import { createHash } from 'node:crypto';
@@ -439,13 +437,18 @@ describe('local command runner process boundaries', () => {
 
       expect(result.timedOut).toBe(true);
       expect(Number.isInteger(descendantPid)).toBe(true);
-      const ps = await promisify(execFile)('ps', [
-        '-o',
-        'stat=',
-        '-p',
-        String(descendantPid),
-      ]).catch(() => ({ stdout: '' }));
-      expect(ps.stdout.trim()).toBe('');
+      const deadline = Date.now() + 500;
+      let alive = true;
+      while (alive && Date.now() < deadline) {
+        try {
+          process.kill(descendantPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+          alive = false;
+        }
+      }
+      expect(alive).toBe(false);
     } finally {
       if (descendantPid) {
         try {

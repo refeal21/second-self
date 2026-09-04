@@ -89,6 +89,6 @@ macOS RSS 会随缓存波动；判定应使用同一 release 构建、同一 pro
 
 同一构建的只读审计结果：生产源码没有 TCP listener 实现，短时启动的主程序 PID 没有 TCP 条目；仓库生产代码与两个 bundle executables 中未发现 `OPENAI_API_KEY`、`api.openai.com` 或 `sk-proj-`。API-key 字样仅存在于明确拒绝该认证模式的实现、UI 文案与负向测试。生产通信为 Tauri IPC 与 stdio。
 
-最终 `.app` 为 125 MiB，只含 arm64 主程序与 arm64 SEA Worker。源 SEA 与 bundle SEA 的 SHA-256 都是 `cc2306620b3708c8d19b0c909769bbc7d2033c7dea938e5c6fe94e3b92db45cb`。Node v22.21.1 的 143,299 字节 LICENSE/第三方声明与构建 runtime 字节相同。bundle 是 ad-hoc/linker-signed、没有 TeamIdentifier；`codesign --verify --deep --strict` 因未密封资源退出 1，因此不声称严格签名或公证通过。
+当前发布前重建的 `.app` 为 125 MiB，只含 arm64 主程序与 arm64 SEA Worker；源 SEA 与同一 `.app` 的 bundle SEA SHA-256 都是 `2633274138eaeba33fc370b7adbf680299c07ae27bdb874402c35efba1750f23`。每次 SEA 重建或 ad-hoc 签名都可能改变某次构建的具体 SHA-256；验收契约是同一构建的 source 与 bundle Worker 字节一致，而不是跨构建复用旧哈希。Node v22.21.1 的 143,299 字节 LICENSE/第三方声明与构建 runtime 字节相同。bundle 是 ad-hoc/linker-signed、没有 TeamIdentifier；`codesign --verify --deep --strict` 因未密封资源退出 1，因此不声称严格签名或公证通过。
 
 生产组件视觉测试为 `native-workspace.test.tsx` 与 `app.test.tsx`，覆盖真实 `<img>` 加载、1280×720/16:9 门禁、坏图禁批、意见重生成、上传替换和批准页 reopen。当前受限环境禁止 Vite 监听端口，Playwright 启动本机 Chrome 又被沙箱终止，Browser Use 也按安全策略拒绝 `file://`；没有把 browser screenshot 伪报为通过。真实组件交互测试和生产 rendered PNG 原图共同作为本轮视觉证据。

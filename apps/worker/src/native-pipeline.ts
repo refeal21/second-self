@@ -221,6 +221,8 @@ export interface NativePptRpcRuntimeOptions {
   }>;
 }
 
+const IMAGEGEN_UNAVAILABLE_MESSAGE = 'Codex ImageGen 能力当前不可用；可上传替换 PNG 继续。';
+
 export function createNativePipeline(input: {
   id: string;
   name: string;
@@ -390,7 +392,7 @@ export class NativePptRpcRuntime {
             recoverable: true,
             resumeStage: 'visual_review',
             slideId: action.slideId,
-            message: 'Codex ImageGen 能力当前不可用；可上传替换 PNG 继续。',
+            message: IMAGEGEN_UNAVAILABLE_MESSAGE,
           };
           message = state.blockedCondition.message;
           break;
@@ -1502,24 +1504,20 @@ function validatePipeline(value: NativePptPipeline): void {
 }
 
 function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
-  const phase = new Map<NativeTaskRecord['kind'], number>([
-    ['source_analysis', 0],
-    ['outline_generation', 1],
-    ['detail_generation', 2],
-    ['visual_generation', 3],
-    ['conversion', 4],
-    ['qa', 5],
-  ]);
   const taskIds = new Set<string>();
+  const tasksByRevision = new Map<number, NativeTaskRecord>();
   let previousRevision = 1;
-  let previousPhase = -1;
   const tasks = value.tasks.map((taskValue) => {
     const task = requireRecordValue(taskValue, 'task') as unknown as NativeTaskRecord;
     requireExactKeys(task as unknown as Record<string, unknown>, [
       'id', 'kind', 'status', 'createdAt', 'updatedAt', 'error',
     ], 'task');
-    const taskPhase = phase.get(task.kind);
-    if (typeof task.id !== 'string' || taskIds.has(task.id) || taskPhase === undefined
+    const legalKinds: NativeTaskRecord['kind'][] = [
+      'source_analysis', 'outline_generation', 'detail_generation',
+      'visual_generation', 'conversion', 'qa',
+    ];
+    if (typeof task.id !== 'string' || taskIds.has(task.id)
+      || !legalKinds.includes(task.kind)
       || !['completed', 'blocked'].includes(task.status)
       || typeof task.createdAt !== 'string' || task.createdAt.length === 0
       || task.updatedAt !== task.createdAt
@@ -1539,12 +1537,12 @@ function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
     }
     const revision = Number(encodedRevision);
     if (!Number.isSafeInteger(revision) || revision <= previousRevision
-      || revision > value.revision || taskPhase < previousPhase) {
+      || revision > value.revision || tasksByRevision.has(revision)) {
       throw new Error('Task transition order is invalid');
     }
     taskIds.add(task.id);
+    tasksByRevision.set(revision, task);
     previousRevision = revision;
-    previousPhase = taskPhase;
     return { task, revision };
   });
 
@@ -1568,7 +1566,8 @@ function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
   }
   const sourceRevision = sourceTasks[0]!.revision;
   const rustSourceRevision = value.sources.length + 2;
-  if (sourceRevision !== 2 && sourceRevision !== rustSourceRevision) {
+  if ((sourceRevision !== 2 && sourceRevision !== rustSourceRevision)
+    || sourceTasks[0]!.task.status !== 'completed') {
     throw new Error('Source attachment revision provenance is invalid');
   }
   let cursor = sourceRevision;
@@ -1600,38 +1599,21 @@ function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
   if (visualTasks.length > 0 && value.slideSpecs?.version.status !== 'frozen') {
     throw new Error('Visual tasks exist before detail approval');
   }
-  const histories = Object.values(value.visuals);
-  const candidateCount = histories.reduce(
-    (count, history) => count + history.filter(({ relativePath }) => relativePath !== '').length,
-    0,
-  );
-  const reopenCount = histories.reduce(
-    (count, history) => count + Math.max(0, history.length - 1),
-    0,
-  );
-  const visualApprovalCount = value.approvals.filter(
-    ({ stage }) => stage === 'visual_review',
-  ).length;
-  const completedVisualTasks = visualTasks.filter(
-    ({ task }) => task.status === 'completed',
-  ).length;
-  if (completedVisualTasks > candidateCount) {
-    throw new Error('Visual task candidates are incomplete');
-  }
-  const visualActionCount = visualTasks.length
-    + (candidateCount - completedVisualTasks)
-    + visualApprovalCount
-    + reopenCount;
-  const visualEndRevision = cursor + visualActionCount;
-  if (visualTasks.some(({ revision }) => revision <= cursor || revision > visualEndRevision)) {
-    throw new Error('Visual task transition provenance is invalid');
-  }
-  cursor = visualEndRevision;
 
   if ((value.exportReceipt === null && conversionTasks.length !== 0)
     || (value.exportReceipt !== null && conversionTasks.length !== 1)) {
     throw new Error('Conversion task provenance is incomplete');
   }
+  const visualEndRevision = conversionTasks.length === 1
+    ? conversionTasks[0]!.revision - 1
+    : value.revision;
+  if (value.slideSpecs?.version.status === 'frozen') {
+    replayVisualActionTimeline(value, tasksByRevision, cursor + 1, visualEndRevision);
+    cursor = visualEndRevision;
+  } else if (visualEndRevision !== cursor) {
+    throw new Error('Visual actions exist before detail approval');
+  }
+
   if (conversionTasks.length === 1) {
     cursor += 1;
     if (conversionTasks[0]!.revision !== cursor
@@ -1650,6 +1632,12 @@ function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
       throw new Error('QA task transition provenance is invalid');
     }
   }
+  if (value.qaReport !== null && value.qaReport.round !== qaTasks.length) {
+    throw new Error('QA report round does not match its task timeline');
+  }
+  if (qaTasks.slice(0, -1).some(({ task }) => task.status !== 'blocked')) {
+    throw new Error('QA cannot continue after a completed task');
+  }
   if (value.project.workflowStatus === 'completed'
     && qaTasks.at(-1)?.task.status !== 'completed') {
     throw new Error('Completed checkpoint lacks a completed QA task');
@@ -1658,6 +1646,11 @@ function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
     && value.blockedCondition?.resumeStage === 'qa'
     && qaTasks.at(-1)?.task.status !== 'blocked') {
     throw new Error('Blocked QA checkpoint lacks a blocked QA task');
+  }
+  if (value.project.workflowStatus === 'blocked'
+    && value.blockedCondition?.resumeStage === 'qa'
+    && qaTasks.at(-1)?.task.error !== value.blockedCondition.message) {
+    throw new Error('Blocked QA task does not match its recoverable condition');
   }
 
   if (cursor !== value.revision) {
@@ -1668,6 +1661,190 @@ function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
     && finalTask.task.updatedAt !== value.project.updatedAt) {
     throw new Error('Project update timestamp does not match its final task');
   }
+}
+
+type VisualReplayEvent =
+  | { kind: 'candidate'; slideIndex: number; versionIndex: number }
+  | { kind: 'approve'; slideIndex: number; versionIndex: number }
+  | { kind: 'reopen'; slideIndex: number; versionIndex: number };
+
+type VisualReplayStage = 'visual_review' | 'blocked' | 'conversion';
+type VisualReplayVersionState = 'none' | 'placeholder' | 'candidate' | 'frozen';
+
+interface VisualReplayState {
+  revision: number;
+  stage: VisualReplayStage;
+  currentSlideIndex: number;
+  eventIndexes: number[];
+  versionIndexes: number[];
+  versionStates: VisualReplayVersionState[];
+}
+
+/**
+ * Replays the only observable legacy visual actions, revision by revision.
+ * Schema v1 did not journal replacement/approval/reopen actions, so those
+ * actions are reconstructed from version histories while task-bearing
+ * generation attempts remain fixed to their encoded revisions.  A snapshot
+ * is accepted only when at least one legal state-machine execution produces
+ * every persisted version and approval and reaches the persisted checkpoint.
+ */
+function replayVisualActionTimeline(
+  value: NativePptPipeline,
+  tasksByRevision: ReadonlyMap<number, NativeTaskRecord>,
+  startRevision: number,
+  endRevision: number,
+): void {
+  if (!value.slideSpecs || endRevision < startRevision - 1) {
+    throw new Error('Visual action timeline boundaries are invalid');
+  }
+  const slideIds = value.slideSpecs.value.map(({ id }) => id);
+  if (slideIds.length === 0) throw new Error('Visual action timeline has no slides');
+  const events = slideIds.map((slideId, slideIndex) => {
+    const history = value.visuals[slideId] ?? [];
+    return history.flatMap((visual, versionIndex): VisualReplayEvent[] => {
+      const result: VisualReplayEvent[] = [];
+      if (versionIndex > 0) result.push({ kind: 'reopen', slideIndex, versionIndex });
+      if (visual.relativePath !== '') result.push({ kind: 'candidate', slideIndex, versionIndex });
+      if (visual.version.status === 'frozen') result.push({ kind: 'approve', slideIndex, versionIndex });
+      return result;
+    });
+  });
+  const initial: VisualReplayState = {
+    revision: startRevision,
+    stage: 'visual_review',
+    currentSlideIndex: 0,
+    eventIndexes: slideIds.map(() => 0),
+    versionIndexes: slideIds.map(() => -1),
+    versionStates: slideIds.map(() => 'none'),
+  };
+  const memo = new Set<string>();
+  const pending: VisualReplayState[] = [initial];
+  while (pending.length > 0) {
+    const state = pending.pop()!;
+    const key = JSON.stringify(state);
+    if (memo.has(key)) continue;
+    memo.add(key);
+    if (state.revision > endRevision) {
+      if (visualReplayMatchesCheckpoint(value, events, state)) return;
+      continue;
+    }
+
+    const task = tasksByRevision.get(state.revision);
+    if (task) {
+      if (task.kind !== 'visual_generation' || state.stage === 'conversion') continue;
+      if (task.status === 'blocked') {
+        if (task.error === IMAGEGEN_UNAVAILABLE_MESSAGE) {
+          pending.push({
+            ...cloneVisualReplayState(state),
+            revision: state.revision + 1,
+            stage: 'blocked',
+          });
+        }
+        continue;
+      }
+      if (task.status !== 'completed') continue;
+      const event = nextVisualReplayEvent(events, state, state.currentSlideIndex);
+      if (event?.kind !== 'candidate') continue;
+      const visual = value.visuals[slideIds[event.slideIndex]!]![event.versionIndex]!;
+      if (event.versionIndex === 0 && task.createdAt !== visual.version.createdAt) continue;
+      const next = applyVisualReplayEvent(events, state, event);
+      if (next !== null) pending.push({ ...next, revision: state.revision + 1 });
+      continue;
+    }
+
+    for (const event of availableVisualReplayEvents(events, state)) {
+      const next = applyVisualReplayEvent(events, state, event);
+      if (next !== null) pending.push({ ...next, revision: state.revision + 1 });
+    }
+  }
+  throw new Error('Visual task revisions cannot replay a legal action timeline');
+}
+
+function cloneVisualReplayState(state: VisualReplayState): VisualReplayState {
+  return {
+    ...state,
+    eventIndexes: [...state.eventIndexes],
+    versionIndexes: [...state.versionIndexes],
+    versionStates: [...state.versionStates],
+  };
+}
+
+function nextVisualReplayEvent(
+  events: readonly VisualReplayEvent[][],
+  state: VisualReplayState,
+  slideIndex: number,
+): VisualReplayEvent | undefined {
+  return events[slideIndex]?.[state.eventIndexes[slideIndex] ?? 0];
+}
+
+function availableVisualReplayEvents(
+  events: readonly VisualReplayEvent[][],
+  state: VisualReplayState,
+): VisualReplayEvent[] {
+  const available: VisualReplayEvent[] = [];
+  const current = nextVisualReplayEvent(events, state, state.currentSlideIndex);
+  if (current?.kind === 'candidate' || current?.kind === 'approve') available.push(current);
+  if (state.stage !== 'blocked') {
+    for (let slideIndex = 0; slideIndex < events.length; slideIndex += 1) {
+      const event = nextVisualReplayEvent(events, state, slideIndex);
+      if (event?.kind === 'reopen') available.push(event);
+    }
+  }
+  return available;
+}
+
+function applyVisualReplayEvent(
+  events: readonly VisualReplayEvent[][],
+  state: VisualReplayState,
+  event: VisualReplayEvent,
+): VisualReplayState | null {
+  const next = cloneVisualReplayState(state);
+  const currentState = next.versionStates[event.slideIndex]!;
+  if (event.kind === 'reopen') {
+    if (next.stage === 'blocked' || currentState !== 'frozen'
+      || event.versionIndex !== next.versionIndexes[event.slideIndex]! + 1) return null;
+    next.stage = 'visual_review';
+    next.currentSlideIndex = event.slideIndex;
+    next.versionIndexes[event.slideIndex] = event.versionIndex;
+    next.versionStates[event.slideIndex] = 'placeholder';
+  } else if (event.kind === 'candidate') {
+    if (event.slideIndex !== next.currentSlideIndex || next.stage === 'conversion'
+      || !['none', 'placeholder'].includes(currentState)) return null;
+    if (currentState === 'none') {
+      if (event.versionIndex !== 0) return null;
+      next.versionIndexes[event.slideIndex] = 0;
+    } else if (event.versionIndex !== next.versionIndexes[event.slideIndex]) return null;
+    next.stage = 'visual_review';
+    next.versionStates[event.slideIndex] = 'candidate';
+  } else {
+    if (event.slideIndex !== next.currentSlideIndex || next.stage !== 'visual_review'
+      || currentState !== 'candidate' || event.versionIndex !== next.versionIndexes[event.slideIndex]) return null;
+    next.versionStates[event.slideIndex] = 'frozen';
+    const pending = next.versionStates.findIndex((status) => status !== 'frozen');
+    if (pending < 0) {
+      next.stage = 'conversion';
+    } else {
+      next.currentSlideIndex = pending;
+    }
+  }
+  next.eventIndexes[event.slideIndex] = next.eventIndexes[event.slideIndex]! + 1;
+  return next;
+}
+
+function visualReplayMatchesCheckpoint(
+  value: NativePptPipeline,
+  events: readonly VisualReplayEvent[][],
+  state: VisualReplayState,
+): boolean {
+  if (events.some((slideEvents, index) => state.eventIndexes[index] !== slideEvents.length)) return false;
+  const slideIds = value.slideSpecs!.value.map(({ id }) => id);
+  if (slideIds[state.currentSlideIndex] !== value.currentSlideId) return false;
+  const expected = value.project.workflowStatus === 'blocked'
+    ? value.blockedCondition!.resumeStage === 'visual_review' ? 'blocked' : 'conversion'
+    : ['conversion', 'qa', 'completed'].includes(value.project.workflowStatus)
+      ? 'conversion'
+      : 'visual_review';
+  return state.stage === expected;
 }
 
 function requireCurrentSlide(state: NativePptPipeline, slideId: string): void {

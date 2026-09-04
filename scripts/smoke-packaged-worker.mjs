@@ -158,21 +158,29 @@ try {
   }
   const legitimateCompleted = structuredClone(result.pipeline);
   const forgedTaskHistory = structuredClone(legitimateCompleted);
-  forgedTaskHistory.tasks = [];
-  forgedTaskHistory.revision = 999;
+  const finalVisualTask = forgedTaskHistory.tasks
+    .filter(({ kind }) => kind === 'visual_generation')
+    .at(-1);
+  if (!finalVisualTask || !finalVisualTask.id.includes('-task-25-visual_generation')) {
+    throw new Error(`Packaged Worker history lacks the expected revision-25 visual task: ${finalVisualTask?.id}`);
+  }
+  finalVisualTask.id = finalVisualTask.id.replace(
+    '-task-25-visual_generation',
+    '-task-27-visual_generation',
+  );
   const forgedTaskHistoryResponse = await worker.rawCall('ppt.project.restore', {
     pipeline: forgedTaskHistory,
   });
   if (forgedTaskHistoryResponse.error?.code !== -32602) {
     throw new Error(
-      `Packaged Worker accepted a forged completed task history: ${JSON.stringify(forgedTaskHistoryResponse)}`,
+      `Packaged Worker accepted an interval-internal visual task revision forgery: ${JSON.stringify(forgedTaskHistoryResponse)}`,
     );
   }
   const completedAfterTaskForgery = await worker.call('ppt.project.snapshot', {
     projectId: legitimateCompleted.project.id,
   });
   if (JSON.stringify(completedAfterTaskForgery) !== JSON.stringify(legitimateCompleted)) {
-    throw new Error('Packaged Worker mutated completed state after rejecting forged task history');
+    throw new Error('Packaged Worker mutated completed state after rejecting visual task revision forgery');
   }
   process.stdout.write(`${JSON.stringify({
     binary,

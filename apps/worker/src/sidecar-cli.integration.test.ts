@@ -181,11 +181,39 @@ describe('worker sidecar process integration', () => {
     }));
     missingRequiredTask.revision -= 1;
 
+    const visualTasks = legitimateCompleted.tasks
+      .filter(({ kind }) => kind === 'visual_generation');
+    const visualTaskOrderingForgeries = visualTasks
+      .map((visualTask) => {
+        const forged = structuredClone(legitimateCompleted);
+        const task = forged.tasks.find(({ id }) => id === visualTask.id)!;
+        task.id = task.id.replace(/-task-(\d+)-/, (_match, revision: string) =>
+          `-task-${Number(revision) + 1}-`);
+        return forged;
+      });
+    const exactFinalApprovalForgery = structuredClone(legitimateCompleted);
+    exactFinalApprovalForgery.tasks.find(({ id }) => id === visualTasks.at(-1)!.id)!.id =
+      exactFinalApprovalForgery.tasks.find(({ id }) => id === visualTasks.at(-1)!.id)!.id
+        .replace('-task-25-', '-task-27-');
+    const approvalSlotPermutation = structuredClone(legitimateCompleted);
+    for (const task of approvalSlotPermutation.tasks.filter(({ kind }) => kind === 'visual_generation')) {
+      task.id = task.id.replace(/-task-(\d+)-/, (_match, revision: string) =>
+        `-task-${Number(revision) + 2}-`);
+    }
+    const forgedQaRound = structuredClone(legitimateCompleted);
+    forgedQaRound.qaReport!.round = 2;
+    forgedQaRound.qaReport!.jsonReportPath = 'qa/qa-round-2.json';
+    forgedQaRound.qaReport!.textReportPath = 'qa/qa-round-2.txt';
+
     for (const forgedCompleted of [
       missingAllTasks,
       forgedRevision,
       forgedTaskRevision,
       missingRequiredTask,
+      ...visualTaskOrderingForgeries,
+      exactFinalApprovalForgery,
+      approvalSlotPermutation,
+      forgedQaRound,
     ]) {
       const rejected = await restarted.request(JSON.stringify({
         jsonrpc: '2.0', id: requestId++, method: 'ppt.project.restore',

@@ -279,6 +279,21 @@ describe('packaged native PPT workflow runtime', () => {
 
     result = await runtime.execute('project-native', {
       kind: 'deck.qa',
+      at: '2026-09-03T02:11:30.000Z',
+      preparation: {
+        status: 'blocked',
+        issue: 'LibreOffice is temporarily unavailable',
+        capability: 'libreoffice',
+      },
+    });
+    expect(result.pipeline).toMatchObject({
+      project: { workflowStatus: 'blocked' },
+      qaReport: { round: 1, status: 'blocked' },
+      blockedCondition: { resumeStage: 'qa', capability: 'libreoffice' },
+    });
+
+    result = await runtime.execute('project-native', {
+      kind: 'deck.qa',
       at: '2026-09-03T02:12:00.000Z',
       preparation: {
         status: 'ready', sofficePath: '/Applications/LibreOffice.app/Contents/MacOS/soffice',
@@ -296,11 +311,14 @@ describe('packaged native PPT workflow runtime', () => {
       },
     });
     expect(result.pipeline.project.workflowStatus).toBe('completed');
-    expect(result.pipeline.qaReport).toMatchObject({ status: 'passed', actualPageCount: 2 });
+    expect(result.pipeline.qaReport).toMatchObject({ round: 2, status: 'passed', actualPageCount: 2 });
     expect(result.writes.map(({ relativePath }) => relativePath)).toEqual(expect.arrayContaining([
-      'qa/run-1/rendered-1.png', 'qa/run-1/rendered-2.png',
-      'qa/qa-round-1.json', 'qa/qa-round-1.txt',
+      'qa/run-2/rendered-1.png', 'qa/run-2/rendered-2.png',
+      'qa/qa-round-2.json', 'qa/qa-round-2.txt',
     ]));
+
+    const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await expect(restarted.restore(result.pipeline)).resolves.toEqual(result.pipeline);
   });
 
   it('restores an authoritative full snapshot into a fresh Worker process', async () => {

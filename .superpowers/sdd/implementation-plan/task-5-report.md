@@ -152,7 +152,7 @@ This section supersedes the rejected packaged-E2E and operation-timeline claims 
 - `ppt.project.restore` now parses and validates the complete aggregate before replacing process state: exact schema, project/preference/source metadata, source-analysis file/hash/provenance, outline and detail version order, visual history and hashes, approval-to-frozen-version bindings, tasks, checkpoint, blocked state, export receipt and QA provenance, plus legal replay and cross-field stage invariants.
 - A forged `completed` snapshot is rejected as JSON-RPC invalid params and the prior aggregate is byte-for-byte unchanged. Recursive canonical JSON hashing also makes Rust `serde_json` key-order normalization safe across SQLite restart.
 - The JSON-RPC action boundary is an explicit discriminated union with exact allowed keys and nested value validation. Unknown or malformed actions return invalid params. The runtime also has a rejecting exhaustive default before task creation or revision increment.
-- Packaged SEA regressions exercise forged restore, unknown action and malformed action against the exact Worker embedded in the final `.app`, and assert atomic revision/state preservation.
+- Packaged SEA regressions exercise forged restore, unknown action, malformed action and deleted task history with forged revision against the exact Worker embedded in the final `.app`, and assert atomic revision/state preservation.
 
 ### Whole-deck editing
 
@@ -167,7 +167,7 @@ The run creates and attaches Golden inputs, executes source analysis, edits and 
 
 ### Operation and memory evidence
 
-The native macOS libproc sampler receives timestamped harness events and samples immediately at create, open, quit/close, Rust+SQLite+Worker restart, reopen and stable-window boundaries, as well as the intervening workflow operations. Its 60 samples list PID/PPID/RSS/executable path for Node, compiled Rust harness, sampler, `.app` embedded SEA, LibreOffice and pdftoppm. The conservative full-harness peak is `484.4 MiB`, below the `4096 MiB` target. This is not presented as a GUI-only idle-RSS measurement.
+The native macOS libproc sampler receives timestamped harness events and samples immediately at create, open, quit/close, Rust+SQLite+Worker restart, reopen and stable-window boundaries, as well as the intervening workflow operations. Its latest 64 samples list PID/PPID/RSS/executable path for Node, compiled Rust harness, sampler, `.app` embedded SEA, LibreOffice and pdftoppm. The conservative full-harness peak is `480.5 MiB`, below the `4096 MiB` target. This is not presented as a GUI-only idle-RSS measurement.
 
 ### Authoritative artifacts
 
@@ -191,3 +191,11 @@ The native macOS libproc sampler receives timestamped harness events and samples
 - Live ImageGen is unavailable, so the accepted production path persists a recoverable block and requires user replacement PNGs. There is no paid/API-key fallback.
 - Codex generation is scripted only in deterministic acceptance. The existing live `initialize` + `account/read` smoke remains the read-only proof of local ChatGPT/Codex login and does not spend a model turn.
 - Keynote open/edit remains the documented human check. PowerPoint compatibility, Developer ID signing and notarization are not claimed.
+
+## 5F fix round 3 — task/revision provenance closure
+
+The last P0 reproduced against a complete legal five-page `completed` snapshot: deleting all 12 task records and setting `revision=999` was accepted by the pre-fix restore path and could replace an existing same-ID aggregate. The RED regression now starts from that real legal history and also exercises revision-only forgery, a forged task-ID revision, and removal plus renumbering of a required task. Every case must return JSON-RPC invalid params and leave the prior completed aggregate structurally identical.
+
+The validator now derives the allowed revision timeline from the whole aggregate instead of checking task record shapes independently. Task IDs must bind the project, task kind and exact positive revision; task revisions must be strictly increasing and phase-monotonic; persisted status/error combinations are constrained; required analysis, outline, detail, conversion and QA tasks must exist when their artifacts exist; and outline/detail approvals, visual candidate generation or replacement, visual approvals, reopen history, export and QA are counted as the corresponding legal actions. The only retained source-revision compatibility boundary is revision 2 for the legacy direct-source path or `source count + 2` for the Rust attachment path. Arbitrary offsets, missing task provenance and forged terminal revisions are rejected before the in-memory map is replaced. Approval IDs and freeze timestamps are also bound to their exact frozen versions.
+
+Fresh focused TDD is green at 14 tests; the full Worker suite remains 165/165 with Worker typecheck and lint green. The final `.app` embedded SEA smoke reports `taskHistoryForgeryRejectedAtomically: true`. The rebuilt packaged production harness still accepts the genuine revision-29/12-task history, survives SQLite and Worker restart, and completes real LibreOffice/pdftoppm QA, proving the validator did not reject the legal production path. Latest operation evidence has 64 samples and a conservative `480.5 MiB` peak. This is structural cross-field provenance validation, not a cryptographically authenticated append-only log.

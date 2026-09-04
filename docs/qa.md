@@ -58,7 +58,7 @@ artifacts/qa/golden-project/golden-project/qa/run-1/rendered-1.png … rendered-
 
 2026-09-04 在当前 Apple Silicon Mac 的最新 release `.app` 和生产验收边界上，以 100 ms 间隔记录整条验收进程树。原生 sampler 接收真实时间戳操作事件，并在每个事件到达时立即采样，再持续覆盖稳定窗口。权威证据为：
 
-- `artifacts/qa/production-harness/memory.json`：60 个样本，峰值 `484.4 MiB`，低于 4096 MiB 门槛。
+- `artifacts/qa/production-harness/memory.json`：64 个样本，峰值 `480.5 MiB`，低于 4096 MiB 门槛。
 - 时间线实际覆盖 `create-project`、`open-project`、`quit-worker-close-sqlite`、`restart-rust-sqlite-worker`、`reopen-project-after-restart` 和 `stable-sampling-window`，还覆盖材料、两次整体审批、五页视觉、导出与 QA。
 - 每个样本保存 PID、PPID、RSS 和可执行文件路径；观测到 Node 驱动器、编译后的 Rust Workbench harness、`.app` 内嵌 SEA Worker、LibreOffice 和 pdftoppm。
 
@@ -78,6 +78,8 @@ macOS RSS 会随缓存波动；判定应使用同一 release 构建、同一 pro
 `artifacts/qa/production-harness/result.json` 是打包生产路径的确定性证据。它使用真实 production adapter、编译后的 Rust Workbench/Tauri service delegates、SQLite、`.app` 内嵌 SEA、Rust held-fd/`O_NOFOLLOW`/原子写入和真实 LibreOffice/pdftoppm；只有 Codex 结构化生成结果由脚本固定。
 
 验收要求包括：完成状态、SQLite 与 Worker 双重重启恢复、五张互不相同的批准全页 PNG、逐页比较分数、真实可读 `.txt` 报告、版本/审批/任务/产物行数，以及重启后的完整 provenance。该 harness 不能替代 Keynote 人工检查，也不声称验证 Microsoft PowerPoint。
+
+完整聚合恢复还会核对任务 ID 中的修订号、阶段顺序、状态/错误组合，以及分析、大纲、细化、视觉、转换和 QA 的任务来源；再把材料附件、两次整体批准、视觉候选、替换、批准和重新打开动作逐项计入修订号。兼容边界只允许“直接注入旧材料”或“全部材料经 Rust 附件命令写入”这两种既有来源偏移，不接受任意偏移。最终 `.app` 内嵌 SEA 的负向 smoke 会把一份真实完成态改成 `tasks=[]`、`revision=999`，要求恢复原子拒绝且原聚合完全不变。这里的 provenance 是结构化一致性校验，不是密码学防篡改日志。
 
 ## 运行时与配置审计
 

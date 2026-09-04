@@ -100,6 +100,7 @@ describe('worker sidecar process integration', () => {
       id: `source-${name}`, fileName: `${name}.bin`, mediaType: 'application/octet-stream',
       relativePath: `sources/source-${name}.bin`, sha256: String(index + 1).repeat(64), byteLength: 1,
     }));
+    created.pipeline.revision = 1 + created.pipeline.sources.length;
     await call(first, 'ppt.project.restore', { pipeline: created.pipeline });
     const execute = async (worker: ReturnType<typeof startWorker>, action: Record<string, unknown>) =>
       call<NativePipelineResult>(worker, 'ppt.project.execute', { projectId: 'project-sidecar-golden', action });
@@ -107,8 +108,14 @@ describe('worker sidecar process integration', () => {
       kind: 'analysis.commit', at: createdAt, requestId: 'analysis-sidecar', output: goldenSourceAnalysis(),
     });
     result = await execute(first, { kind: 'outline.submit', at: createdAt, outline: goldenOutline() });
+    const editedOutline = structuredClone(goldenOutline());
+    editedOutline.slides[0]!.title = '用户编辑：2026 年经营复盘与增长计划';
+    result = await execute(first, { kind: 'outline.submit', at: createdAt, outline: editedOutline });
     result = await execute(first, { kind: 'outline.approve', at: createdAt });
     result = await execute(first, { kind: 'details.submit', at: createdAt, specs: goldenSlideSpecs() });
+    const editedSpecs = goldenSlideSpecs().map((spec) => structuredClone(spec));
+    editedSpecs[0] = { ...editedSpecs[0]!, body: ['用户编辑｜管理层汇报｜2026 年 9 月'] };
+    result = await execute(first, { kind: 'details.submit', at: createdAt, specs: editedSpecs });
     result = await execute(first, { kind: 'details.approve', at: createdAt });
     expect(result.pipeline.currentSlideId).toBe('slide-cover');
 
@@ -122,6 +129,10 @@ describe('worker sidecar process integration', () => {
     for (const [index, spec] of goldenSlideSpecs().entries()) {
       const contentsBase64 = Buffer.from(createDistinctApprovedVisual(background, index)).toString('base64');
       visualBytes[spec.id] = contentsBase64;
+      result = await execute(restarted, {
+        kind: 'visual.generate', at: createdAt, slideId: spec.id,
+      });
+      expect(result.pipeline.project.workflowStatus).toBe('blocked');
       result = await execute(restarted, {
         kind: 'visual.replace', at: createdAt, slideId: spec.id,
         imageBase64: contentsBase64, altText: `独立批准视觉 ${index + 1}`,
@@ -147,5 +158,44 @@ describe('worker sidecar process integration', () => {
     expect(result.pipeline.project.workflowStatus).toBe('completed');
     expect(result.pipeline.qaReport).toMatchObject({ status: 'passed', actualPageCount: 5 });
     expect(new Set(result.pipeline.qaReport!.comparisons.map(({ approvedVisualPath }) => approvedVisualPath)).size).toBe(5);
+    expect(result.pipeline).toMatchObject({ revision: 29 });
+    expect(result.pipeline.tasks).toHaveLength(12);
+
+    const legitimateCompleted = structuredClone(result.pipeline);
+    const missingAllTasks = structuredClone(legitimateCompleted);
+    missingAllTasks.tasks = [];
+    missingAllTasks.revision = 999;
+    const forgedRevision = structuredClone(legitimateCompleted);
+    forgedRevision.revision = 999;
+    const forgedTaskRevision = structuredClone(legitimateCompleted);
+    forgedTaskRevision.revision = 999;
+    forgedTaskRevision.tasks.at(-1)!.id = forgedTaskRevision.tasks.at(-1)!.id.replace(
+      /-task-\d+-qa$/,
+      '-task-999-qa',
+    );
+    const missingRequiredTask = structuredClone(legitimateCompleted);
+    missingRequiredTask.tasks = missingRequiredTask.tasks.slice(1).map((task) => ({
+      ...task,
+      id: task.id.replace(/-task-(\d+)-/, (_match, revision: string) =>
+        `-task-${Number(revision) - 1}-`),
+    }));
+    missingRequiredTask.revision -= 1;
+
+    for (const forgedCompleted of [
+      missingAllTasks,
+      forgedRevision,
+      forgedTaskRevision,
+      missingRequiredTask,
+    ]) {
+      const rejected = await restarted.request(JSON.stringify({
+        jsonrpc: '2.0', id: requestId++, method: 'ppt.project.restore',
+        params: { pipeline: forgedCompleted },
+      }));
+      expect(rejected).toMatchObject({ error: { code: -32602 } });
+      const preserved = await call<NativePptPipeline>(restarted, 'ppt.project.snapshot', {
+        projectId: legitimateCompleted.project.id,
+      });
+      expect(preserved).toEqual(legitimateCompleted);
+    }
   });
 });

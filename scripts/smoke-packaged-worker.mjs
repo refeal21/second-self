@@ -97,14 +97,21 @@ try {
       sha256: createHash('sha256').update(bytes).digest('hex'), byteLength: bytes.byteLength,
     };
   }));
+  created.pipeline.revision = 1 + created.pipeline.sources.length;
   await worker.call('ppt.project.restore', { pipeline: created.pipeline });
   const execute = (action) => worker.call('ppt.project.execute', {
     projectId: 'project-packaged-smoke', action,
   });
   let result = await execute({ kind: 'analysis.commit', at, requestId: 'analysis-packaged', output: analysis });
   result = await execute({ kind: 'outline.submit', at, outline });
+  const editedOutline = structuredClone(outline);
+  editedOutline.slides[0].title = '用户编辑：2026 年经营复盘与增长计划';
+  result = await execute({ kind: 'outline.submit', at, outline: editedOutline });
   result = await execute({ kind: 'outline.approve', at });
   result = await execute({ kind: 'details.submit', at, specs });
+  const editedSpecs = structuredClone(specs);
+  editedSpecs[0] = { ...editedSpecs[0], body: ['用户编辑｜管理层汇报｜2026 年 9 月'] };
+  result = await execute({ kind: 'details.submit', at, specs: editedSpecs });
   result = await execute({ kind: 'details.approve', at });
 
   await stop(worker);
@@ -119,6 +126,10 @@ try {
     const relativePath = `visuals/${spec.id}-v1.png`;
     const contentsBase64 = (await readFile(join(goldenRoot, relativePath))).toString('base64');
     visualBytes[spec.id] = contentsBase64;
+    result = await executeRestored({ kind: 'visual.generate', at, slideId: spec.id });
+    if (result.pipeline.project.workflowStatus !== 'blocked') {
+      throw new Error(`Packaged Worker did not persist the unavailable visual block for ${spec.id}`);
+    }
     result = await executeRestored({ kind: 'visual.replace', at, slideId: spec.id, imageBase64: contentsBase64, altText: `批准视觉 ${spec.id}` });
     result = await executeRestored({ kind: 'visual.approve', at, slideId: spec.id });
     approvedVisuals.push({ slideId: spec.id, relativePath, contentsBase64 });
@@ -140,17 +151,42 @@ try {
   if (result.pipeline.project.workflowStatus !== 'completed' || report?.status !== 'passed') {
     throw new Error(`Packaged Worker full smoke failed: ${report?.issues?.join('; ') ?? 'missing report'}`);
   }
+  if (result.pipeline.revision !== 29 || result.pipeline.tasks.length !== 12) {
+    throw new Error(
+      `Packaged Worker did not reproduce the production history: revision=${result.pipeline.revision}, tasks=${result.pipeline.tasks.length}`,
+    );
+  }
+  const legitimateCompleted = structuredClone(result.pipeline);
+  const forgedTaskHistory = structuredClone(legitimateCompleted);
+  forgedTaskHistory.tasks = [];
+  forgedTaskHistory.revision = 999;
+  const forgedTaskHistoryResponse = await worker.rawCall('ppt.project.restore', {
+    pipeline: forgedTaskHistory,
+  });
+  if (forgedTaskHistoryResponse.error?.code !== -32602) {
+    throw new Error(
+      `Packaged Worker accepted a forged completed task history: ${JSON.stringify(forgedTaskHistoryResponse)}`,
+    );
+  }
+  const completedAfterTaskForgery = await worker.call('ppt.project.snapshot', {
+    projectId: legitimateCompleted.project.id,
+  });
+  if (JSON.stringify(completedAfterTaskForgery) !== JSON.stringify(legitimateCompleted)) {
+    throw new Error('Packaged Worker mutated completed state after rejecting forged task history');
+  }
   process.stdout.write(`${JSON.stringify({
     binary,
     architecture: process.arch,
     workflowStatus: result.pipeline.project.workflowStatus,
     restartRestoredRevision: result.pipeline.revision,
+    tasks: result.pipeline.tasks.length,
     pages: report.actualPageCount,
     distinctApprovedVisuals: new Set(report.comparisons.map(({ approvedVisualPath }) => approvedVisualPath)).size,
     maxDifferenceScore: Math.max(...report.comparisons.map(({ differenceScore }) => differenceScore ?? 1)),
     forgedRestoreRejectedAtomically: true,
     unknownActionRejectedAtomically: true,
     malformedActionRejectedAtomically: true,
+    taskHistoryForgeryRejectedAtomically: true,
     writes: result.writes.map(({ relativePath }) => relativePath),
   }, null, 2)}\n`);
 } finally {

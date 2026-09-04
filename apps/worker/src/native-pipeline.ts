@@ -1415,7 +1415,7 @@ function validatePipeline(value: NativePptPipeline): void {
 
   const visualRecord = requireRecordValue(value.visuals, 'visuals');
   const specIds = new Set(value.slideSpecs?.value.map(({ id }) => id) ?? []);
-  const frozenVisualKeys = new Set<string>();
+  const frozenVisualApprovals = new Map<string, { id: string; decidedAt: string }>();
   let draftVisualCount = 0;
   for (const [slideId, historyValue] of Object.entries(visualRecord)) {
     if (!specIds.has(slideId) || !Array.isArray(historyValue) || historyValue.length === 0) {
@@ -1439,7 +1439,13 @@ function validatePipeline(value: NativePptPipeline): void {
           || !Number.isSafeInteger(visual.byteLength) || visual.byteLength <= 0) {
           throw new Error('Frozen visual artifact provenance is invalid');
         }
-        frozenVisualKeys.add(`visual_review|${visual.version.id}|${slideId}`);
+        frozenVisualApprovals.set(
+          `visual_review|${visual.version.id}|${slideId}`,
+          {
+            id: `${value.project.id}-approval-visual-${slideId}-v${sequence}`,
+            decidedAt: visual.version.frozenAt!,
+          },
+        );
       } else {
         draftVisualCount += 1;
         if (index !== historyValue.length - 1) throw new Error('Only the current visual version may remain draft');
@@ -1453,10 +1459,20 @@ function validatePipeline(value: NativePptPipeline): void {
   }
   if (draftVisualCount > 1) throw new Error('Only one visual draft may be active');
 
-  const expectedApprovalKeys = new Set<string>();
-  if (value.outline?.version.status === 'frozen') expectedApprovalKeys.add(`outline_review|${value.outline.version.id}|`);
-  if (value.slideSpecs?.version.status === 'frozen') expectedApprovalKeys.add(`detail_review|${value.slideSpecs.version.id}|`);
-  for (const key of frozenVisualKeys) expectedApprovalKeys.add(key);
+  const expectedApprovals = new Map<string, { id: string; decidedAt: string }>();
+  if (value.outline?.version.status === 'frozen') {
+    expectedApprovals.set(`outline_review|${value.outline.version.id}|`, {
+      id: `${value.project.id}-outline_review-1`,
+      decidedAt: value.outline.version.frozenAt!,
+    });
+  }
+  if (value.slideSpecs?.version.status === 'frozen') {
+    expectedApprovals.set(`detail_review|${value.slideSpecs.version.id}|`, {
+      id: `${value.project.id}-detail_review-2`,
+      decidedAt: value.slideSpecs.version.frozenAt!,
+    });
+  }
+  for (const [key, proof] of frozenVisualApprovals) expectedApprovals.set(key, proof);
   const approvalIds = new Set<string>();
   const actualApprovalKeys = new Set<string>();
   for (const approvalValue of value.approvals) {
@@ -1464,37 +1480,194 @@ function validatePipeline(value: NativePptPipeline): void {
     requireExactKeys(approval as unknown as Record<string, unknown>, [
       'id', 'projectId', 'versionId', 'stage', 'status', 'decidedAt', ...(approval.slideId === undefined ? [] : ['slideId']),
     ], 'approval');
-    if (typeof approval.id !== 'string' || approvalIds.has(approval.id)
+    const key = `${approval.stage}|${approval.versionId}|${approval.slideId ?? ''}`;
+    const expected = expectedApprovals.get(key);
+    if (!expected || approval.id !== expected.id || approval.decidedAt !== expected.decidedAt
+      || approvalIds.has(approval.id)
       || approval.projectId !== value.project.id || approval.status !== 'approved'
       || !['outline_review', 'detail_review', 'visual_review'].includes(approval.stage)
       || typeof approval.versionId !== 'string' || typeof approval.decidedAt !== 'string') {
       throw new Error('Approval provenance is invalid');
     }
     approvalIds.add(approval.id);
-    actualApprovalKeys.add(`${approval.stage}|${approval.versionId}|${approval.slideId ?? ''}`);
+    actualApprovalKeys.add(key);
   }
-  if (actualApprovalKeys.size !== expectedApprovalKeys.size
-    || [...expectedApprovalKeys].some((key) => !actualApprovalKeys.has(key))) {
+  if (actualApprovalKeys.size !== expectedApprovals.size
+    || [...expectedApprovals.keys()].some((key) => !actualApprovalKeys.has(key))) {
     throw new Error('Approvals do not exactly match frozen versions');
   }
 
+  validateCheckpointShape(value, specIds);
+  validateTaskAndRevisionProvenance(value);
+}
+
+function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
+  const phase = new Map<NativeTaskRecord['kind'], number>([
+    ['source_analysis', 0],
+    ['outline_generation', 1],
+    ['detail_generation', 2],
+    ['visual_generation', 3],
+    ['conversion', 4],
+    ['qa', 5],
+  ]);
   const taskIds = new Set<string>();
-  for (const taskValue of value.tasks) {
+  let previousRevision = 1;
+  let previousPhase = -1;
+  const tasks = value.tasks.map((taskValue) => {
     const task = requireRecordValue(taskValue, 'task') as unknown as NativeTaskRecord;
     requireExactKeys(task as unknown as Record<string, unknown>, [
       'id', 'kind', 'status', 'createdAt', 'updatedAt', 'error',
     ], 'task');
-    if (typeof task.id !== 'string' || taskIds.has(task.id)
-      || !['source_analysis', 'outline_generation', 'detail_generation', 'visual_generation', 'conversion', 'qa'].includes(task.kind)
-      || !['queued', 'running', 'completed', 'blocked', 'failed'].includes(task.status)
-      || typeof task.createdAt !== 'string' || typeof task.updatedAt !== 'string'
-      || (task.error !== null && typeof task.error !== 'string')) {
+    const taskPhase = phase.get(task.kind);
+    if (typeof task.id !== 'string' || taskIds.has(task.id) || taskPhase === undefined
+      || !['completed', 'blocked'].includes(task.status)
+      || typeof task.createdAt !== 'string' || task.createdAt.length === 0
+      || task.updatedAt !== task.createdAt
+      || (task.status === 'completed' && task.error !== null)
+      || (task.status === 'blocked' && (typeof task.error !== 'string' || task.error.length === 0))
+      || (task.status === 'blocked' && !['visual_generation', 'qa'].includes(task.kind))) {
       throw new Error('Task record is invalid');
     }
+    const prefix = `${value.project.id}-task-`;
+    const suffix = `-${task.kind}`;
+    if (!task.id.startsWith(prefix) || !task.id.endsWith(suffix)) {
+      throw new Error('Task provenance identifier is invalid');
+    }
+    const encodedRevision = task.id.slice(prefix.length, -suffix.length);
+    if (!/^[1-9]\d*$/.test(encodedRevision)) {
+      throw new Error('Task revision provenance is invalid');
+    }
+    const revision = Number(encodedRevision);
+    if (!Number.isSafeInteger(revision) || revision <= previousRevision
+      || revision > value.revision || taskPhase < previousPhase) {
+      throw new Error('Task transition order is invalid');
+    }
     taskIds.add(task.id);
+    previousRevision = revision;
+    previousPhase = taskPhase;
+    return { task, revision };
+  });
+
+  const byKind = (kind: NativeTaskRecord['kind']) =>
+    tasks.filter(({ task }) => task.kind === kind);
+  const sourceTasks = byKind('source_analysis');
+  const outlineTasks = byKind('outline_generation');
+  const detailTasks = byKind('detail_generation');
+  const visualTasks = byKind('visual_generation');
+  const conversionTasks = byKind('conversion');
+  const qaTasks = byKind('qa');
+
+  if (!value.analysis) {
+    if (tasks.length !== 0 || ![1, 1 + value.sources.length].includes(value.revision)) {
+      throw new Error('Intake revision provenance is invalid');
+    }
+    return;
+  }
+  if (sourceTasks.length !== 1) {
+    throw new Error('Source analysis task provenance is incomplete');
+  }
+  const sourceRevision = sourceTasks[0]!.revision;
+  const rustSourceRevision = value.sources.length + 2;
+  if (sourceRevision !== 2 && sourceRevision !== rustSourceRevision) {
+    throw new Error('Source attachment revision provenance is invalid');
+  }
+  let cursor = sourceRevision;
+
+  if ((value.outline === null && outlineTasks.length !== 0)
+    || (value.outline !== null && outlineTasks.length === 0)) {
+    throw new Error('Outline task provenance is incomplete');
+  }
+  for (const task of outlineTasks) {
+    cursor += 1;
+    if (task.revision !== cursor || task.task.status !== 'completed') {
+      throw new Error('Outline task transition provenance is invalid');
+    }
+  }
+  if (value.outline?.version.status === 'frozen') cursor += 1;
+
+  if ((value.slideSpecs === null && detailTasks.length !== 0)
+    || (value.slideSpecs !== null && detailTasks.length === 0)) {
+    throw new Error('Detail task provenance is incomplete');
+  }
+  for (const task of detailTasks) {
+    cursor += 1;
+    if (task.revision !== cursor || task.task.status !== 'completed') {
+      throw new Error('Detail task transition provenance is invalid');
+    }
+  }
+  if (value.slideSpecs?.version.status === 'frozen') cursor += 1;
+
+  if (visualTasks.length > 0 && value.slideSpecs?.version.status !== 'frozen') {
+    throw new Error('Visual tasks exist before detail approval');
+  }
+  const histories = Object.values(value.visuals);
+  const candidateCount = histories.reduce(
+    (count, history) => count + history.filter(({ relativePath }) => relativePath !== '').length,
+    0,
+  );
+  const reopenCount = histories.reduce(
+    (count, history) => count + Math.max(0, history.length - 1),
+    0,
+  );
+  const visualApprovalCount = value.approvals.filter(
+    ({ stage }) => stage === 'visual_review',
+  ).length;
+  const completedVisualTasks = visualTasks.filter(
+    ({ task }) => task.status === 'completed',
+  ).length;
+  if (completedVisualTasks > candidateCount) {
+    throw new Error('Visual task candidates are incomplete');
+  }
+  const visualActionCount = visualTasks.length
+    + (candidateCount - completedVisualTasks)
+    + visualApprovalCount
+    + reopenCount;
+  const visualEndRevision = cursor + visualActionCount;
+  if (visualTasks.some(({ revision }) => revision <= cursor || revision > visualEndRevision)) {
+    throw new Error('Visual task transition provenance is invalid');
+  }
+  cursor = visualEndRevision;
+
+  if ((value.exportReceipt === null && conversionTasks.length !== 0)
+    || (value.exportReceipt !== null && conversionTasks.length !== 1)) {
+    throw new Error('Conversion task provenance is incomplete');
+  }
+  if (conversionTasks.length === 1) {
+    cursor += 1;
+    if (conversionTasks[0]!.revision !== cursor
+      || conversionTasks[0]!.task.status !== 'completed') {
+      throw new Error('Conversion task transition provenance is invalid');
+    }
   }
 
-  validateCheckpointShape(value, specIds);
+  if ((value.qaReport === null && qaTasks.length !== 0)
+    || (value.qaReport !== null && qaTasks.length === 0)) {
+    throw new Error('QA task provenance is incomplete');
+  }
+  for (const task of qaTasks) {
+    cursor += 1;
+    if (task.revision !== cursor) {
+      throw new Error('QA task transition provenance is invalid');
+    }
+  }
+  if (value.project.workflowStatus === 'completed'
+    && qaTasks.at(-1)?.task.status !== 'completed') {
+    throw new Error('Completed checkpoint lacks a completed QA task');
+  }
+  if (value.project.workflowStatus === 'blocked'
+    && value.blockedCondition?.resumeStage === 'qa'
+    && qaTasks.at(-1)?.task.status !== 'blocked') {
+    throw new Error('Blocked QA checkpoint lacks a blocked QA task');
+  }
+
+  if (cursor !== value.revision) {
+    throw new Error('Pipeline revision does not match its legal transition provenance');
+  }
+  const finalTask = tasks.at(-1);
+  if (finalTask?.revision === value.revision
+    && finalTask.task.updatedAt !== value.project.updatedAt) {
+    throw new Error('Project update timestamp does not match its final task');
+  }
 }
 
 function requireCurrentSlide(state: NativePptPipeline, slideId: string): void {

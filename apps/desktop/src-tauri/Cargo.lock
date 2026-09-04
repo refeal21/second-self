@@ -737,6 +737,7 @@ name = "digital-twin-desktop"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "glob",
  "libc",
  "rusqlite",
  "serde",
@@ -746,6 +747,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-shell",
+ "tauri-utils",
 ]
 
 [[package]]

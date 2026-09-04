@@ -23,6 +23,8 @@ pnpm --filter @digital-twin/desktop tauri build --bundles app
 
 应用不接受 OpenAI API Key。API-key、未知账户类型、登出状态或空计划都会保持“开始任务”禁用；即使 UI 状态过期，所有通用任务和 PPT 结构化生成也会在 `thread/start` 前重新执行 `account/read` 并原子拒绝。ChatGPT/Codex 未提供 ImageGen 能力时，页面会明确显示不可用；这不是网络重试问题，也不会回退到收费 API。
 
+桌面端登录链接只可由系统默认浏览器打开，并且 Tauri capability 只允许 `https://auth.openai.com/*`、`https://chatgpt.com/*` 和兼容旧登录跳转的 `https://chat.openai.com/*`。`http:`、`file:`、第三方域名、任意指定应用、文件/目录打开、Finder reveal 和 shell 命令都不在此权限内；若登录链接被拒绝，请检查本机 Codex 是否返回上述官方 HTTPS 域名，而不要放宽 capability。
+
 ## LibreOffice QA 失败或中文方框
 
 先确认 LibreOffice 能从命令行启动。macOS 无头 LibreOffice 可能看不到系统中文字体，因此 QA 为每次运行在工作区外的隔离临时目录生成局部 Fontconfig，显式包含 `/System/Library/Fonts`、`/System/Library/Fonts/Supplemental` 和 `/Library/Fonts`，并把 `FONTCONFIG_FILE`、`FONTCONFIG_PATH`、`XDG_CACHE_HOME` 传给 LibreOffice 与 pdftoppm。临时字体缓存随本轮准备清理，不会写入项目交付目录。QA 除了检查字体文件，还会对真实 rendered PNG 检测连续方框/tofu；检测到不可读中文会进入可恢复的 `qa-rendering` 阻塞。

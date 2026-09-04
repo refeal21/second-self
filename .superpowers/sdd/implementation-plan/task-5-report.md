@@ -276,3 +276,16 @@ This section supersedes stale counts, paths and acceptance claims in 5E–5G. No
 - Live ImageGen remains unavailable. Production proves the recoverable block and user replacement continuation without a billed/API-key fallback.
 - Keynote/PowerPoint editing remains a human compatibility check. The `.app` is ad-hoc/linker-signed with no TeamIdentifier; `codesign --verify --deep --strict` exits 1 because resources are not sealed, so Developer ID signing, strict bundle verification and notarization are not claimed.
 - The production harness scripts only deterministic Codex structured output. It does not claim a live paid model turn; the existing read-only Codex `initialize`/`account/read` check remains the login proof.
+
+## 5I — login opener ACL follow-up (2026-09-04, no commit)
+
+### RED → GREEN
+
+- RED: `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test opener_acl -- --nocapture` used Tauri's own `CapabilityFile` and `Resolved` parser over the generated plugin manifests. Before the capability change it failed with `main window must receive the opener open_url command`; the main window had only event listen/unlisten, while `App.tsx` prevents native link navigation and calls `plugin-opener.openUrl`.
+- GREEN: the only added command permission is `opener:allow-open-url`, scoped to the system-default-browser URL patterns `https://auth.openai.com/*`, `https://chatgpt.com/*`, and legacy `https://chat.openai.com/*`. The insecure `opener:default` set was deliberately not used because it also grants HTTP/mailto/tel and Finder reveal. No shell, filesystem, open-path, reveal, arbitrary application, or HTTP scope is granted.
+- The parser regression verifies official URLs pass and `http:`, `file:`, unrelated hosts, and deceptive `auth.openai.com.evil.example` hosts fail. It also proves that no `opener.open_path`, reveal, shell, or filesystem command enters the effective ACL.
+- A second smoke creates a mock Tauri app from `tauri::generate_context!()` (the same compiled ACL context used by the desktop target) and invokes `plugin:opener|open_url` with a `file:` URL. It receives the opener's `Not allowed to open url` scope error rather than Tauri's `plugin:opener|open_url not allowed` command error, proving the compiled boundary reaches opener scope without launching a browser or starting a login.
+
+### Fresh packaging evidence and limitation
+
+`pnpm --filter @digital-twin/desktop tauri build --bundles app` rebuilt `target/release/bundle/macos/Digital Twin Workbench.app` successfully after the capability change. The focused ACL suite is 2/2 green. This follow-up does not claim a real account login or open an external page: doing so would create a user session and is outside a non-interactive smoke. The compiled IPC smoke and fresh `.app` build establish the authorization boundary; a user can complete the normal login flow with an official Codex-returned URL.

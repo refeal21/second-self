@@ -7,6 +7,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from 'react';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import {
   createDesktopAdapter,
   type ApprovalSummary,
@@ -550,6 +551,7 @@ function TasksPage({
   );
   const [isStarting, setIsStarting] = useState(false);
   const [isResponding, setIsResponding] = useState(false);
+  const [loginUrl, setLoginUrl] = useState('');
   const inputQuestions = task ? parseTaskQuestions(task) : [];
   const hasAllInputAnswers =
     inputQuestions.length > 0 &&
@@ -584,6 +586,32 @@ function TasksPage({
       await report(async () => {
         throw error;
       });
+    }
+  };
+  const login = async () => {
+    setLoginUrl('');
+    try {
+      const result = await adapter.startLogin();
+      const url = new URL(result.authUrl);
+      if (url.protocol !== 'https:') throw new Error('登录地址必须使用 HTTPS。');
+      setLoginUrl(url.toString());
+      await report(async () => ({ status: result.message }));
+    } catch (error) {
+      await report(async () => { throw error; });
+    }
+  };
+  const mutateTask = async (kind: 'cancel' | 'recover') => {
+    if (!task) return;
+    setIsResponding(true);
+    try {
+      const next = kind === 'cancel'
+        ? await adapter.cancelTask(task.id)
+        : await adapter.recoverTask(task.id);
+      setTask(next);
+    } catch (error) {
+      await report(async () => { throw error; });
+    } finally {
+      setIsResponding(false);
     }
   };
   const respond = async (decision: 'approve' | 'decline') => {
@@ -642,10 +670,10 @@ function TasksPage({
               rows={5}
             />
             <div className="form-actions">
-              <span className="muted">工作目录：当前项目</span>
+              <span className="muted">工作目录：Rust 验证的绝对工作区</span>
               <button
                 className="button button-primary"
-                disabled={isStarting || !prompt.trim()}
+                disabled={isStarting || !prompt.trim() || account.status !== 'connected'}
               >
                 {isStarting ? '正在创建…' : '开始任务'}
                 <Icon name="arrowRight" />
@@ -671,10 +699,24 @@ function TasksPage({
           </button>
           <button
             className="text-action"
-            onClick={() => void report(() => adapter.startLogin())}
+            onClick={() => void login()}
           >
             登录或重新登录
           </button>
+          {account.status !== 'connected' && <p className="muted">
+            仅支持活动 ChatGPT 登录；不支持 API Key，也不会保存令牌。
+          </p>}
+          {loginUrl && <a href={loginUrl} target="_blank" rel="noreferrer noopener"
+            onClick={(event) => {
+              if (adapter.mode !== 'tauri') return;
+              event.preventDefault();
+              void report(async () => {
+                await openUrl(loginUrl);
+                return { status: '已在系统浏览器中打开 ChatGPT 登录。' };
+              });
+            }}>
+            在浏览器中打开 ChatGPT 登录
+          </a>}
         </aside>
       </div>
       {task ? (
@@ -689,9 +731,15 @@ function TasksPage({
                     ? '等待你的补充信息'
                     : task.status === 'completed'
                       ? '任务已完成'
-                  : task.status === 'failed'
-                    ? '任务已停止'
-                    : 'Codex 正在处理'}
+                      : task.status === 'cancelled'
+                        ? '任务已取消'
+                        : task.status === 'interrupted' && task.recoverable
+                          ? '任务被中断，可恢复'
+                          : task.status === 'ready'
+                            ? '任务已恢复，可继续'
+                            : task.status === 'failed'
+                              ? '任务已停止'
+                              : 'Codex 正在处理'}
               </p>
             </div>
             <span className="status-label">
@@ -714,6 +762,14 @@ function TasksPage({
               <Icon name="clock" />
               使用量 {task.usage}
             </span>
+            {['running', 'waiting_for_approval', 'waiting_for_input', 'recovering'].includes(task.status) && (
+              <button className="button button-secondary" disabled={isResponding}
+                onClick={() => void mutateTask('cancel')}>取消任务</button>
+            )}
+            {task.status === 'interrupted' && task.recoverable && (
+              <button className="button button-primary" disabled={isResponding}
+                onClick={() => void mutateTask('recover')}>恢复任务</button>
+            )}
             {task.status === 'waiting_for_approval' && (
               <div>
                 <button
@@ -1705,6 +1761,21 @@ function SettingsPage({
           />
           <p className="muted">
             应用会优先使用配置路径，其次检测本机可执行文件。
+          </p>
+          <label htmlFor="pdf-renderer-path">PDF 渲染器路径</label>
+          <input
+            id="pdf-renderer-path"
+            value={settings.pdfRendererPath ?? ''}
+            placeholder="可选，例如 /opt/homebrew/bin/pdftoppm"
+            onChange={(event) =>
+              dispatch({
+                type: 'settings-edited',
+                settings: { ...settings, pdfRendererPath: event.target.value },
+              })
+            }
+          />
+          <p className="muted">
+            QA 依赖 Poppler 的 pdftoppm。留空时依次检查应用资源、Homebrew 常见路径、Codex bundled runtime 与 PATH。
           </p>
         </section>
         <section>

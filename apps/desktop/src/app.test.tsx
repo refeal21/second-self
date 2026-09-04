@@ -349,9 +349,10 @@ describe('desktop workbench interactions', () => {
           prompt,
           status: 'waiting_for_input',
           transcript: [{ role: 'user', text: prompt }],
-          usage: '0 tokens',
-          error: null,
-          pendingInteraction: {
+            usage: '0 tokens',
+            error: null,
+            recoverable: false,
+            pendingInteraction: {
             requestId: 'input-multi',
             kind: 'user_input',
             params: {
@@ -399,6 +400,70 @@ describe('desktop workbench interactions', () => {
       tone: ['简洁'],
       audience: ['管理层'],
     });
+  });
+
+  it('blocks model tasks until active ChatGPT login and exposes the real safe login URL', async () => {
+    const user = userEvent.setup();
+    const base = createDemoDesktopAdapter();
+    const startLogin = vi.fn(async () => ({
+      message: '请继续登录。',
+      authUrl: 'https://auth.example.test/chatgpt',
+    }));
+    const adapter = {
+      ...base,
+      initialState: {
+        ...base.initialState,
+        account: { email: null, plan: null, status: 'logged_out' as const },
+      },
+      startLogin,
+    } satisfies DesktopAdapter;
+    render(<App adapter={adapter} initialRoute="tasks" />);
+
+    expect(screen.getByRole('button', { name: /开始任务/ })).toBeDisabled();
+    expect(screen.getByText(/仅支持活动 ChatGPT 登录/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '登录或重新登录' }));
+    expect(await screen.findByRole('link', { name: '在浏览器中打开 ChatGPT 登录' }))
+      .toHaveAttribute('href', 'https://auth.example.test/chatgpt');
+  });
+
+  it('exposes real cancel and recover controls for general tasks', async () => {
+    const user = userEvent.setup();
+    const base = createDemoDesktopAdapter();
+    const running = {
+      id: 'task-cancellable', prompt: '长任务', status: 'running' as const,
+      transcript: [{ role: 'user' as const, text: '长任务' }], usage: '0 tokens',
+      pendingInteraction: null, error: null, recoverable: false,
+    };
+    const cancelTask = vi.fn(async () => ({ ...running, status: 'cancelled' as const }));
+    const adapter = {
+      ...base,
+      startTask: vi.fn(async () => running),
+      cancelTask,
+    } satisfies DesktopAdapter;
+    render(<App adapter={adapter} initialRoute="tasks" />);
+    await user.click(screen.getByRole('button', { name: /开始任务/ }));
+    await user.click(await screen.findByRole('button', { name: '取消任务' }));
+    expect(cancelTask).toHaveBeenCalledWith('task-cancellable');
+    expect(await screen.findByText('任务已取消')).toBeInTheDocument();
+
+    cleanup();
+    const interrupted = {
+      ...running, id: 'task-recoverable', status: 'interrupted' as const,
+      error: 'App Server exited', recoverable: true,
+    };
+    const recoverTask = vi.fn(async () => ({
+      ...interrupted, status: 'ready' as const, error: null, recoverable: false,
+    }));
+    const recoveryAdapter = {
+      ...base,
+      startTask: vi.fn(async () => interrupted),
+      recoverTask,
+    } satisfies DesktopAdapter;
+    render(<App adapter={recoveryAdapter} initialRoute="tasks" />);
+    await user.click(screen.getByRole('button', { name: /开始任务/ }));
+    await user.click(await screen.findByRole('button', { name: '恢复任务' }));
+    expect(recoverTask).toHaveBeenCalledWith('task-recoverable');
+    expect(await screen.findByText('任务已恢复，可继续')).toBeInTheDocument();
   });
 
   it('shows unavailable instead of empty-success copy for native collections', async () => {
@@ -457,10 +522,13 @@ describe('desktop workbench interactions', () => {
     await user.type(screen.getByLabelText('默认工作区路径'), '/tmp/persisted');
     await user.clear(screen.getByLabelText('Codex 可执行路径'));
     await user.type(screen.getByLabelText('Codex 可执行路径'), '/usr/local/bin/codex');
+    await user.clear(screen.getByLabelText('PDF 渲染器路径'));
+    await user.type(screen.getByLabelText('PDF 渲染器路径'), '/opt/homebrew/bin/pdftoppm');
     await user.click(screen.getByRole('button', { name: '保存设置' }));
     expect(save).toHaveBeenCalledWith({
       workspacePath: '/tmp/persisted',
       codexPath: '/usr/local/bin/codex',
+      pdfRendererPath: '/opt/homebrew/bin/pdftoppm',
     });
     await user.click(screen.getByRole('link', { name: '首页' }));
     await user.click(screen.getByRole('link', { name: '设置' }));
@@ -468,6 +536,9 @@ describe('desktop workbench interactions', () => {
     expect(screen.getByLabelText('默认工作区路径')).toHaveValue('/tmp/persisted');
     expect(screen.getByLabelText('Codex 可执行路径')).toHaveValue(
       '/usr/local/bin/codex',
+    );
+    expect(screen.getByLabelText('PDF 渲染器路径')).toHaveValue(
+      '/opt/homebrew/bin/pdftoppm',
     );
   });
 });

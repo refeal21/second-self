@@ -1,4 +1,5 @@
 import JSZip from 'jszip';
+import { PNG } from 'pngjs';
 import { describe, expect, it } from 'vitest';
 import {
   PptExportService,
@@ -14,6 +15,17 @@ const onePixelPng = Uint8Array.from(
     'base64',
   ),
 );
+
+function fullSlidePng(): Uint8Array {
+  const png = new PNG({ width: 160, height: 90 });
+  for (let offset = 0; offset < png.data.length; offset += 4) {
+    png.data[offset] = 20;
+    png.data[offset + 1] = 80;
+    png.data[offset + 2] = 160;
+    png.data[offset + 3] = 255;
+  }
+  return new Uint8Array(PNG.sync.write(png));
+}
 
 function deck(
   visual: ApprovedPptDeck['slides'][number]['visual'],
@@ -73,11 +85,11 @@ async function unzip(bytes: Uint8Array) {
 }
 
 describe('PptxGenJS editable exporter', () => {
-  it('keeps approved text, tables, charts, and shapes editable without duplicating a full-slide PNG', async () => {
+  it('embeds a masked approved full-slide visual while keeping text, tables, charts, and shapes editable', async () => {
     const exporter = new PptxGenJsExporter();
     const bytes = await exporter.export(
       deck({
-        image: onePixelPng,
+        image: fullSlidePng(),
         asset: {
           artifactPath: '/workspace/project-1/visuals/slide-1-v1.png',
           mediaType: 'image/png',
@@ -112,8 +124,8 @@ describe('PptxGenJS editable exporter', () => {
     expect(slideXml).toContain('<p:sp>');
     expect(slideXml).toContain('<a:prstGeom prst="rect">');
     expect(slideXml?.match(/Approved growth title/g)).toHaveLength(1);
-    expect(slideXml).not.toContain('<p:pic>');
-    expect(media).toEqual([]);
+    expect(slideXml).toContain('<p:pic>');
+    expect(media).toHaveLength(1);
     expect(relationshipsXml).toContain(
       'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"',
     );
@@ -121,13 +133,25 @@ describe('PptxGenJS editable exporter', () => {
     expect(relationshipsXml).toContain(
       'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"',
     );
-    expect(relationshipsXml).not.toContain('/image"');
+    expect(relationshipsXml).toContain('/image"');
     expect(chartXml).toContain('<c:numCache>');
     expect(chartXml).toContain('<c:v>100</c:v>');
     expect(chartXml).toContain('<c:v>112</c:v>');
     expect(notesXml).toContain('[Sources]');
     expect(notesXml).toContain('Annual report');
     expect(notesXml).toContain('page 8');
+
+    const maskedPng = PNG.sync.read(
+      await archive.file(media[0]!)!.async('nodebuffer'),
+    );
+    const titlePixel = (8 * maskedPng.width + 20) * 4;
+    expect([...maskedPng.data.subarray(titlePixel, titlePixel + 4)]).toEqual([
+      247, 249, 252, 255,
+    ]);
+    const retainedVisualPixel = (70 * maskedPng.width + 70) * 4;
+    expect([...maskedPng.data.subarray(retainedVisualPixel, retainedVisualPixel + 4)]).toEqual([
+      20, 80, 160, 255,
+    ]);
   });
 
   it('embeds only an explicitly text-free complex visual asset', async () => {

@@ -28,6 +28,10 @@ class ScriptedPptAppServer implements NativeAppServerTransport {
     const message = JSON.parse(line) as NativeJsonRpcMessage;
     if (message.id === undefined || !message.method) return;
     let result: unknown = {};
+    if (message.method === 'account/read') result = {
+      account: { type: 'chatgpt', email: 'production@example.com', planType: 'plus' },
+      requiresOpenaiAuth: false,
+    };
     if (message.method === 'thread/start') result = { thread: { id: `thread-${this.turn + 1}` } };
     if (message.method === 'turn/start') result = { turn: { id: `turn-${++this.turn}` } };
     queueMicrotask(() => this.line?.(JSON.stringify({ id: message.id, result })));

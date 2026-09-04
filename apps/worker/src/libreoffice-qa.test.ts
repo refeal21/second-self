@@ -174,9 +174,14 @@ describe('LibreOffice presentation QA', () => {
     archive.file('ppt/presentation.xml', '<p:presentation><p:sldSz cx="1000" cy="500"/></p:presentation>');
     archive.file('ppt/slides/slide1.xml', [
       '<p:sld><p:sp><a:xfrm><a:off x="900" y="10"/><a:ext cx="200" cy="100"/></a:xfrm>',
-      '<a:rPr typeface="Missing Board Font"/><a:srcRect l="60000" r="50000"/></p:sp></p:sld>',
+      '<a:rPr typeface="Missing Board Font"/><a:t>可编辑标题</a:t><a:srcRect l="60000" r="50000"/></p:sp>',
+      '<p:pic/><a:tbl/><c:chart/></p:sld>',
     ].join(''));
-    archive.file('ppt/slides/_rels/slide1.xml.rels', '<Relationships><Relationship Id="rId1" Target="../media/missing.png"/></Relationships>');
+    archive.file('ppt/media/image1.png', new Uint8Array([1, 2, 3]));
+    archive.file('ppt/slides/_rels/slide1.xml.rels', [
+      '<Relationships><Relationship Id="rId1" Target="../media/missing.png"/>',
+      '<Relationship Id="rId2" Target="../media/image1.png"/></Relationships>',
+    ].join(''));
 
     const result = await inspectPptxOoxml(await archive.generateAsync({ type: 'uint8array' }));
 
@@ -184,6 +189,14 @@ describe('LibreOffice presentation QA', () => {
     expect(result.missingResources).toContain('ppt/media/missing.png');
     expect(result.outOfBoundsObjects).toEqual(['ppt/slides/slide1.xml#1']);
     expect(result.cropIssues).toEqual(['ppt/slides/slide1.xml#crop-1']);
+    expect(result.mediaCount).toBe(1);
+    expect(result.slideEvidence).toEqual([{
+      imageCount: 1,
+      textValues: ['可编辑标题'],
+      tableCount: 1,
+      chartCount: 1,
+      shapeCount: 1,
+    }]);
   });
 
   it('detects bundled soffice, converts and renders headlessly, then writes one atomic QA bundle', async () => {

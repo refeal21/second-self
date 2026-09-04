@@ -20,6 +20,8 @@
 pnpm golden:qa
 ```
 
+该入口直接使用 Node 的 `tsx` loader，不创建 `tsx` CLI IPC socket；在禁止 Unix socket 的受限构建环境中也能执行同一 Golden 脚本。
+
 流程会先验证跳过材料分析、大纲批准、逐页规格批准或任一视觉批准均失败，然后走完合法审批链。最终断言包括：
 
 - PPTX 中的中文与已批准规格完全一致。
@@ -56,9 +58,9 @@ artifacts/qa/golden-project/golden-project/qa/run-1/rendered-1.png … rendered-
 
 ## 内存验收
 
-2026-09-04 在当前 Apple Silicon Mac 的最新 release `.app` 和生产验收边界上，以 100 ms 间隔记录整条验收进程树。原生 sampler 接收真实时间戳操作事件，并在每个事件到达时立即采样，再持续覆盖稳定窗口。权威证据为：
+2026-09-04 在当前 Apple Silicon Mac 的最新 release `.app` 和生产验收边界上，以 100 ms 间隔记录整条验收进程树。原生 sampler 接收真实时间戳操作事件，并在每个事件到达时立即采样，再持续覆盖稳定窗口。最新权威证据为：
 
-- `artifacts/qa/production-harness/memory.json`：本轮 59 个样本，峰值 `472.6 MiB`，低于 4096 MiB 门槛。
+- `artifacts/qa/production-harness/memory.json`：本轮 90 个样本，峰值 `618.8 MiB`，低于 4096 MiB 门槛。
 - 时间线实际覆盖 `create-project`、`open-project`、`quit-worker-close-sqlite`、`restart-rust-sqlite-worker`、`reopen-project-after-restart` 和 `stable-sampling-window`，还覆盖材料、两次整体审批、五页视觉、导出与 QA。
 - 每个样本保存 PID、PPID、RSS 和可执行文件路径；观测到 Node 驱动器、编译后的 Rust Workbench harness、`.app` 内嵌 SEA Worker、LibreOffice 和 pdftoppm。
 
@@ -77,10 +79,16 @@ macOS RSS 会随缓存波动；判定应使用同一 release 构建、同一 pro
 
 `artifacts/qa/production-harness/result.json` 是打包生产路径的确定性证据。它使用真实 production adapter、编译后的 Rust Workbench/Tauri service delegates、SQLite、`.app` 内嵌 SEA、Rust held-fd/`O_NOFOLLOW`/原子写入和真实 LibreOffice/pdftoppm；只有 Codex 结构化生成结果由脚本固定。
 
-验收要求包括：完成状态、SQLite 与 Worker 双重重启恢复、五张互不相同的批准全页 PNG、逐页比较分数、真实可读 `.txt` 报告、版本/审批/任务/产物行数，以及重启后的完整 provenance。该 harness 不能替代 Keynote 人工检查，也不声称验证 Microsoft PowerPoint。
+验收要求包括：完成状态、SQLite 与 Worker 双重重启恢复、五张互不相同的批准全页 PNG、逐页比较分数、真实可读 `.txt` 报告、版本/审批/任务/产物行数，以及重启后的完整 provenance。harness 以空 PATH 启动 Rust 边界；本轮自动发现 Codex runtime 的原生 LibreOffice 与 pdftoppm，`pptxOoxml.mediaCount=5`，五页均 `imageCount=1`，表格页保留原生表格、图表页保留原生图表，并且基础形状与唯一可编辑标题均有逐页证据。五张 rendered PNG 都有 SHA-256 且 `likelyTofu=false`，原始 1920×1080 页面 1/4 又经人工像素抽查，中文可读。
+
+同一结果的 `chatGptAuthGate` 记录 8 次 `account/read`（3 次结构化生成和 5 次视觉请求）、3 次 `thread/start`/`turn/start`，且首次账户读取发生在首次 `thread/start` 之前。API-key/未知/空计划的负向 spy 测试断言不会调用 native/Worker、`workspace_directory`、`thread/start` 或 `turn/start`。
 
 完整聚合恢复还会核对任务 ID 中的修订号、状态/错误组合，以及分析、大纲、细化、视觉、转换和 QA 的任务来源。视觉阶段不再只检查阶段区间：校验器按每个 revision 重放 `visual_review → blocked → visual_review/conversion`，同时推进每页 `none → placeholder/candidate → frozen`，并把替换、批准和重新打开与完整 visual/version/approval 历史绑定。兼容边界保留 schema v1、SQLite 原 JSON 和“直接注入旧材料/全部材料经 Rust 附件命令写入”两种既有来源偏移。最终 `.app` 内嵌 SEA 的负向 smoke 使用真实 revision-29/12-task 完成态，只把最后一个 visual task 从 revision 25 改到 approval 所在的 revision 27，要求恢复原子拒绝且原聚合完全不变。这里的 provenance 是结构化合法执行证明，不是密码学防篡改日志。
 
 ## 运行时与配置审计
 
-同一构建的只读审计结果：主程序、Worker 和 Codex App Server 均没有 TCP listener；仓库与两个 bundle executables 中未发现 `OPENAI_API_KEY` 或 `api.openai.com`；唯一 API-key 字样位于“拒绝 Codex API-key 登录通知”的负向单元测试。生产通信为 Tauri IPC 与 stdio。
+同一构建的只读审计结果：生产源码没有 TCP listener 实现，短时启动的主程序 PID 没有 TCP 条目；仓库生产代码与两个 bundle executables 中未发现 `OPENAI_API_KEY`、`api.openai.com` 或 `sk-proj-`。API-key 字样仅存在于明确拒绝该认证模式的实现、UI 文案与负向测试。生产通信为 Tauri IPC 与 stdio。
+
+最终 `.app` 为 125 MiB，只含 arm64 主程序与 arm64 SEA Worker。源 SEA 与 bundle SEA 的 SHA-256 都是 `cc2306620b3708c8d19b0c909769bbc7d2033c7dea938e5c6fe94e3b92db45cb`。Node v22.21.1 的 143,299 字节 LICENSE/第三方声明与构建 runtime 字节相同。bundle 是 ad-hoc/linker-signed、没有 TeamIdentifier；`codesign --verify --deep --strict` 因未密封资源退出 1，因此不声称严格签名或公证通过。
+
+生产组件视觉测试为 `native-workspace.test.tsx` 与 `app.test.tsx`，覆盖真实 `<img>` 加载、1280×720/16:9 门禁、坏图禁批、意见重生成、上传替换和批准页 reopen。当前受限环境禁止 Vite 监听端口，Playwright 启动本机 Chrome 又被沙箱终止，Browser Use 也按安全策略拒绝 `file://`；没有把 browser screenshot 伪报为通过。真实组件交互测试和生产 rendered PNG 原图共同作为本轮视觉证据。

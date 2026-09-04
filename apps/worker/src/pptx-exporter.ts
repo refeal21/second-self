@@ -1,5 +1,6 @@
 import { basename } from 'node:path';
 import PptxGenJS from 'pptxgenjs';
+import { PNG } from 'pngjs';
 import type {
   ApprovedVisualAsset,
   SlideChart,
@@ -68,10 +69,11 @@ export class PptxGenJsExporter implements PptxExporter {
       const slide = pptx.addSlide();
       slide.background = { color: 'F7F9FC' };
       const visual = item.visual;
-      if (
+      if (visual?.asset.usage === 'full_slide_reference') {
+        addMaskedFullSlideVisual(slide, visual.asset, visual.image, item.spec);
+      } else if (
         visual &&
         visual.asset.textFree &&
-        visual.asset.usage !== 'full_slide_reference' &&
         visual.asset.embeddingAudit?.approvedForEmbedding === true &&
         visual.asset.embeddingAudit.classification === visual.asset.usage
       ) {
@@ -94,6 +96,60 @@ export class PptxGenJsExporter implements PptxExporter {
     if (output instanceof Uint8Array) return output;
     if (output instanceof ArrayBuffer) return new Uint8Array(output);
     throw new Error('PptxGenJS returned an unsupported output type');
+  }
+}
+
+function addMaskedFullSlideVisual(
+  slide: PptxGenJS.Slide,
+  asset: ApprovedVisualAsset,
+  image: Uint8Array,
+  spec: SlideSpec,
+): void {
+  const masked = maskEditableObjectRegions(image, spec);
+  slide.addImage({
+    data: `data:image/png;base64,${Buffer.from(masked).toString('base64')}`,
+    x: 0,
+    y: 0,
+    w: 13.333,
+    h: 7.5,
+    altText: `${asset.altText} Editable text and object regions masked.`,
+  });
+}
+
+function maskEditableObjectRegions(image: Uint8Array, spec: SlideSpec): Uint8Array {
+  let png: ReturnType<typeof PNG.sync.read>;
+  try {
+    png = PNG.sync.read(Buffer.from(image));
+  } catch {
+    throw new Error('Approved full-slide visual must be a decodable PNG');
+  }
+  const regions: Array<{ x: number; y: number; w: number; h: number }> = [
+    { x: 0.75, y: 0.42, w: 11.8, h: 0.65 },
+    ...(spec.body.length > 0 ? [{ x: 0.8, y: 1.35, w: 5.7, h: 1.15 }] : []),
+    ...spec.tables.map((_table, index) => ({ x: 0.8, y: 2.75 + index * 1.35, w: 5.7, h: 1.05 })),
+    ...spec.charts.map((_chart, index) => ({ x: 6.9, y: 2.55 + index * 0.2, w: 5.7, h: 3.8 })),
+    ...spec.shapes.map(({ x, y, w, h }) => ({ x, y, w, h })),
+  ];
+  for (const region of regions) fillRegion(png, region);
+  return new Uint8Array(PNG.sync.write(png));
+}
+
+function fillRegion(
+  png: ReturnType<typeof PNG.sync.read>,
+  region: { x: number; y: number; w: number; h: number },
+): void {
+  const left = Math.max(0, Math.floor(region.x / 13.333 * png.width));
+  const right = Math.min(png.width, Math.ceil((region.x + region.w) / 13.333 * png.width));
+  const top = Math.max(0, Math.floor(region.y / 7.5 * png.height));
+  const bottom = Math.min(png.height, Math.ceil((region.y + region.h) / 7.5 * png.height));
+  for (let y = top; y < bottom; y += 1) {
+    for (let x = left; x < right; x += 1) {
+      const offset = (y * png.width + x) * 4;
+      png.data[offset] = 247;
+      png.data[offset + 1] = 249;
+      png.data[offset + 2] = 252;
+      png.data[offset + 3] = 255;
+    }
   }
 }
 

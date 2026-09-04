@@ -42,6 +42,15 @@ pub fn ppt_project_directory_service(
 }
 
 #[tauri::command]
+pub fn workspace_directory(state: State<'_, WorkbenchService>) -> Result<String, String> {
+    workspace_directory_service(&state)
+}
+
+pub fn workspace_directory_service(service: &WorkbenchService) -> Result<String, String> {
+    service.workspace_directory()
+}
+
+#[tauri::command]
 pub fn ppt_read_artifact(
     state: State<'_, WorkbenchService>,
     project_id: String,
@@ -242,9 +251,10 @@ pub fn save_desktop_settings(
     state: State<'_, WorkbenchService>,
     workspace_path: String,
     codex_path: String,
+    pdf_renderer_path: String,
 ) -> Result<StatusResult, String> {
     Ok(StatusResult {
-        status: state.save_settings(workspace_path, codex_path)?,
+        status: state.save_settings(workspace_path, codex_path, pdf_renderer_path)?,
     })
 }
 

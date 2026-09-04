@@ -150,7 +150,7 @@ export type NativePipelineAction =
   | { kind: 'outline.approve'; at: string }
   | { kind: 'details.submit'; at: string; specs: readonly SlideSpec[] }
   | { kind: 'details.approve'; at: string }
-  | { kind: 'visual.generate'; at: string; slideId: string }
+  | { kind: 'visual.generate'; at: string; slideId: string; feedback?: string }
   | { kind: 'visual.replace'; at: string; slideId: string; imageBase64: string; altText: string }
   | { kind: 'visual.approve'; at: string; slideId: string }
   | { kind: 'visual.reopen'; at: string; slideId: string }
@@ -180,6 +180,16 @@ export function parseNativePipelineAction(value: unknown): NativePipelineAction 
       validateSlideSpecsValue(action.specs);
       break;
     case 'visual.generate':
+      requireExactKeys(
+        action,
+        action.feedback === undefined ? ['kind', 'at', 'slideId'] : ['kind', 'at', 'slideId', 'feedback'],
+        kind,
+      );
+      requireIdentifier(requireStringValue(action.slideId, 'action.slideId'), 'slide id');
+      if (action.feedback !== undefined) {
+        requireNonEmpty(requireStringValue(action.feedback, 'action.feedback'), 'visual feedback');
+      }
+      break;
     case 'visual.approve':
     case 'visual.reopen':
       requireExactKeys(action, ['kind', 'at', 'slideId'], kind);
@@ -213,7 +223,7 @@ export function parseNativePipelineAction(value: unknown): NativePipelineAction 
 
 export interface NativePptRpcRuntimeOptions {
   imageGenAvailable: boolean;
-  generateVisual?: (slideId: string, spec: SlideSpec) => Promise<{
+  generateVisual?: (slideId: string, spec: SlideSpec, feedback?: string) => Promise<{
     image: Uint8Array;
     usage: NativeVisualVersion['usage'];
     textFree: boolean;
@@ -401,7 +411,7 @@ export class NativePptRpcRuntime {
           throw new Error('ImageGen capability is available but no turn runner is connected');
         }
         const spec = requireSpec(state, action.slideId);
-        const generated = await this.options.generateVisual(action.slideId, spec);
+        const generated = await this.options.generateVisual(action.slideId, spec, action.feedback);
         ({ message } = await replaceVisual(state, writes, {
           ...action,
           imageBase64: Buffer.from(generated.image).toString('base64'),
@@ -611,10 +621,40 @@ export class NativePptRpcRuntime {
         });
         const comparisons = await new PngPixelPageComparator().compare(pages, approvedVisuals);
         const blankPages = comparisons.flatMap((comparison, index) => comparison.blank ? [index + 1] : []);
+        const tofuPages = pages.flatMap(({ contents }, index) =>
+          detectLikelyTofuGlyphs(contents) ? [index + 1] : []);
         const fontChecks = inspection.fonts.map((font) => ({
           font,
           available: preparation.fontAvailability[font] === true,
         }));
+        const editableEvidenceIssues = specs.flatMap((spec, index) => {
+          const evidence = inspection.slideEvidence?.[index];
+          if (!evidence) return [`Missing OOXML object evidence for page ${index + 1}`];
+          const titleOccurrences = evidence.textValues.filter((value) => value === spec.title).length;
+          const missingBody = spec.body.filter((text) =>
+            !evidence.textValues.some((value) => value === text || value.includes(text)));
+          const minimumShapes = 1 + (spec.body.length > 0 ? 1 : 0) + spec.shapes.length;
+          return [
+            ...(evidence.imageCount > 0 ? [] : [
+              `Approved visual is not mapped to an OOXML image on page ${index + 1}`,
+            ]),
+            ...(titleOccurrences === 1 ? [] : [
+              `Editable title must occur exactly once on page ${index + 1}; found ${titleOccurrences}`,
+            ]),
+            ...(missingBody.length === 0 ? [] : [
+              `Editable body text is missing on page ${index + 1}: ${missingBody.join(', ')}`,
+            ]),
+            ...(evidence.tableCount >= spec.tables.length ? [] : [
+              `Editable table count is incomplete on page ${index + 1}`,
+            ]),
+            ...(evidence.chartCount >= spec.charts.length ? [] : [
+              `Editable chart count is incomplete on page ${index + 1}`,
+            ]),
+            ...(evidence.shapeCount >= minimumShapes ? [] : [
+              `Editable basic-shape evidence is incomplete on page ${index + 1}`,
+            ]),
+          ];
+        });
         const issues = [
           ...(inspection.slideCount === specs.length ? [] : [
             `OOXML slide count mismatch: expected ${specs.length}, found ${inspection.slideCount}`,
@@ -622,8 +662,13 @@ export class NativePptRpcRuntime {
           ...inspection.missingResources.map((path) => `Missing OOXML resource: ${path}`),
           ...inspection.outOfBoundsObjects.map((id) => `Out-of-bounds slide object: ${id}`),
           ...inspection.cropIssues.map((id) => `Invalid image crop: ${id}`),
+          ...((inspection.mediaCount ?? 0) > 0 ? [] : ['PPTX contains no embedded approved visual media']),
+          ...editableEvidenceIssues,
           ...fontChecks.filter(({ available }) => !available).map(({ font }) => `Unavailable font: ${font}`),
           ...(blankPages.length === 0 ? [] : [`Blank rendered pages: ${blankPages.join(', ')}`]),
+          ...(tofuPages.length === 0 ? [] : [
+            `Likely tofu glyph boxes detected on rendered pages: ${tofuPages.join(', ')}`,
+          ]),
           ...comparisons.flatMap((comparison, index) =>
             comparison.differenceScore !== undefined && comparison.differenceScore > 0.6
               ? [`Visual difference exceeds threshold on page ${index + 1}: ${comparison.differenceScore}`]
@@ -751,6 +796,118 @@ function decodeBase64(value: string, label: string): Uint8Array {
   return new Uint8Array(Buffer.from(value, 'base64'));
 }
 
+/**
+ * Detect repeated hollow replacement-glyph boxes in a rendered page. The
+ * detector intentionally requires a run of at least three similarly sized,
+ * baseline-aligned boxes so ordinary borders, cards, and single icons do not
+ * fail QA. Both dark-on-light and light-on-dark text are checked.
+ */
+export function detectLikelyTofuGlyphs(contents: Uint8Array): boolean {
+  let png: ReturnType<typeof PNG.sync.read>;
+  try {
+    png = PNG.sync.read(Buffer.from(contents));
+  } catch {
+    return false;
+  }
+  const dark = findHollowGlyphBoxes(png, (luminance) => luminance < 96);
+  if (containsRepeatedGlyphRun(dark)) return true;
+  const light = findHollowGlyphBoxes(png, (luminance) => luminance > 224);
+  return containsRepeatedGlyphRun(light);
+}
+
+interface GlyphBox {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+function findHollowGlyphBoxes(
+  png: ReturnType<typeof PNG.sync.read>,
+  selected: (luminance: number) => boolean,
+): GlyphBox[] {
+  const { width, height, data } = png;
+  const selectedPixels = new Uint8Array(width * height);
+  for (let index = 0; index < selectedPixels.length; index += 1) {
+    const offset = index * 4;
+    const alpha = data[offset + 3] ?? 0;
+    if (alpha < 128) continue;
+    const luminance = Math.round(
+      (data[offset] ?? 0) * 0.2126 +
+      (data[offset + 1] ?? 0) * 0.7152 +
+      (data[offset + 2] ?? 0) * 0.0722,
+    );
+    selectedPixels[index] = selected(luminance) ? 1 : 0;
+  }
+
+  const visited = new Uint8Array(selectedPixels.length);
+  const boxes: GlyphBox[] = [];
+  for (let seed = 0; seed < selectedPixels.length; seed += 1) {
+    if (selectedPixels[seed] === 0 || visited[seed] === 1) continue;
+    const queue = [seed];
+    visited[seed] = 1;
+    let cursor = 0;
+    let left = width;
+    let right = 0;
+    let top = height;
+    let bottom = 0;
+    let count = 0;
+    while (cursor < queue.length) {
+      const index = queue[cursor++]!;
+      const x = index % width;
+      const y = Math.floor(index / width);
+      left = Math.min(left, x); right = Math.max(right, x);
+      top = Math.min(top, y); bottom = Math.max(bottom, y);
+      count += 1;
+      for (const next of [index - 1, index + 1, index - width, index + width]) {
+        if (next < 0 || next >= selectedPixels.length || visited[next] === 1 || selectedPixels[next] === 0) continue;
+        const nextX = next % width;
+        if (Math.abs(nextX - x) > 1) continue;
+        visited[next] = 1;
+        queue.push(next);
+      }
+    }
+    const boxWidth = right - left + 1;
+    const boxHeight = bottom - top + 1;
+    if (boxWidth < 8 || boxHeight < 8 || boxWidth > 96 || boxHeight > 96) continue;
+    if (Math.abs(boxWidth / boxHeight - 1) > 0.25) continue;
+    const innerLeft = left + Math.max(2, Math.floor(boxWidth * 0.2));
+    const innerRight = right - Math.max(2, Math.floor(boxWidth * 0.2));
+    const innerTop = top + Math.max(2, Math.floor(boxHeight * 0.2));
+    const innerBottom = bottom - Math.max(2, Math.floor(boxHeight * 0.2));
+    let innerSelected = 0;
+    let innerPixels = 0;
+    for (let y = innerTop; y <= innerBottom; y += 1) {
+      for (let x = innerLeft; x <= innerRight; x += 1) {
+        innerPixels += 1;
+        innerSelected += selectedPixels[y * width + x] ?? 0;
+      }
+    }
+    if (innerPixels === 0 || innerSelected / innerPixels > 0.08) continue;
+    const expectedPerimeter = 2 * boxWidth + 2 * boxHeight - 4;
+    if (count < expectedPerimeter * 0.65 || count > boxWidth * boxHeight * 0.55) continue;
+    boxes.push({ left, top, width: boxWidth, height: boxHeight });
+  }
+  return boxes;
+}
+
+function containsRepeatedGlyphRun(boxes: readonly GlyphBox[]): boolean {
+  for (const anchor of boxes) {
+    const run = boxes.filter((box) =>
+      Math.abs(box.width - anchor.width) <= Math.max(2, anchor.width * 0.2) &&
+      Math.abs(box.height - anchor.height) <= Math.max(2, anchor.height * 0.2) &&
+      Math.abs(box.top - anchor.top) <= Math.max(2, anchor.height * 0.35),
+    ).sort((left, right) => left.left - right.left);
+    let consecutive = 1;
+    for (let index = 1; index < run.length; index += 1) {
+      const gap = run[index]!.left - (run[index - 1]!.left + run[index - 1]!.width);
+      consecutive = gap >= -2 && gap <= anchor.width * 1.5 ? consecutive + 1 : 1;
+      if (consecutive >= 3) return true;
+    }
+  }
+  return false;
+}
+
 async function replaceVisual(
   state: NativePptPipeline,
   writes: NativeArtifactWrite[],
@@ -776,10 +933,15 @@ async function replaceVisual(
     throw new Error('Approved visual must be reopened before replacement');
   }
   const image = new Uint8Array(Buffer.from(input.imageBase64, 'base64'));
+  let decoded: PNG;
   try {
-    PNG.sync.read(Buffer.from(image));
+    decoded = PNG.sync.read(Buffer.from(image));
   } catch {
     throw new Error('Replacement visual must be a decodable PNG');
+  }
+  const ratio = decoded.height > 0 ? decoded.width / decoded.height : 0;
+  if (decoded.width < 640 || decoded.height < 360 || Math.abs(ratio - 16 / 9) > 0.02) {
+    throw new Error('Replacement visual must be a reasonable 16:9 PNG (at least 640x360)');
   }
   const reuseReopenedDraft = existing?.relativePath === '' && existing.byteLength === 0;
   const sequence = reuseReopenedDraft

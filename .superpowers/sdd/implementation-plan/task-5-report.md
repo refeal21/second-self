@@ -223,3 +223,56 @@ No schema migration or action-journal field was introduced. Rust and SQLite alre
 ### Residual risk
 
 The schema-v1 aggregate proves structural legal executability, not which actor emitted an indistinguishable legal action and not cryptographic append-only history. The replay search is iterative and memoized to avoid recursive-stack failure; its state space grows with reopen permutations, although current production decks and the five-page acceptance remain small. Live ImageGen, Keynote/PowerPoint, signing and notarization boundaries are unchanged.
+
+## 5H final centralized production-chain fix — 2026-09-04
+
+This section supersedes stale counts, paths and acceptance claims in 5E–5G. No commit was created; `.git` remained read-only throughout this final wave.
+
+### RED evidence established before implementation
+
+- Rust production QA was able to report an installed Chinese font without creating or passing `FONTCONFIG_FILE`, and the prior page checks had no tofu detector. The production harness with `PATH=''` then exposed two additional real failures: first `soffice` was undiscoverable, then the Codex runtime `env bash` wrappers exited 127.
+- The native approval component showed only path/SHA and allowed no feedback-driven regeneration or approved-page reopen. Component REDs found no candidate `<img>`, no load/dimension gate and no reopen control.
+- User replacement visuals were classified as full-slide references and excluded from export. The OOXML RED had `ppt/media` count 0. A 1×1 PNG also reached the pre-fix approval path.
+- API-key/null/empty-plan account cases could reach the old task path without an atomic account gate; the UI treated an empty ChatGPT plan as connected. Spy REDs asserted zero workspace, `thread/start` and `turn/start` calls on rejection.
+- General tasks used `cwd: '.'`; there was no Rust command providing the canonical configured workspace.
+- A Worker exit before generation registration was discarded and left a dead cached generation. A QA root process could exit while a descendant retained stdout, leaving an unbounded reader join. Cancel/recover existed below the adapter but was unreachable from the UI. `pdftoppm` discovery depended on PATH. Project rename updated the relational name without the authoritative pipeline JSON name.
+- The documented `pnpm golden:qa` command used the `tsx` CLI and failed with a sandbox Unix-socket `EPERM` before the Golden script ran.
+
+### Production architecture after the fix
+
+- Rust creates a run-local Fontconfig pointing to the three macOS system font directories and passes `FONTCONFIG_FILE`, `FONTCONFIG_PATH` and `XDG_CACHE_HOME` explicitly to LibreOffice and pdftoppm. The Worker detects repeated aligned hollow-square glyphs on both light and dark backgrounds and blocks `qa-rendering` rather than accepting unreadable Chinese.
+- Executable discovery validates absolute executable files across bundle resources, standard install/Homebrew paths, explicit overrides and Codex runtime. Native Mach-O LibreOffice/pdftoppm binaries precede their `env bash` wrappers, so the production harness passes with an empty PATH.
+- QA children run in isolated process groups. Root exit and timeout both terminate descendants; stdout/stderr capture and drain are byte/time bounded. The descendant-inherits-stdout regression returns in under two seconds.
+- The native UI reads the artifact only through `ppt_read_artifact`, renders the complete PNG as an `<img>`, and enables approval only after a successful load of a reasonable 16:9 image (at least 640×360). It exposes modification feedback, regeneration, upload replacement and approved-page reopen without bypassing sequential approval.
+- Export masks editable title/body/table/chart/shape regions in the approved bitmap, embeds one retained complex visual layer per slide, then adds native editable OOXML objects. Production acceptance requires `media>0`, one image mapping per page, one editable title occurrence, body content and the expected table/chart/basic-shape objects. A decoded 1×1 or non-16:9 PNG is rejected before state mutation.
+- Every general or PPT structured model task calls `account/read` immediately before task creation and accepts only `type=chatgpt` with a nonempty plan. Unsupported/unknown/logged-out/empty-plan cases reject before Rust workspace lookup, `thread/start` or `turn/start`; the UI remains disabled and directs the user to ChatGPT login. Tokens and API keys are neither accepted nor persisted.
+- General-task cwd comes only from Rust `workspace_directory`; PPT task cwd comes only from the Rust project directory command. Both must be canonical absolute paths. Cancel/recover are wired through adapter and UI. Startup exits invalidate the pending Worker generation, and a later request starts a new process.
+- Project rename updates relational and pipeline JSON names in one transaction. Poppler has an explicit settings field and capability error. ChatGPT login URLs must be HTTPS and are opened with the Tauri system-browser plugin.
+
+### Fresh GREEN evidence
+
+- `pnpm typecheck`, `pnpm lint`, `pnpm test`, and Rust fmt check: green. Counts are core 8/8, Worker 165/165, desktop 68/68, Rust 26/26.
+- `pnpm golden:qa`: `completed`, 5/5, all four skip guards true, five distinct approved visual paths, maximum difference `0.045109`, no issues and no repair. The script now uses the no-IPC Node loader.
+- Presentations `slides_test.py`: no overflow for Golden and production-harness PPTX.
+- Fresh Worker SEA and `.app` build: green. Packaged smoke completes revision 29 with 12 tasks and five distinct visuals, and atomically rejects forged restore, unknown/malformed actions and the in-range task-history forgery.
+- Latest production harness: project `project-1788508015569-1`, revision 29, SQLite and Worker restart/reopen true, 7 approvals, 7 versions, 12 tasks and 23 artifacts. It used native Codex-runtime LibreOffice/pdftoppm under `PATH=''`, rendered 5/5 pages, and reached `completed` with maximum difference `0.062731`.
+- Production PPTX evidence: `mediaCount=5`; each of five slides has `imageCount=1`; the table slide has one native table, the chart slide one native chart, and every slide retains basic shapes and exactly one editable title. All five rendered PNG SHA-256 records have `likelyTofu=false`; pages 1 and 4 were also inspected at original resolution and contain readable Chinese.
+- Account-gate evidence: 8 account reads cover 3 structured turns and 5 visual requests; there are 3 thread starts and 3 turns, with account read before the first thread. API-key/null/empty-plan spy cases call neither native/Worker execution, workspace lookup nor thread/turn start.
+- Memory evidence: 90 process-tree samples across create, approvals, restart, export and real QA; peak `618.8 MiB`, below 4096 MiB.
+- Bundle audit: 125 MiB, arm64 main and Worker. Source/bundle SEA SHA-256 both `cc2306620b3708c8d19b0c909769bbc7d2033c7dea938e5c6fe94e3b92db45cb`. Bundled Node v22.21.1 LICENSE is byte-identical to the 143,299-byte build-runtime LICENSE. Production/source/binary scans found no `OPENAI_API_KEY`, `api.openai.com`, `sk-proj-` or TCP-listener implementation; a short app launch showed no TCP entries.
+
+### Authoritative outputs
+
+- `.app`: `apps/desktop/src-tauri/target/release/bundle/macos/Digital Twin Workbench.app`
+- production result: `artifacts/qa/production-harness/result.json`
+- memory: `artifacts/qa/production-harness/memory.json`
+- editable PPTX: `artifacts/qa/production-harness/workspace/project-1788508015569-1/exports/production-harness.pptx`
+- readable QA: `artifacts/qa/production-harness/workspace/project-1788508015569-1/qa/qa-round-1.txt`
+- rendered PNG example: `artifacts/qa/production-harness/workspace/project-1788508015569-1/qa/run-1/rendered-1.png`
+
+### Honest residual boundaries
+
+- Browser component evidence is green through 30 focused production-component tests, and real rendered PNGs were visually inspected. This sandbox forbids the Vite listener, terminated a Playwright-launched Chrome, and Browser Use explicitly rejected `file://`; no browser screenshot is claimed and no workaround was attempted.
+- Live ImageGen remains unavailable. Production proves the recoverable block and user replacement continuation without a billed/API-key fallback.
+- Keynote/PowerPoint editing remains a human compatibility check. The `.app` is ad-hoc/linker-signed with no TeamIdentifier; `codesign --verify --deep --strict` exits 1 because resources are not sealed, so Developer ID signing, strict bundle verification and notarization are not claimed.
+- The production harness scripts only deterministic Codex structured output. It does not claim a live paid model turn; the existing read-only Codex `initialize`/`account/read` check remains the login proof.

@@ -6,7 +6,7 @@
 - pnpm 11、Node.js 22（只在开发和构建时需要）。
 - Rust stable 与 Apple Command Line Tools。
 - 本机 Codex CLI，或包含 Codex 的 ChatGPT macOS 应用。
-- LibreOffice（Golden Project 自动 QA 必需）。
+- LibreOffice 与 Poppler `pdftoppm`（生产/Golden Project 自动 QA 必需）。
 - Keynote（只用于最后的人工打开/编辑检查）。
 
 检测工具：
@@ -17,8 +17,11 @@ node --version
 pnpm --version
 codex --version || /Applications/ChatGPT.app/Contents/Resources/codex --version
 mdfind 'kMDItemCFBundleIdentifier == "org.libreoffice.script"'
+pdftoppm -v
 test -d /Applications/Keynote.app && echo "Keynote available"
 ```
+
+从 Finder 启动时不会假定 shell PATH。生产 QA 按以下受控顺序验证可执行文件：应用 bundle 资源、标准 `/Applications` 或 Homebrew 位置、显式绝对覆盖路径、Codex bundled runtime，最后才使用 PATH。`pdftoppm` 还可在“设置 → PDF 渲染器路径”填写绝对可执行文件；无效、非绝对或无执行权限的路径会被拒绝。
 
 ## 开发模式
 
@@ -40,6 +43,15 @@ git diff --check
 ```
 
 `pnpm test` 依次执行 core、Worker、desktop 和 Rust 测试。Rust 边界测试包括持久化重启、审批不可跳过、偏好快照，以及相对逃逸、绝对路径、已有/断裂符号链接和父目录替换。
+
+视觉审批的生产组件回归可单独运行：
+
+```bash
+pnpm --filter @digital-twin/desktop exec vitest run \
+  src/native-workspace.test.tsx src/app.test.tsx
+```
+
+它验证安全读取的真实 `<img>`、至少 640×360 的 16:9 加载门禁、加载失败禁批、修改意见与重新生成、上传替换、批准后重新打开，以及 ChatGPT 登录、取消/恢复控件。浏览器 demo 只证明演示界面，不作为 Rust/Tauri 持久化或模型调用证据。
 
 ## Golden Project
 
@@ -68,7 +80,7 @@ file 'apps/desktop/src-tauri/target/release/bundle/macos/Digital Twin Workbench.
 codesign -dv --verbose=4 'apps/desktop/src-tauri/target/release/bundle/macos/Digital Twin Workbench.app' 2>&1
 ```
 
-应看到主程序和 `digital-twin-worker` 都是 arm64 Mach-O。签名应为 ad-hoc/linker-signed、没有 TeamIdentifier；这不是 Developer ID 签名，也没有 Apple 公证。不要把此构建当作可公开分发的安装包。
+应看到主程序和 `digital-twin-worker` 都是 arm64 Mach-O。签名应为 ad-hoc/linker-signed、没有 TeamIdentifier；这不是 Developer ID 签名，也没有 Apple 公证。当前个人 bundle 的 `codesign --verify --deep --strict` 会因为未密封资源退出 1，因此不要把此构建当作可公开分发的安装包或声称通过严格发布签名验证。
 
 Worker SEA 使用当前 Node 22 可执行文件构建，同时把该 Node 发行版的完整 `LICENSE`（其中包含依赖许可证和第三方声明）以及精确版本复制到 `.app/Contents/Resources/licenses/node-runtime/`。若构建机器上的匹配 LICENSE 缺失，构建会直接失败。
 
@@ -95,7 +107,7 @@ pnpm build:production-harness
 pnpm harness:production
 ```
 
-第一条命令以 `acceptance-harness` Cargo feature 编译 `production-harness` 和原生 RSS sampler；这些测试二进制不会进入最终 `.app`。第二条命令使用生产 `createTauriDesktopAdapter`，通过与 Tauri commands 共用的 Rust Workbench service delegates 执行：项目创建与附件、SQLite 提交和重启、打包 SEA 恢复、两次整份编辑/审批、五页 ImageGen 明确阻塞与用户替换、顺序视觉审批、Rust fd 边界导出，以及真实 LibreOffice/pdftoppm QA。
+第一条命令以 `acceptance-harness` Cargo feature 编译 `production-harness` 和原生 RSS sampler；这些测试二进制不会进入最终 `.app`。第二条命令使用生产 `createTauriDesktopAdapter`，通过与 Tauri commands 共用的 Rust Workbench service delegates 执行：项目创建与附件、SQLite 提交和重启、打包 SEA 恢复、两次整份编辑/审批、五页 ImageGen 明确阻塞与用户替换、顺序视觉审批、Rust fd 边界导出，以及真实 LibreOffice/pdftoppm QA。Rust harness 的 PATH 被清空，证明 Finder/受限环境仍能发现经过验证的原生工具，而不是偶然继承开发 shell。
 
 为保持确定性且不花费模型回合，只有 Codex 的结构化生成响应由本地脚本固定；adapter、Worker、Rust、SQLite、文件写入和 QA 都使用生产实现。结果写入：
 
@@ -105,3 +117,5 @@ artifacts/qa/production-harness/memory.json
 ```
 
 项目 ID 每次运行都会重新生成，因此 PPTX 和 QA 报告的精确绝对路径以 `result.json` 的 `exportPath` 与 `readableReportPath` 为准。
+
+`result.json` 还包含逐页 PNG SHA/tofu 检测、`ppt/media` 数量、每页图片映射、可编辑文字/表格/图表/形状证据、ChatGPT `account/read` 前置顺序和整条进程树 RSS。生产完成要求每页都有一个批准视觉、标题只出现一次，且表格/图表/基础形状仍是 OOXML 对象。

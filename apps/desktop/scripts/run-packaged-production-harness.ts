@@ -18,6 +18,10 @@ import type {
   NativePptPipeline,
   NativePreferenceSnapshot,
 } from '../../worker/src/native-pipeline.js';
+import {
+  detectLikelyTofuGlyphs,
+} from '../../worker/src/native-pipeline.js';
+import { inspectPptxOoxml } from '../../worker/src/libreoffice-qa.js';
 import { createTauriDesktopAdapter } from '../src/desktop-adapter.js';
 import type {
   WorkflowWorkerGateway,
@@ -90,7 +94,10 @@ class JsonLineProcess {
   private requestId = 1;
 
   constructor(command: string, args: string[]) {
-    this.child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.child = spawn(command, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, PATH: '' },
+    });
     this.lines = createInterface({ input: this.child.stdout })[Symbol.asyncIterator]();
   }
 
@@ -190,6 +197,7 @@ class ScriptedCodexTransport implements AppServerTransport {
   private readonly exitListeners = new Set<(detail: AppServerExit) => void>();
   private outputIndex = 0;
   private threadIndex = 0;
+  readonly methods: string[] = [];
 
   constructor(private readonly outputs: readonly unknown[]) {}
 
@@ -197,9 +205,17 @@ class ScriptedCodexTransport implements AppServerTransport {
 
   async send(line: string): Promise<void> {
     const request = JSON.parse(line) as { id?: number; method: string; params?: unknown };
+    this.methods.push(request.method);
     if (request.id === undefined) return;
     if (request.method === 'initialize') {
       this.emit({ id: request.id, result: { serverInfo: { name: 'scripted-codex', version: '1' } } });
+      return;
+    }
+    if (request.method === 'account/read') {
+      this.emit({ id: request.id, result: {
+        account: { type: 'chatgpt', email: 'production-harness@example.test', planType: 'plus' },
+        requiresOpenaiAuth: false,
+      } });
       return;
     }
     if (request.method === 'thread/start') {
@@ -266,6 +282,12 @@ async function main(): Promise<void> {
   const memoryPath = join(evidenceRoot, 'memory.json');
   const sampler = new OperationRssSamplerProcess(memoryPath);
   const operations: Array<{ operation: string; at: string; revision?: number }> = [];
+  const codexTransports: ScriptedCodexTransport[] = [];
+  const codexTransport = (outputs: readonly unknown[]) => {
+    const transport = new ScriptedCodexTransport(outputs);
+    codexTransports.push(transport);
+    return transport;
+  };
   const record = (operation: string, pipeline?: NativePptPipeline) => {
     sampler.mark(operation);
     operations.push({
@@ -276,7 +298,7 @@ async function main(): Promise<void> {
   };
   try {
     let adapter = createTauriDesktopAdapter(
-      new ScriptedCodexTransport([]),
+      codexTransport([]),
       (command, args) => rust.call(command, args),
       worker,
     );
@@ -316,7 +338,7 @@ async function main(): Promise<void> {
     const analysis = remapSourceIds(goldenSourceAnalysis(), sourceMapping);
     const generatedOutline = remapSourceIds(goldenOutline(), sourceMapping);
     const generatedSpecs = remapSourceIds(goldenSlideSpecs(), sourceMapping);
-    const scripted = new ScriptedCodexTransport([analysis, generatedOutline, generatedSpecs]);
+    const scripted = codexTransport([analysis, generatedOutline, generatedSpecs]);
     adapter = createTauriDesktopAdapter(scripted, (command, args) => rust.call(command, args), worker);
 
     pipeline = await adapter.analyzeProject(project.id);
@@ -328,7 +350,7 @@ async function main(): Promise<void> {
     pipeline = await adapter.approveOutline(project.id);
     record('outline-edit-save-approve', pipeline);
     pipeline = await adapter.generateDetails(project.id);
-    const editedSpecs = structuredClone(pipeline.slideSpecs!.value);
+    const editedSpecs = [...structuredClone(pipeline.slideSpecs!.value)];
     editedSpecs[0] = { ...editedSpecs[0]!, body: ['用户编辑｜管理层汇报｜2026 年 9 月'] };
     pipeline = await adapter.saveDetails(project.id, editedSpecs);
     pipeline = await adapter.approveDetails(project.id);
@@ -339,7 +361,7 @@ async function main(): Promise<void> {
     await worker.restart();
     record('restart-rust-sqlite-worker');
     adapter = createTauriDesktopAdapter(
-      new ScriptedCodexTransport([]),
+      codexTransport([]),
       (command, args) => rust.call(command, args),
       worker,
     );
@@ -375,16 +397,61 @@ async function main(): Promise<void> {
     await adapter.exportProject(project.id, 'production-harness.pptx');
     pipeline = await adapter.loadProjectPipeline(project.id);
     record('editable-pptx-export', pipeline);
+    const exportedPptx = Buffer.from(await rust.call<string>('ppt_read_artifact', {
+      projectId: project.id,
+      relativePath: pipeline.exportReceipt!.relativePath,
+    }), 'base64');
+    const pptxInspection = await inspectPptxOoxml(exportedPptx);
+    if ((pptxInspection.mediaCount ?? 0) <= 0) {
+      throw new Error('Production PPTX contains no embedded approved visual media');
+    }
+    if (pptxInspection.slideEvidence?.length !== pipeline.slideSpecs!.value.length) {
+      throw new Error('Production PPTX slide evidence does not map one-to-one to approved specs');
+    }
+    pipeline.slideSpecs!.value.forEach((spec, index) => {
+      const evidence = pptxInspection.slideEvidence![index]!;
+      if (evidence.imageCount < 1) throw new Error(`Approved visual missing from PPTX page ${index + 1}`);
+      if (evidence.textValues.filter((value) => value === spec.title).length !== 1) {
+        throw new Error(`Editable title is missing or duplicated on PPTX page ${index + 1}`);
+      }
+      if (evidence.tableCount < spec.tables.length || evidence.chartCount < spec.charts.length) {
+        throw new Error(`Editable table/chart objects are incomplete on PPTX page ${index + 1}`);
+      }
+      if (evidence.shapeCount < 1 + (spec.body.length > 0 ? 1 : 0) + spec.shapes.length) {
+        throw new Error(`Editable basic shapes are incomplete on PPTX page ${index + 1}`);
+      }
+    });
     pipeline = await adapter.runProjectQa(project.id);
     record('libreoffice-pdftoppm-qa', pipeline);
     if (pipeline.project.workflowStatus !== 'completed' || pipeline.qaReport?.status !== 'passed') {
       throw new Error(`Real production QA did not pass: ${pipeline.qaReport?.issues.join('; ')}`);
     }
+    const renderedPixelEvidence = await Promise.all(pipeline.qaReport.renderedPages.map(async (relativePath) => {
+      const bytes = Buffer.from(await rust.call<string>('ppt_read_artifact', {
+        projectId: project.id,
+        relativePath,
+      }), 'base64');
+      return {
+        relativePath,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+        likelyTofu: detectLikelyTofuGlyphs(bytes),
+      };
+    }));
+    if (renderedPixelEvidence.some(({ likelyTofu }) => likelyTofu)) {
+      throw new Error('Rendered production PNG contains likely tofu replacement glyphs');
+    }
+    const codexMethods = codexTransports.flatMap(({ methods }) => methods);
+    const accountReads = codexMethods.filter((method) => method === 'account/read').length;
+    const firstAccountRead = codexMethods.indexOf('account/read');
+    const firstThreadStart = codexMethods.indexOf('thread/start');
+    if (accountReads < 8 || firstAccountRead < 0 || firstThreadStart < firstAccountRead) {
+      throw new Error('Structured and visual model requests were not preceded by active ChatGPT account reads');
+    }
 
     await rust.call('harness.restart');
     await worker.restart();
     const reopenedAdapter = createTauriDesktopAdapter(
-      new ScriptedCodexTransport([]),
+      codexTransport([]),
       (command, args) => rust.call(command, args),
       worker,
     );
@@ -434,6 +501,17 @@ async function main(): Promise<void> {
       pages: reopened.qaReport!.actualPageCount,
       maximumDifferenceScore: Math.max(...reopened.qaReport!.comparisons.map(({ differenceScore }) => differenceScore ?? 1)),
       distinctApprovedVisuals: distinctHashes.size,
+      pptxOoxml: {
+        mediaCount: pptxInspection.mediaCount,
+        slideEvidence: pptxInspection.slideEvidence,
+      },
+      chatGptAuthGate: {
+        accountReads,
+        threadStarts: codexMethods.filter((method) => method === 'thread/start').length,
+        turnStarts: codexMethods.filter((method) => method === 'turn/start').length,
+        accountReadBeforeFirstThread: firstAccountRead < firstThreadStart,
+      },
+      renderedPixelEvidence,
       comparisonApprovedPaths: comparisonPaths,
       readableReportPath: join(inspection.projectDirectory, reopened.qaReport!.textReportPath),
       exportPath: join(inspection.projectDirectory, reopened.exportReceipt!.relativePath),

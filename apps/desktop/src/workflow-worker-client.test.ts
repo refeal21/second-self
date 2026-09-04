@@ -116,6 +116,35 @@ describe('Tauri workflow Worker client', () => {
     expect(bridge.commands.filter(({ command }) => command === 'start_worker_sidecar')).toHaveLength(2);
   });
 
+  it('observes an exit before the start response and restarts instead of caching a dead generation', async () => {
+    class PreGenerationExitBridge extends FakeBridge {
+      private starts = 0;
+
+      override async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+        if (command !== 'start_worker_sidecar') return super.invoke(command, args);
+        this.commands.push({ command, args });
+        this.starts += 1;
+        if (this.starts === 1) {
+          this.emit('workflow-worker://exit', {
+            generation: 41,
+            code: 86,
+            signal: null,
+          });
+          return { generation: 41, pid: 42, protocolVersion: 1 } as T;
+        }
+        return { generation: 42, pid: 43, protocolVersion: 1 } as T;
+      }
+    }
+
+    const bridge = new PreGenerationExitBridge();
+    const client = new TauriWorkflowWorkerClient(bridge);
+
+    await expect(client.health()).rejects.toThrow('exited during startup');
+    await expect(client.health()).resolves.toMatchObject({ status: 'ready' });
+    expect(bridge.commands.filter(({ command }) => command === 'start_worker_sidecar')).toHaveLength(2);
+    expect(bridge.commands.filter(({ command }) => command === 'send_worker_sidecar_line')).toHaveLength(1);
+  });
+
   it('exposes typed production PPT create, restore, execute and snapshot RPC calls', async () => {
     class PipelineBridge extends FakeBridge {
       override async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {

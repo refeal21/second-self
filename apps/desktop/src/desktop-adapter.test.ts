@@ -13,6 +13,14 @@ class ScriptedNativeServer implements NativeAppServerTransport {
     | ((detail: { code: number | null; signal: string | null }) => void)
     | undefined;
 
+  constructor(
+    private readonly account: unknown = {
+      type: 'chatgpt',
+      email: 'person@example.com',
+      planType: 'plus',
+    },
+  ) {}
+
   async start(): Promise<void> {}
 
   async send(line: string): Promise<void> {
@@ -45,11 +53,19 @@ class ScriptedNativeServer implements NativeAppServerTransport {
     this.lineListener?.(JSON.stringify(message));
   }
 
+  crash(): void {
+    this.exitListener?.({ code: 70, signal: null });
+  }
+
   private responseFor(method: string): unknown {
     switch (method) {
       case 'initialize':
         return {};
+      case 'account/read':
+        return { account: this.account, requiresOpenaiAuth: this.account === null };
       case 'thread/start':
+        return { thread: { id: 'thread-native-1' } };
+      case 'thread/resume':
         return { thread: { id: 'thread-native-1' } };
       case 'turn/start':
         return { turn: { id: 'turn-native-1' } };
@@ -61,13 +77,80 @@ class ScriptedNativeServer implements NativeAppServerTransport {
 
 async function runningNativeTask() {
   const transport = new ScriptedNativeServer();
-  const invoke = vi.fn(async () => ({}));
+  const invoke = vi.fn(async (command: string) => {
+    if (command === 'workspace_directory') return '/validated/workspace';
+    return {};
+  });
   const adapter = createTauriDesktopAdapter(transport, invoke);
   const task = await adapter.startTask('整理评审结论');
   return { adapter, invoke, task, transport };
 }
 
 describe('native desktop general-task bridge', () => {
+  it('does not expose an inactive ChatGPT account as connected to the UI', async () => {
+    const transport = new ScriptedNativeServer({
+      type: 'chatgpt', email: 'person@example.com', planType: '',
+    });
+    const adapter = createTauriDesktopAdapter(transport, vi.fn());
+
+    await expect(adapter.connectAccount()).resolves.toEqual({
+      email: null, plan: null, status: 'unavailable',
+    });
+  });
+
+  it.each([
+    [{ type: 'apikey' }, 'API-key'],
+    [null, 'ChatGPT'],
+    [{ type: 'chatgpt', email: null, planType: '' }, 'active'],
+  ])('atomically blocks non-active ChatGPT auth before any paid turn (%j)', async (account, message) => {
+    const transport = new ScriptedNativeServer(account);
+    const invoke = vi.fn(async () => '/validated/workspace');
+    const adapter = createTauriDesktopAdapter(transport, invoke);
+
+    await expect(adapter.startTask('不得发起付费 turn')).rejects.toThrow(message);
+
+    expect(transport.sent.some(({ method }) => method === 'account/read')).toBe(true);
+    expect(transport.sent.some(({ method }) => method === 'thread/start')).toBe(false);
+    expect(transport.sent.some(({ method }) => method === 'turn/start')).toBe(false);
+    expect(invoke).not.toHaveBeenCalledWith('workspace_directory', undefined);
+  });
+
+  it('blocks PPT visual model requests before native or Worker execution for non-ChatGPT auth', async () => {
+    const transport = new ScriptedNativeServer({ type: 'apikey' });
+    const invoke = vi.fn();
+    const worker: WorkflowWorkerGateway = {
+      health: vi.fn(async () => ({
+        protocolVersion: 1 as const,
+        worker: 'digital-twin-workflow-worker' as const,
+        status: 'ready' as const,
+      })),
+      createProject: vi.fn(async () => ({} as never)),
+      restoreProject: vi.fn(async (pipeline) => pipeline),
+      executeProject: vi.fn(async () => ({} as never)),
+      snapshotProject: vi.fn(async () => ({} as never)),
+    };
+    const adapter = createTauriDesktopAdapter(transport, invoke, worker);
+
+    await expect(adapter.requestVisual('project-auth', 'slide-auth')).rejects.toThrow('API-key');
+
+    expect(transport.sent.some(({ method }) => method === 'account/read')).toBe(true);
+    expect(transport.sent.some(({ method }) => method === 'thread/start')).toBe(false);
+    expect(transport.sent.some(({ method }) => method === 'turn/start')).toBe(false);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(worker.restoreProject).not.toHaveBeenCalled();
+    expect(worker.executeProject).not.toHaveBeenCalled();
+  });
+
+  it('uses only the canonical workspace returned by Rust for a general task', async () => {
+    const { invoke, task, transport } = await runningNativeTask();
+
+    expect(task.status).toBe('running');
+    expect(invoke).toHaveBeenCalledWith('workspace_directory', undefined);
+    expect(transport.sent.find(({ method }) => method === 'thread/start')).toMatchObject({
+      params: { cwd: '/validated/workspace' },
+    });
+  });
+
   it('loads persisted collections through the native command boundary', async () => {
     const transport = new ScriptedNativeServer();
     const persisted = {
@@ -254,5 +337,28 @@ describe('native desktop general-task bridge', () => {
     await expect(adapter.respondToTask(task.id, 'approve')).rejects.toThrow(
       'Task is not waiting for an approval',
     );
+  });
+
+  it('exposes cancel and crash recovery with recoverable task state', async () => {
+    const cancelled = await runningNativeTask();
+    await expect(cancelled.adapter.cancelTask(cancelled.task.id)).resolves.toMatchObject({
+      status: 'cancelled',
+    });
+    expect(cancelled.transport.sent.at(-1)).toMatchObject({
+      method: 'turn/interrupt',
+      params: { threadId: 'thread-native-1', turnId: 'turn-native-1' },
+    });
+
+    const crashed = await runningNativeTask();
+    let latest = crashed.task;
+    crashed.adapter.subscribeTask(crashed.task.id, (task) => { latest = task; });
+    crashed.transport.crash();
+    expect(latest).toMatchObject({ status: 'interrupted', recoverable: true });
+
+    await expect(crashed.adapter.recoverTask(crashed.task.id)).resolves.toMatchObject({
+      status: 'ready',
+      recoverable: false,
+    });
+    expect(crashed.transport.sent.some(({ method }) => method === 'thread/resume')).toBe(true);
   });
 });

@@ -5,7 +5,7 @@
   "scripts": {
     "build:worker-sidecar": "node scripts/build-worker-sidecar.mjs",
     "generate:golden-fixtures": "node apps/worker/scripts/generate-golden-fixtures.mjs",
-    "golden:qa": "pnpm --filter @digital-twin/worker exec tsx scripts/run-golden-project.ts",
+    "golden:qa": "node --import ./apps/worker/node_modules/tsx/dist/loader.mjs apps/worker/scripts/run-golden-project.ts",
     "smoke:packaged-worker": "node scripts/smoke-packaged-worker.mjs",
     "build:production-harness": "cargo build --release --manifest-path apps/desktop/src-tauri/Cargo.toml --features acceptance-harness --bin production-harness --bin process-rss-sampler",
     "harness:production": "node --import ./apps/worker/node_modules/tsx/dist/loader.mjs apps/desktop/scripts/run-packaged-production-harness.ts",

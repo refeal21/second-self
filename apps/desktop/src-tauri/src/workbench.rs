@@ -5,7 +5,7 @@ use std::{
     process::{Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex,
+        mpsc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -137,6 +137,7 @@ pub struct CollectionSummary {
 pub struct SettingsSummary {
     pub workspace_path: String,
     pub codex_path: String,
+    pub pdf_renderer_path: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -207,9 +208,11 @@ impl WorkbenchService {
             database
                 .save_setting("workspace_path", &workspace_root.to_string_lossy())
                 .map_err(database_error)?;
-            database
-                .save_setting("codex_path", "")
-                .map_err(database_error)?;
+        }
+        for key in ["codex_path", "pdf_renderer_path"] {
+            if database.setting(key).map_err(database_error)?.is_none() {
+                database.save_setting(key, "").map_err(database_error)?;
+            }
         }
         let stored_workspace = database
             .setting("workspace_path")
@@ -265,6 +268,10 @@ impl WorkbenchService {
             .setting("codex_path")
             .map_err(database_error)?
             .unwrap_or_default();
+        let pdf_renderer_path = database
+            .setting("pdf_renderer_path")
+            .map_err(database_error)?
+            .unwrap_or_default();
         Ok(DesktopInitialState {
             account: AccountSummary {
                 email: None,
@@ -290,6 +297,7 @@ impl WorkbenchService {
             settings: SettingsSummary {
                 workspace_path,
                 codex_path,
+                pdf_renderer_path,
             },
         })
     }
@@ -337,6 +345,16 @@ impl WorkbenchService {
         Ok(canonical.to_string_lossy().into_owned())
     }
 
+    pub fn workspace_directory(&self) -> Result<String, String> {
+        let workspace = self.workspace()?;
+        let canonical = fs::canonicalize(&workspace)
+            .map_err(|error| format!("Workspace cannot be resolved: {error}"))?;
+        if !canonical.is_dir() || canonical != workspace {
+            return Err("Configured workspace is not a canonical directory".into());
+        }
+        Ok(canonical.to_string_lossy().into_owned())
+    }
+
     pub fn read_artifact(&self, project_id: &str, relative_path: &str) -> Result<String, String> {
         use base64::Engine;
         let bytes = self.read_artifact_bytes(project_id, relative_path)?;
@@ -356,22 +374,32 @@ impl WorkbenchService {
         if workflow_status != Some("qa") && !retrying_qa {
             return Err("Project is not at the QA checkpoint".into());
         }
-        let Some(soffice) = find_executable(&[
-            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-            "/Applications/LibreOfficeDev.app/Contents/MacOS/soffice",
-            "soffice",
-        ]) else {
+        let soffice_candidates = soffice_candidates();
+        let Some(soffice) =
+            find_soffice_with_candidates(&soffice_candidates, env::var_os("PATH").as_deref())
+        else {
             return Ok(serde_json::json!({
                 "status": "blocked",
                 "capability": "libreoffice",
-                "issue": "LibreOffice soffice executable is unavailable; install LibreOffice and retry QA."
+                "issue": "LibreOffice soffice executable is unavailable. Install LibreOffice and retry QA; the app checked its bundle, /Applications, Homebrew locations, the Codex bundled runtime, and PATH."
             }));
         };
-        let Some(renderer) = find_executable(&["pdftoppm"]) else {
+        let configured_renderer = self
+            .database()?
+            .setting("pdf_renderer_path")
+            .map_err(database_error)?
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+        let candidates = pdf_renderer_candidates();
+        let Some(renderer) = find_pdf_renderer_with_candidates(
+            configured_renderer.as_deref(),
+            &candidates,
+            env::var_os("PATH").as_deref(),
+        ) else {
             return Ok(serde_json::json!({
                 "status": "blocked",
                 "capability": "pdf-renderer",
-                "issue": "PDF renderer pdftoppm is unavailable; install Poppler and retry QA."
+                "issue": "PDF renderer pdftoppm is unavailable. Install Poppler or set an executable absolute pdftoppm path in Settings; the app also checked its bundle, /opt/homebrew/bin, /usr/local/bin, and the Codex bundled runtime."
             }));
         };
         self.prepare_qa_with_tools(project_id, &pipeline, &soffice, &renderer)
@@ -458,6 +486,7 @@ impl WorkbenchService {
         }
 
         let temp = QaTempDirectory::create()?;
+        let fontconfig = create_qa_fontconfig(&temp.path)?;
         let input_path = temp.path.join("input.pptx");
         fs::write(&input_path, &pptx)
             .map_err(|error| format!("QA temporary PPTX cannot be written: {error}"))?;
@@ -474,8 +503,8 @@ impl WorkbenchService {
             .args(["--headless", "--convert-to", "pdf", "--outdir"])
             .arg(&temp.path)
             .arg(&input_path)
-            .current_dir(&temp.path)
-            .env("TMPDIR", &command_temp);
+            .current_dir(&temp.path);
+        apply_qa_environment(&mut conversion_command, &command_temp, &fontconfig);
         let conversion = run_bounded_command(conversion_command, Duration::from_secs(30), 16_384)
             .map_err(|error| format!("LibreOffice QA cannot start: {error}"))?;
         if conversion.timed_out || !conversion.status.success() {
@@ -498,8 +527,8 @@ impl WorkbenchService {
             .args(["-png", "-r", "144"])
             .arg(&pdf_path)
             .arg(&render_prefix)
-            .current_dir(&temp.path)
-            .env("TMPDIR", &command_temp);
+            .current_dir(&temp.path);
+        apply_qa_environment(&mut render_command, &command_temp, &fontconfig);
         let rendering = run_bounded_command(render_command, Duration::from_secs(30), 16_384)
             .map_err(|error| format!("PDF renderer cannot start: {error}"))?;
         if rendering.timed_out || !rendering.status.success() {
@@ -531,12 +560,7 @@ impl WorkbenchService {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let pdf = read_bounded_file(&pdf_path, MAX_PDF_BYTES, "Rendered QA PDF")?;
-        let hiragino_available = [
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/System/Library/Fonts/Supplemental/Hiragino Sans GB.ttc",
-        ]
-        .iter()
-        .any(|path| Path::new(path).is_file());
+        let hiragino_available = fontconfig.is_file() && system_chinese_font().is_some();
         Ok(serde_json::json!({
             "status": "ready",
             "sofficePath": soffice.to_string_lossy(),
@@ -893,6 +917,7 @@ impl WorkbenchService {
         &self,
         workspace_path: String,
         codex_path: String,
+        pdf_renderer_path: String,
     ) -> Result<String, String> {
         let workspace = PathBuf::from(non_empty(workspace_path, "Workspace path")?);
         if !workspace.is_absolute() {
@@ -908,12 +933,23 @@ impl WorkbenchService {
                 return Err("Codex path must be an existing absolute file".into());
             }
         }
+        if !pdf_renderer_path.trim().is_empty() {
+            let renderer = PathBuf::from(pdf_renderer_path.trim());
+            if !renderer.is_absolute() || !is_executable_file(&renderer) {
+                return Err(
+                    "PDF renderer path must be an existing executable absolute file".into(),
+                );
+            }
+        }
         let database = self.database()?;
         database
             .save_setting("workspace_path", &workspace.to_string_lossy())
             .map_err(database_error)?;
         database
             .save_setting("codex_path", codex_path.trim())
+            .map_err(database_error)?;
+        database
+            .save_setting("pdf_renderer_path", pdf_renderer_path.trim())
             .map_err(database_error)?;
         *self
             .workspace_root
@@ -1115,24 +1151,157 @@ fn validate_worker_relative_path(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn find_executable(candidates: &[&str]) -> Option<PathBuf> {
-    for candidate in candidates {
-        let path = Path::new(candidate);
-        if path.is_absolute() && is_executable_file(path) {
-            return Some(path.to_path_buf());
-        }
-        if !path.is_absolute() {
-            if let Some(path_value) = env::var_os("PATH") {
-                for directory in env::split_paths(&path_value) {
-                    let resolved = directory.join(path);
-                    if is_executable_file(&resolved) {
-                        return Some(resolved);
-                    }
-                }
-            }
+fn find_pdf_renderer_with_candidates(
+    configured: Option<&Path>,
+    fixed_candidates: &[PathBuf],
+    path_value: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    find_named_executable_with_candidates("pdftoppm", configured, fixed_candidates, path_value)
+}
+
+fn find_soffice_with_candidates(
+    fixed_candidates: &[PathBuf],
+    path_value: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    find_named_executable_with_candidates("soffice", None, fixed_candidates, path_value)
+}
+
+fn find_named_executable_with_candidates(
+    executable_name: &str,
+    configured: Option<&Path>,
+    fixed_candidates: &[PathBuf],
+    path_value: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    configured
+        .filter(|path| path.is_absolute() && is_executable_file(path))
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            fixed_candidates
+                .iter()
+                .find(|path| path.is_absolute() && is_executable_file(path))
+                .cloned()
+        })
+        .or_else(|| {
+            path_value.and_then(|value| {
+                env::split_paths(value)
+                    .map(|directory| directory.join(executable_name))
+                    .find(|path| is_executable_file(path))
+            })
+        })
+}
+
+fn soffice_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(executable) = env::current_exe() {
+        if let Some(contents) = executable.parent().and_then(Path::parent) {
+            candidates.push(contents.join("Resources/bin/soffice"));
+            candidates.push(contents.join("Resources/soffice"));
         }
     }
-    None
+    candidates.extend([
+        PathBuf::from("/Applications/LibreOffice.app/Contents/MacOS/soffice"),
+        PathBuf::from("/Applications/LibreOfficeDev.app/Contents/MacOS/soffice"),
+        PathBuf::from("/opt/homebrew/bin/soffice"),
+        PathBuf::from("/usr/local/bin/soffice"),
+    ]);
+    if let Some(override_path) = env::var_os("DIGITAL_TWIN_SOFFICE") {
+        candidates.push(PathBuf::from(override_path));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let dependencies =
+            PathBuf::from(home).join(".cache/codex-runtimes/codex-primary-runtime/dependencies");
+        // Prefer the native executable: the runtime's convenience wrapper uses
+        // `/usr/bin/env bash`, which is intentionally unavailable when QA is
+        // launched with a constrained PATH (for example from Finder).
+        candidates.push(dependencies.join(
+            "native/libreoffice-headless/libreoffice/LibreOfficeDev.app/Contents/MacOS/soffice",
+        ));
+        candidates.push(dependencies.join("bin/override/soffice"));
+        candidates.push(dependencies.join("bin/fallback/soffice"));
+    }
+    candidates
+}
+
+fn pdf_renderer_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(executable) = env::current_exe() {
+        if let Some(contents) = executable.parent().and_then(Path::parent) {
+            candidates.push(contents.join("Resources/bin/pdftoppm"));
+            candidates.push(contents.join("Resources/pdftoppm"));
+        }
+    }
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin/pdftoppm"),
+        PathBuf::from("/usr/local/bin/pdftoppm"),
+    ]);
+    if let Some(override_path) = env::var_os("DIGITAL_TWIN_PDF_RENDERER") {
+        candidates.push(PathBuf::from(override_path));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let dependencies =
+            PathBuf::from(home).join(".cache/codex-runtimes/codex-primary-runtime/dependencies");
+        // Prefer native binaries over the runtime's `env bash` wrappers so
+        // Finder/constrained-PATH launches do not depend on shell discovery.
+        candidates.push(dependencies.join("native/poppler/poppler/bin/pdftoppm"));
+        candidates.push(dependencies.join("native/poppler/bin/pdftoppm"));
+        candidates.push(dependencies.join("bin/override/pdftoppm"));
+        candidates.push(dependencies.join("bin/fallback/pdftoppm"));
+    }
+    candidates
+}
+
+fn create_qa_fontconfig(root: &Path) -> Result<PathBuf, String> {
+    let cache = root.join("font-cache");
+    fs::create_dir_all(&cache)
+        .map_err(|error| format!("QA Fontconfig cache cannot be created: {error}"))?;
+    let xdg_cache = root.join("xdg-cache");
+    fs::create_dir_all(&xdg_cache)
+        .map_err(|error| format!("QA XDG cache cannot be created: {error}"))?;
+    let path = root.join("fontconfig.xml");
+    let cache = xml_escape(&cache.to_string_lossy());
+    let contents = format!(
+        "<?xml version=\"1.0\"?>\n\
+         <!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n\
+         <fontconfig>\n\
+           <dir>/System/Library/Fonts</dir>\n\
+           <dir>/System/Library/Fonts/Supplemental</dir>\n\
+           <dir>/Library/Fonts</dir>\n\
+           <cachedir>{cache}</cachedir>\n\
+         </fontconfig>\n"
+    );
+    fs::write(&path, contents)
+        .map_err(|error| format!("QA Fontconfig file cannot be written: {error}"))?;
+    Ok(path)
+}
+
+fn apply_qa_environment(command: &mut Command, temp: &Path, fontconfig: &Path) {
+    command
+        .env("TMPDIR", temp)
+        .env("FONTCONFIG_FILE", fontconfig)
+        .env("FONTCONFIG_PATH", fontconfig.parent().unwrap_or(temp))
+        .env(
+            "XDG_CACHE_HOME",
+            fontconfig.parent().unwrap_or(temp).join("xdg-cache"),
+        );
+}
+
+fn system_chinese_font() -> Option<PathBuf> {
+    [
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Supplemental/Hiragino Sans GB.ttc",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -1209,8 +1378,15 @@ fn run_bounded_command(
         .stderr
         .take()
         .ok_or_else(|| "QA command stderr pipe is unavailable".to_string())?;
-    let stdout_reader = thread::spawn(move || read_capped(stdout, max_output_bytes));
-    let stderr_reader = thread::spawn(move || read_capped(stderr, max_output_bytes));
+    let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
+    let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = stdout_sender.send(read_capped(stdout, max_output_bytes));
+    });
+    thread::spawn(move || {
+        let _ = stderr_sender.send(read_capped(stderr, max_output_bytes));
+    });
+    let process_group_id = child.id();
     let started = Instant::now();
     let mut timed_out = false;
     let status = loop {
@@ -1226,12 +1402,6 @@ fn run_bounded_command(
             thread::sleep(Duration::from_millis(250));
             if child.try_wait().ok().flatten().is_none() {
                 terminate_command_group(&mut child, libc::SIGKILL);
-            } else {
-                #[cfg(unix)]
-                unsafe {
-                    // The root can exit on TERM while a descendant survives.
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
-                }
             }
             break child
                 .wait()
@@ -1239,18 +1409,31 @@ fn run_bounded_command(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "QA stdout reader panicked".to_string())??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "QA stderr reader panicked".to_string())??;
+    // The root may exit while descendants retain inherited pipe handles. Kill
+    // the isolated group on every terminal path, then drain for a bounded
+    // interval so an escaped descendant can never hang QA indefinitely.
+    terminate_process_group_id(process_group_id, libc::SIGKILL);
+    let stdout = receive_bounded_output(stdout_receiver, "stdout")?;
+    let stderr = receive_bounded_output(stderr_receiver, "stderr")?;
     Ok(BoundedCommandOutput {
         status,
         stdout,
         stderr,
         timed_out,
     })
+}
+
+fn receive_bounded_output(
+    receiver: mpsc::Receiver<Result<Vec<u8>, String>>,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    match receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(output) => output,
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(Vec::new()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("QA {label} reader stopped unexpectedly"))
+        }
+    }
 }
 
 fn terminate_command_group(child: &mut std::process::Child, signal: i32) {
@@ -1262,6 +1445,17 @@ fn terminate_command_group(child: &mut std::process::Child, signal: i32) {
     {
         let _ = signal;
         let _ = child.kill();
+    }
+}
+
+fn terminate_process_group_id(process_group_id: u32, signal: i32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(process_group_id as i32), signal);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (process_group_id, signal);
     }
 }
 
@@ -1314,6 +1508,12 @@ impl Drop for QaTempDirectory {
 mod qa_command_tests {
     use super::*;
 
+    fn executable(path: &Path) {
+        fs::write(path, b"#!/bin/sh\nexit 0\n").expect("fixture written");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("fixture executable");
+    }
+
     #[test]
     fn qa_command_output_is_capped_by_bytes() {
         let mut command = Command::new("/bin/sh");
@@ -1335,5 +1535,68 @@ mod qa_command_tests {
             .expect("timed-out command is reaped");
         assert!(output.timed_out);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn qa_command_returns_when_root_exits_but_a_descendant_inherits_stdout() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "(trap '' TERM; sleep 30) & exit 0"]);
+        let started = Instant::now();
+        let output = run_bounded_command(command, Duration::from_secs(5), 1_024)
+            .expect("root exit is observed without an unbounded pipe join");
+        assert!(output.status.success());
+        assert!(!output.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn production_fontconfig_points_to_system_chinese_fonts_and_is_passed_to_children() {
+        let temp = QaTempDirectory::create().expect("temporary QA directory");
+        let fontconfig = create_qa_fontconfig(&temp.path).expect("fontconfig created");
+        let contents = fs::read_to_string(&fontconfig).expect("fontconfig readable");
+        assert!(contents.contains("/System/Library/Fonts"));
+        assert!(contents.contains("/System/Library/Fonts/Supplemental"));
+        assert!(temp.path.join("font-cache").is_dir());
+
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "test -f \"$FONTCONFIG_FILE\" && grep -q System/Library/Fonts \"$FONTCONFIG_FILE\"",
+        ]);
+        apply_qa_environment(&mut command, &temp.path, &fontconfig);
+        let output = run_bounded_command(command, Duration::from_secs(2), 1_024)
+            .expect("environment probe runs");
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn pdf_renderer_discovery_works_with_an_empty_path_and_validates_executable_candidates() {
+        let temp = QaTempDirectory::create().expect("temporary directory");
+        let configured = temp.path.join("configured-pdftoppm");
+        let bundled = temp.path.join("bundled-pdftoppm");
+        fs::write(&configured, b"not executable").expect("configured fixture written");
+        executable(&bundled);
+
+        let found = find_pdf_renderer_with_candidates(
+            Some(&configured),
+            &[bundled.clone()],
+            Some(std::ffi::OsStr::new("")),
+        );
+        assert_eq!(found, Some(bundled));
+    }
+
+    #[test]
+    fn soffice_discovery_works_with_an_empty_path_and_validates_executable_candidates() {
+        let temp = QaTempDirectory::create().expect("temporary directory");
+        let invalid = temp.path.join("invalid-soffice");
+        let bundled = temp.path.join("bundled-soffice");
+        fs::write(&invalid, b"not executable").expect("invalid fixture written");
+        executable(&bundled);
+
+        let found = find_soffice_with_candidates(
+            &[invalid, bundled.clone()],
+            Some(std::ffi::OsStr::new("")),
+        );
+        assert_eq!(found, Some(bundled));
     }
 }

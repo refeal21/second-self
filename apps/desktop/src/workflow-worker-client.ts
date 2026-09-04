@@ -49,6 +49,10 @@ interface WorkerExit {
   signal: number | null;
 }
 
+type WorkerStartupEvent =
+  | { kind: 'stdout'; payload: WorkerLine }
+  | { kind: 'exit'; payload: WorkerExit };
+
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -66,7 +70,7 @@ export class TauriWorkflowWorkerClient implements WorkflowWorkerGateway {
   private nextId = 1;
   private stdoutBuffer = '';
   private pending = new Map<number, PendingRequest>();
-  private pendingStartLines: WorkerLine[] | null = null;
+  private pendingStartEvents: WorkerStartupEvent[] | null = null;
 
   constructor(private readonly bridge: WorkflowWorkerBridge = defaultBridge) {}
 
@@ -139,15 +143,32 @@ export class TauriWorkflowWorkerClient implements WorkflowWorkerGateway {
   private async start(): Promise<void> {
     await this.bindEvents();
     this.stdoutBuffer = '';
-    this.pendingStartLines = [];
-    const started = await this.bridge.invoke<WorkerStarted>('start_worker_sidecar');
+    this.pendingStartEvents = [];
+    let started: WorkerStarted;
+    try {
+      started = await this.bridge.invoke<WorkerStarted>('start_worker_sidecar');
+    } catch (error) {
+      this.pendingStartEvents = null;
+      throw error;
+    }
     if (started.protocolVersion !== 1) {
+      this.pendingStartEvents = null;
       throw new Error(`Unsupported workflow worker protocol ${started.protocolVersion}`);
     }
     this.generation = started.generation;
-    const buffered = this.pendingStartLines;
-    this.pendingStartLines = null;
-    for (const line of buffered ?? []) this.receiveLine(line);
+    const buffered = this.pendingStartEvents;
+    this.pendingStartEvents = null;
+    for (const event of buffered ?? []) {
+      if (event.payload.generation !== started.generation) continue;
+      if (event.kind === 'stdout') {
+        this.receiveLine(event.payload);
+        continue;
+      }
+      this.handleExit(event.payload);
+      throw new Error(
+        `Workflow worker exited during startup (code ${event.payload.code ?? 'unknown'}, signal ${event.payload.signal ?? 'none'})`,
+      );
+    }
   }
 
   private bindEvents(): Promise<void> {
@@ -155,21 +176,30 @@ export class TauriWorkflowWorkerClient implements WorkflowWorkerGateway {
       this.binding = Promise.all([
         this.bridge.listen<WorkerLine>('workflow-worker://stdout', ({ payload }) => {
           if (payload.generation === this.generation) this.receiveLine(payload);
-          else if (this.pendingStartLines !== null) this.pendingStartLines.push(payload);
+          else if (this.pendingStartEvents !== null) {
+            this.pendingStartEvents.push({ kind: 'stdout', payload });
+          }
         }),
         this.bridge.listen<WorkerExit>('workflow-worker://exit', ({ payload }) => {
-          if (payload.generation !== this.generation) return;
-          this.generation = null;
-          this.stdoutBuffer = '';
-          const error = new Error(
-            `Workflow worker exited unexpectedly (code ${payload.code ?? 'unknown'}, signal ${payload.signal ?? 'none'})`,
-          );
-          for (const request of this.pending.values()) request.reject(error);
-          this.pending.clear();
+          if (payload.generation === this.generation) this.handleExit(payload);
+          else if (this.pendingStartEvents !== null) {
+            this.pendingStartEvents.push({ kind: 'exit', payload });
+          }
         }),
       ]).then(() => undefined);
     }
     return this.binding;
+  }
+
+  private handleExit(payload: WorkerExit): void {
+    if (payload.generation !== this.generation) return;
+    this.generation = null;
+    this.stdoutBuffer = '';
+    const error = new Error(
+      `Workflow worker exited unexpectedly (code ${payload.code ?? 'unknown'}, signal ${payload.signal ?? 'none'})`,
+    );
+    for (const request of this.pending.values()) request.reject(error);
+    this.pending.clear();
   }
 
   private receiveLine(payload: WorkerLine): void {

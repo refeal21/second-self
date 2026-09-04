@@ -1975,6 +1975,44 @@ textarea::placeholder {
   }
 }
 
+.native-visual-preview {
+  margin: 20px 0;
+}
+
+.native-visual-preview img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  border: 1px solid var(--border-color, #d9dee8);
+  border-radius: 10px;
+  background: #f7f9fc;
+}
+
+.native-visual-preview figcaption {
+  margin-top: 8px;
+  color: var(--muted-color, #687386);
+  font-size: 13px;
+}
+
+.native-feedback {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.native-feedback textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.approved-visuals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 16px 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

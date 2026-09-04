@@ -64,6 +64,7 @@ export type CollectionAvailability = 'unavailable' | 'loading' | 'loaded';
 export interface DesktopSettings {
   workspacePath: string;
   codexPath: string;
+  pdfRendererPath?: string;
 }
 export interface DesktopInitialState {
   account: AccountSummary;
@@ -86,11 +87,13 @@ export interface PendingTaskInteraction {
 export interface TaskSummary {
   id: string;
   prompt: string;
-  status: 'running' | 'waiting_for_approval' | 'waiting_for_input' | 'completed' | 'failed' | 'interrupted';
+  status: 'queued' | 'running' | 'waiting_for_approval' | 'waiting_for_input' | 'completed' |
+    'cancelled' | 'failed' | 'interrupted' | 'recovering' | 'ready';
   transcript: Array<{ role: 'user' | 'assistant'; text: string }>;
   usage: string;
   pendingInteraction: PendingTaskInteraction | null;
   error: string | null;
+  recoverable: boolean;
 }
 export interface RegenerateResult { status: string; selectedSlide: number }
 export interface ApprovalResult {
@@ -107,8 +110,10 @@ export interface DesktopAdapter {
   readonly initialState: DesktopInitialState;
   loadInitialState(): Promise<DesktopInitialState>;
   connectAccount(): Promise<AccountSummary>;
-  startLogin(): Promise<{ message: string }>;
+  startLogin(): Promise<{ message: string; authUrl: string }>;
   startTask(prompt: string): Promise<TaskSummary>;
+  cancelTask(taskId: string): Promise<TaskSummary>;
+  recoverTask(taskId: string): Promise<TaskSummary>;
   subscribeTask(taskId: string, listener: (task: TaskSummary) => void): () => void;
   respondToTask(taskId: string, decision: 'approve' | 'decline'): Promise<{ status: string }>;
   respondToTaskInput(taskId: string, answers: Record<string, string[]>): Promise<{ status: string }>;
@@ -122,7 +127,8 @@ export interface DesktopAdapter {
   generateDetails(projectId: string): Promise<NativePptPipeline>;
   saveDetails(projectId: string, specs: readonly SlideSpec[]): Promise<NativePptPipeline>;
   approveDetails(projectId: string): Promise<NativePptPipeline>;
-  requestVisual(projectId: string, slideId: string): Promise<NativePptPipeline>;
+  requestVisual(projectId: string, slideId: string, feedback?: string): Promise<NativePptPipeline>;
+  readProjectVisual(projectId: string, relativePath: string): Promise<string>;
   replaceVisual(projectId: string, slideId: string, imageBase64: string, altText: string): Promise<NativePptPipeline>;
   approveVisual(projectId: string, slideId: string): Promise<NativePptPipeline>;
   reopenVisual(projectId: string, slideId: string): Promise<NativePptPipeline>;
@@ -135,7 +141,7 @@ export interface DesktopAdapter {
   exportProject(projectId: string, name: string): Promise<{ message: string }>;
   decideApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }>;
   decideMemory(proposalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }>;
-  saveSettings(input: { workspacePath: string; codexPath: string }): Promise<{ status: string }>;
+  saveSettings(input: { workspacePath: string; codexPath: string; pdfRendererPath?: string }): Promise<{ status: string }>;
 }
 
 export interface DemoAdapterOptions {
@@ -178,6 +184,7 @@ const demoInitialState: DesktopInitialState = {
   settings: {
     workspacePath: '/Users/demo/Documents/Workspaces',
     codexPath: '演示：自动检测',
+    pdfRendererPath: '',
   },
 };
 
@@ -190,7 +197,7 @@ const nativeInitialState: DesktopInitialState = {
     approvals: 'unavailable',
     memories: 'unavailable',
   },
-  settings: { workspacePath: '', codexPath: '' },
+  settings: { workspacePath: '', codexPath: '', pdfRendererPath: '' },
 };
 
 export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): DesktopAdapter {
@@ -207,7 +214,9 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
     initialState,
     async loadInitialState() { return structuredClone(initialState); },
     async connectAccount() { return structuredClone(demoInitialState.account); },
-    async startLogin() { return { message: '演示数据：浏览器登录流程已准备好。' }; },
+    async startLogin() {
+      return { message: '演示数据：浏览器登录流程已准备好。', authUrl: 'https://chatgpt.com/' };
+    },
     async startTask(prompt) {
       const task: TaskSummary = {
         id: `demo-task-${counter++}`, prompt, status: 'waiting_for_approval',
@@ -218,6 +227,7 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
         usage: '2.6K / 5.0K tokens',
         pendingInteraction: { requestId: `demo-approval-${counter}`, kind: 'command_approval', params: {} },
         error: null,
+        recoverable: false,
       };
       tasks.set(task.id, task);
       return cloneTask(task);
@@ -229,6 +239,21 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
       const current = tasks.get(taskId);
       if (current) listener(cloneTask(current));
       return () => taskListeners.delete(listener);
+    },
+    async cancelTask(taskId) {
+      const task = tasks.get(taskId);
+      if (!task) throw new Error('Task does not exist');
+      task.status = 'cancelled';
+      task.recoverable = false;
+      return cloneTask(task);
+    },
+    async recoverTask(taskId) {
+      const task = tasks.get(taskId);
+      if (!task?.recoverable) throw new Error('Task is not recoverable');
+      task.status = 'ready';
+      task.recoverable = false;
+      task.error = null;
+      return cloneTask(task);
     },
     async respondToTask(taskId, decision) {
       const task = tasks.get(taskId);
@@ -263,6 +288,7 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
     async saveDetails() { throw new Error('演示模式不会保存生产细化。'); },
     async approveDetails() { throw new Error('演示模式不会保存生产审批。'); },
     async requestVisual() { throw new Error('演示模式不会请求 ImageGen。'); },
+    async readProjectVisual() { throw new Error('演示模式没有生产视觉文件。'); },
     async replaceVisual() { throw new Error('演示模式不会写入视觉文件。'); },
     async approveVisual() { throw new Error('演示模式不会保存生产审批。'); },
     async reopenVisual() { throw new Error('演示模式不会改动生产版本。'); },
@@ -331,22 +357,43 @@ class TauriDesktopAdapter implements DesktopAdapter {
   async connectAccount(): Promise<AccountSummary> {
     await this.client.connect();
     const account = await this.client.readAccount();
-    return account
-      ? { email: account.email, plan: account.planType, status: 'connected' }
-      : { email: null, plan: null, status: 'logged_out' };
+    if (account?.planType.trim()) {
+      return { email: account.email, plan: account.planType, status: 'connected' };
+    }
+    return {
+      email: null,
+      plan: null,
+      status: this.client.getAuthState().status === 'logged_out' ? 'logged_out' : 'unavailable',
+    };
   }
-  async startLogin(): Promise<{ message: string }> {
+  async startLogin(): Promise<{ message: string; authUrl: string }> {
     await this.client.connect();
     const response = await this.client.startChatGptLogin();
-    return { message: `已发起登录，请在浏览器中继续：${response.authUrl}` };
+    const url = new URL(response.authUrl);
+    if (url.protocol !== 'https:') throw new Error('Codex 返回了不安全的 ChatGPT 登录地址。');
+    return { message: '已发起登录，请在浏览器中继续。', authUrl: url.toString() };
   }
   async startTask(prompt: string): Promise<TaskSummary> {
-    await this.client.connect();
+    await this.requireActiveChatGptAccount();
+    const cwd = await this.callNative<string>('workspace_directory');
+    if (!isCanonicalAbsolutePath(cwd)) {
+      throw new Error('没有可用的 Rust 验证绝对工作区；请先在设置中选择合法工作区。');
+    }
     const id = `desktop-task-${this.taskCounter++}`;
-    const task = await this.tasks.startTask({ id, cwd: '.', prompt, createdAt: new Date().toISOString() });
+    const task = await this.tasks.startTask({ id, cwd, prompt, createdAt: new Date().toISOString() });
     this.taskIds.add(id);
     this.taskPrompts.set(id, prompt);
     return this.toTaskSummary(task);
+  }
+  async cancelTask(taskId: string): Promise<TaskSummary> {
+    await this.tasks.cancelTask(taskId);
+    this.publish(taskId);
+    return this.toTaskSummary(this.requireTask(taskId));
+  }
+  async recoverTask(taskId: string): Promise<TaskSummary> {
+    await this.tasks.recoverTask(taskId);
+    this.publish(taskId);
+    return this.toTaskSummary(this.requireTask(taskId));
   }
   subscribeTask(taskId: string, listener: (task: TaskSummary) => void): () => void {
     const taskListeners = this.listeners.get(taskId) ?? new Set();
@@ -423,8 +470,15 @@ class TauriDesktopAdapter implements DesktopAdapter {
   async approveDetails(projectId: string): Promise<NativePptPipeline> {
     return this.applyCurrent(projectId, { kind: 'details.approve', at: new Date().toISOString() });
   }
-  async requestVisual(projectId: string, slideId: string): Promise<NativePptPipeline> {
-    return this.applyCurrent(projectId, { kind: 'visual.generate', at: new Date().toISOString(), slideId });
+  async requestVisual(projectId: string, slideId: string, feedback?: string): Promise<NativePptPipeline> {
+    await this.requireActiveChatGptAccount();
+    return this.applyCurrent(projectId, {
+      kind: 'visual.generate', at: new Date().toISOString(), slideId,
+      ...(feedback?.trim() ? { feedback: feedback.trim() } : {}),
+    });
+  }
+  readProjectVisual(projectId: string, relativePath: string): Promise<string> {
+    return this.callNative('ppt_read_artifact', { projectId, relativePath });
   }
   async replaceVisual(projectId: string, slideId: string, imageBase64: string, altText: string): Promise<NativePptPipeline> {
     return this.applyCurrent(projectId, { kind: 'visual.replace', at: new Date().toISOString(), slideId, imageBase64, altText });
@@ -498,8 +552,11 @@ class TauriDesktopAdapter implements DesktopAdapter {
   }
   decideApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }> { return this.callNative('approval_decide', { approvalId, decision }); }
   decideMemory(proposalId: string, decision: 'approved' | 'rejected'): Promise<{ status: string }> { return this.callNative('memory_decide', { proposalId, decision }); }
-  async saveSettings(input: { workspacePath: string; codexPath: string }): Promise<{ status: string }> {
-    const result = await this.callNative<{ status: string }>('save_desktop_settings', input);
+  async saveSettings(input: { workspacePath: string; codexPath: string; pdfRendererPath?: string }): Promise<{ status: string }> {
+    const result = await this.callNative<{ status: string }>('save_desktop_settings', {
+      ...input,
+      pdfRendererPath: input.pdfRendererPath ?? '',
+    });
     this.codexPath = input.codexPath;
     if (this.transport instanceof TauriCodexTransport) await this.transport.setConfiguredPath(input.codexPath);
     return result;
@@ -517,8 +574,9 @@ class TauriDesktopAdapter implements DesktopAdapter {
     });
   }
   private async runStructured<T>(projectId: string, prompt: string): Promise<T> {
+    await this.requireActiveChatGptAccount();
     const cwd = await this.callNative<string>('ppt_project_directory', { projectId });
-    await this.client.connect();
+    if (!isCanonicalAbsolutePath(cwd)) throw new Error('Rust 未返回合法的项目绝对路径。');
     const id = `ppt-structured-${this.taskCounter++}`;
     const task = await this.tasks.startTask({ id, cwd, prompt, createdAt: new Date().toISOString() });
     this.taskIds.add(id);
@@ -547,6 +605,25 @@ class TauriDesktopAdapter implements DesktopAdapter {
   }
 
   private callNative<T>(command: string, args?: Record<string, unknown>): Promise<T> { return this.nativeInvoke(command, args) as Promise<T>; }
+  private async requireActiveChatGptAccount(): Promise<void> {
+    await this.client.connect();
+    const account = await this.client.readAccount();
+    if (!account) {
+      const auth = this.client.getAuthState();
+      if (auth.status === 'invalidated' && /apikey/i.test(auth.reason)) {
+        throw new Error('API-key authentication is not supported; sign in with an active ChatGPT account.');
+      }
+      throw new Error('A ChatGPT login is required before starting a model task.');
+    }
+    if (!account.planType.trim()) {
+      throw new Error('An active ChatGPT account is required before starting a model task.');
+    }
+  }
+  private requireTask(taskId: string): GeneralTask {
+    const task = this.tasks.getTask(taskId);
+    if (!task) throw new Error('Task does not exist');
+    return task;
+  }
   private publishThread(threadId: string): void {
     for (const taskId of this.taskIds) if (this.tasks.getTask(taskId)?.threadId === threadId) this.publish(taskId);
   }
@@ -558,22 +635,15 @@ class TauriDesktopAdapter implements DesktopAdapter {
     for (const listener of this.listeners.get(taskId) ?? []) listener(summary);
   }
   private toTaskSummary(task: GeneralTask): TaskSummary {
-    const status: TaskSummary['status'] =
-      task.status === 'queued' ||
-      task.status === 'ready' ||
-      task.status === 'recovering'
-        ? 'running'
-        : task.status === 'cancelled'
-          ? 'failed'
-          : task.status;
     return {
       id: task.id,
       prompt: this.taskPrompts.get(task.id) ?? task.transcript[0]?.text ?? '',
-      status,
+      status: task.status,
       transcript: task.transcript.map(({ role, text }) => ({ role, text })),
       usage: formatUsage(task.tokenUsage),
       pendingInteraction: task.pendingInteraction ? { ...task.pendingInteraction } : null,
       error: task.error,
+      recoverable: task.recoverable,
     };
   }
 }
@@ -601,4 +671,8 @@ function formatUsage(usage: Record<string, unknown> | null): string {
 function cloneTask(task: TaskSummary): TaskSummary { return structuredClone(task); }
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;
+}
+
+function isCanonicalAbsolutePath(value: string): boolean {
+  return value.startsWith('/') && !value.includes('\0') && !value.split('/').includes('..');
 }

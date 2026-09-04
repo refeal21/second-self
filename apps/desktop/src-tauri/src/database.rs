@@ -234,10 +234,32 @@ impl Database {
     }
 
     pub fn rename_project(&self, id: &str, name: &str, updated_at: &str) -> Result<bool> {
-        Ok(self.connection.execute(
-            "UPDATE projects SET name = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, name, updated_at],
-        )? == 1)
+        let transaction = self.connection.unchecked_transaction()?;
+        let encoded: Option<String> = transaction
+            .query_row(
+                "SELECT pipeline_json FROM projects WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(encoded) = encoded else {
+            return Ok(false);
+        };
+        let mut pipeline: serde_json::Value = json_column(encoded, 0)?;
+        let project = pipeline
+            .get_mut("project")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| invalid_parameter("pipeline project object is invalid"))?;
+        project.insert("name".into(), name.into());
+        project.insert("updatedAt".into(), updated_at.into());
+        let encoded = serde_json::to_string(&pipeline)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        transaction.execute(
+            "UPDATE projects SET name = ?2, updated_at = ?3, pipeline_json = ?4 WHERE id = ?1",
+            params![id, name, updated_at, encoded],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn mutate_project(&self, id: &str, mutation: &ProjectMutation) -> Result<bool> {

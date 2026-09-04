@@ -1,12 +1,14 @@
 /* @vitest-environment jsdom */
 
 import '@testing-library/jest-dom/vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createNativePipeline, type NativePptPipeline } from '../../worker/src/native-pipeline.js';
 import { createDemoDesktopAdapter, type DesktopAdapter } from './desktop-adapter.js';
 import { NativeWorkspacePage } from './native-workspace.js';
+
+afterEach(cleanup);
 
 function qaPipeline(status: 'qa' | 'completed'): NativePptPipeline {
   const pipeline = createNativePipeline({
@@ -33,7 +35,116 @@ function qaPipeline(status: 'qa' | 'completed'): NativePptPipeline {
   return pipeline;
 }
 
+function visualPipeline(
+  status: 'visual_review' | 'conversion' = 'visual_review',
+): NativePptPipeline {
+  const pipeline = createNativePipeline({
+    id: 'project-visual-ui', name: '经营复盘', goal: '管理层决策',
+    createdAt: '2026-09-04T00:00:00.000Z',
+  });
+  pipeline.project.workflowStatus = status;
+  pipeline.slideSpecs = {
+    version: {
+      id: 'project-visual-ui-slide-specs-v1', projectId: pipeline.project.id,
+      sequence: 1, status: 'frozen', createdAt: pipeline.project.createdAt,
+      frozenAt: '2026-09-04T00:01:00.000Z',
+    },
+    value: [{
+      id: 'slide-cover', title: '封面', body: ['管理层汇报'], tables: [], charts: [],
+      shapes: [], sourceMap: [], imageGenerationBrief: '完整 16:9 封面，不要生成文字。',
+    }],
+  };
+  pipeline.currentSlideId = 'slide-cover';
+  pipeline.visuals['slide-cover'] = [{
+    slideId: 'slide-cover',
+    version: {
+      id: 'project-visual-ui-visual-slide-cover-v1', projectId: pipeline.project.id,
+      sequence: 1, status: status === 'conversion' ? 'frozen' : 'draft',
+      createdAt: '2026-09-04T00:02:00.000Z',
+      frozenAt: status === 'conversion' ? '2026-09-04T00:03:00.000Z' : null,
+    },
+    relativePath: 'visuals/slide-cover-v1.png', sha256: 'b'.repeat(64), byteLength: 1024,
+    usage: 'full_slide_reference', textFree: false, altText: '用户替换的完整封面',
+  }];
+  return pipeline;
+}
+
 describe('native PPT QA workspace', () => {
+  it('renders the current PNG at 16:9, gates approval on image load, and sends revision feedback', async () => {
+    const user = userEvent.setup();
+    const initial = visualPipeline();
+    const base = createDemoDesktopAdapter();
+    const approveVisual = vi.fn(async () => initial);
+    const requestVisual = vi.fn(async () => initial);
+    const adapter = {
+      ...base,
+      mode: 'tauri' as const,
+      loadProjectPipeline: vi.fn(async () => initial),
+      readProjectVisual: vi.fn(async () => 'data:image/png;base64,valid-preview'),
+      approveVisual,
+      requestVisual,
+    } satisfies DesktopAdapter;
+    render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
+      projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
+
+    const preview = await screen.findByRole('img', { name: '用户替换的完整封面' });
+    const approve = screen.getByRole('button', { name: '批准当前页' });
+    expect(approve).toBeDisabled();
+    Object.defineProperties(preview, {
+      naturalWidth: { value: 1280, configurable: true },
+      naturalHeight: { value: 720, configurable: true },
+    });
+    fireEvent.load(preview);
+    expect(approve).toBeEnabled();
+
+    await user.type(screen.getByRole('textbox', { name: '修改意见' }), '减少装饰，突出数据');
+    await user.click(screen.getByRole('button', { name: '按意见重新生成' }));
+    expect(requestVisual).toHaveBeenCalledWith(
+      initial.project.id,
+      'slide-cover',
+      '减少装饰，突出数据',
+    );
+  });
+
+  it('keeps approval disabled when the visual cannot load or is not a reasonable 16:9 image', async () => {
+    const initial = visualPipeline();
+    const base = createDemoDesktopAdapter();
+    const adapter = {
+      ...base,
+      mode: 'tauri' as const,
+      loadProjectPipeline: vi.fn(async () => initial),
+      readProjectVisual: vi.fn(async () => 'data:image/png;base64,broken'),
+    } satisfies DesktopAdapter;
+    render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
+      projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
+
+    const preview = await screen.findByRole('img', { name: '用户替换的完整封面' });
+    fireEvent.error(preview);
+    expect(screen.getByRole('button', { name: '批准当前页' })).toBeDisabled();
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法加载当前 PNG');
+  });
+
+  it('exposes reopen for an approved page after sequential visual approval', async () => {
+    const user = userEvent.setup();
+    const initial = visualPipeline('conversion');
+    const reopened = visualPipeline('visual_review');
+    const base = createDemoDesktopAdapter();
+    const reopenVisual = vi.fn(async () => reopened);
+    const adapter = {
+      ...base,
+      mode: 'tauri' as const,
+      loadProjectPipeline: vi.fn(async () => initial),
+      readProjectVisual: vi.fn(async () => 'data:image/png;base64,valid-preview'),
+      reopenVisual,
+    } satisfies DesktopAdapter;
+    render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
+      projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
+
+    await user.click(await screen.findByRole('button', { name: '重新打开第 1 页' }));
+    expect(reopenVisual).toHaveBeenCalledWith(initial.project.id, 'slide-cover');
+    expect(await screen.findByText(/5\. 逐页视觉/)).toBeInTheDocument();
+  });
+
   it('runs the production QA action and renders the real readable report path', async () => {
     const user = userEvent.setup();
     const initial = qaPipeline('qa');

@@ -119,3 +119,31 @@ fn persists_checkpoint_and_project_preference_snapshot_across_reopen() {
 
     std::fs::remove_file(path).expect("temporary database removed");
 }
+
+#[test]
+fn rename_keeps_the_relational_name_and_authoritative_pipeline_name_in_sync() {
+    let database = Database::open_in_memory().expect("database opens");
+    database
+        .insert_project(&NewProject {
+            id: "project-rename".into(),
+            name: "旧名称".into(),
+            goal: "验证重命名".into(),
+            created_at: "2026-09-04T00:00:00Z".into(),
+        })
+        .expect("project inserted");
+
+    assert!(database
+        .rename_project("project-rename", "新名称", "2026-09-04T00:01:00Z")
+        .expect("rename succeeds"));
+
+    let project = database
+        .get_project("project-rename")
+        .expect("project queried")
+        .expect("project exists");
+    assert_eq!(project.name, "新名称");
+    assert_eq!(project.pipeline["project"]["name"], "新名称");
+    assert_eq!(
+        project.pipeline["project"]["updatedAt"],
+        "2026-09-04T00:01:00Z"
+    );
+}

@@ -665,6 +665,14 @@ export interface PptxOoxmlInspection {
   missingResources: readonly string[];
   outOfBoundsObjects: readonly string[];
   cropIssues: readonly string[];
+  mediaCount?: number;
+  slideEvidence?: readonly {
+    imageCount: number;
+    textValues: readonly string[];
+    tableCount: number;
+    chartCount: number;
+    shapeCount: number;
+  }[];
 }
 
 export async function inspectPptxOoxml(contents: Uint8Array): Promise<PptxOoxmlInspection> {
@@ -678,6 +686,8 @@ export async function inspectPptxOoxml(contents: Uint8Array): Promise<PptxOoxmlI
       missingResources: ['invalid-or-unreadable-pptx-package'],
       outOfBoundsObjects: [],
       cropIssues: [],
+      mediaCount: 0,
+      slideEvidence: [],
     };
   }
   const slideNames = Object.keys(archive.files)
@@ -690,8 +700,17 @@ export async function inspectPptxOoxml(contents: Uint8Array): Promise<PptxOoxmlI
   const fonts = new Set<string>();
   const outOfBoundsObjects: string[] = [];
   const cropIssues: string[] = [];
+  const slideEvidence: NonNullable<PptxOoxmlInspection['slideEvidence']>[number][] = [];
   for (const name of slideNames) {
     const xml = await archive.file(name)!.async('string');
+    slideEvidence.push({
+      imageCount: [...xml.matchAll(/<p:pic(?:\s|\/?>)/g)].length,
+      textValues: [...xml.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)]
+        .map((match) => unescapeXml(match[1] ?? '')),
+      tableCount: [...xml.matchAll(/<a:tbl(?:\s|\/?>)/g)].length,
+      chartCount: [...xml.matchAll(/<c:chart(?:\s|\/>)/g)].length,
+      shapeCount: [...xml.matchAll(/<p:sp(?:\s|\/?>)/g)].length,
+    });
     for (const match of xml.matchAll(/\btypeface="([^"]+)"/g)) {
       if (match[1] && !match[1].startsWith('+')) fonts.add(unescapeXml(match[1]));
     }
@@ -743,6 +762,10 @@ export async function inspectPptxOoxml(contents: Uint8Array): Promise<PptxOoxmlI
     missingResources: [...missingResources].sort(),
     outOfBoundsObjects,
     cropIssues,
+    mediaCount: Object.keys(archive.files).filter(
+      (name) => name.startsWith('ppt/media/') && !archive.files[name]?.dir,
+    ).length,
+    slideEvidence,
   };
 }
 

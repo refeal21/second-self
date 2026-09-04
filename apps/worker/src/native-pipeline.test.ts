@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
+import { PNG } from 'pngjs';
 import { describe, expect, it } from 'vitest';
 import {
   NativePptRpcRuntime,
@@ -17,6 +18,30 @@ const pngPath = join(
   repositoryRoot,
   'fixtures/golden-project/sources/market-background.png',
 );
+
+const onePixelPngBase64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+function tofuPageBase64(): string {
+  const png = new PNG({ width: 1280, height: 720, colorType: 6 });
+  png.data.fill(255);
+  for (let glyph = 0; glyph < 4; glyph += 1) {
+    const left = 100 + glyph * 42;
+    const top = 80;
+    for (let y = top; y < top + 30; y += 1) {
+      for (let x = left; x < left + 30; x += 1) {
+        if (x === left || x === left + 29 || y === top || y === top + 29) {
+          const offset = (y * png.width + x) * 4;
+          png.data[offset] = 20;
+          png.data[offset + 1] = 20;
+          png.data[offset + 2] = 20;
+          png.data[offset + 3] = 255;
+        }
+      }
+    }
+  }
+  return PNG.sync.write(png).toString('base64');
+}
 
 function intakePipeline(): NativePptPipeline {
   const pipeline = createNativePipeline({
@@ -197,6 +222,14 @@ describe('packaged native PPT workflow runtime', () => {
       },
     });
 
+    await expect(runtime.execute('project-native', {
+      kind: 'visual.replace',
+      at: '2026-09-03T02:06:30.000Z',
+      slideId: 'slide-cover',
+      imageBase64: onePixelPngBase64,
+      altText: '无效的一像素占位图',
+    })).rejects.toThrow('16:9');
+
     const imageBase64 = (await readFile(pngPath)).toString('base64');
     result = await runtime.execute('project-native', {
       kind: 'visual.replace',
@@ -281,15 +314,26 @@ describe('packaged native PPT workflow runtime', () => {
       kind: 'deck.qa',
       at: '2026-09-03T02:11:30.000Z',
       preparation: {
-        status: 'blocked',
-        issue: 'LibreOffice is temporarily unavailable',
-        capability: 'libreoffice',
+        status: 'ready', sofficePath: '/Applications/LibreOffice.app/Contents/MacOS/soffice',
+        rendererPath: '/mock/pdftoppm', pdfBase64: Buffer.from('pdf').toString('base64'),
+        pptxBase64: pptxWrite!.contentsBase64,
+        renderedPages: [
+          { fileName: 'rendered-1.png', contentsBase64: tofuPageBase64() },
+          { fileName: 'rendered-2.png', contentsBase64: tofuPageBase64() },
+        ],
+        approvedVisuals: [
+          { slideId: 'slide-cover', relativePath: 'visuals/slide-cover-v2.png', contentsBase64: imageBase64 },
+          { slideId: 'slide-kpi', relativePath: 'visuals/slide-kpi-v1.png', contentsBase64: imageBase64 },
+        ],
+        fontAvailability: { 'Hiragino Sans GB': true },
       },
     });
     expect(result.pipeline).toMatchObject({
       project: { workflowStatus: 'blocked' },
-      qaReport: { round: 1, status: 'blocked' },
-      blockedCondition: { resumeStage: 'qa', capability: 'libreoffice' },
+      qaReport: { round: 1, status: 'failed', issues: expect.arrayContaining([
+        expect.stringContaining('tofu'),
+      ]) },
+      blockedCondition: { resumeStage: 'qa', capability: 'qa-rendering' },
     });
 
     result = await runtime.execute('project-native', {

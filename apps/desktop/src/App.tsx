@@ -96,21 +96,34 @@ export function App({
   }, []);
 
   useEffect(() => {
-    // The browser demo state is already complete and is intentionally mutable for
-    // the lifetime of the preview. Only the native shell has a second, durable
-    // source of truth that must replace the bootstrap placeholder.
-    if (adapter.mode !== 'tauri') return;
     let active = true;
-    void adapter
-      .loadInitialState()
-      .then((state) => {
-        if (active) dispatch({ type: 'state-loaded', state });
-      })
-      .catch((error: unknown) => {
-        if (active) setNotice({ kind: 'error', text: toMessage(error) });
+    let unsubscribe: (() => void) | undefined;
+    const subscribe = () => {
+      unsubscribe = adapter.subscribeConnection((connection) => {
+        if (active) dispatch({ type: 'connection-updated', connection });
       });
+    };
+    if (adapter.mode === 'demo') {
+      subscribe();
+    } else {
+      void (async () => {
+        const state = await adapter.loadInitialState();
+        if (!active) return;
+        dispatch({ type: 'state-loaded', state });
+        // Subscribe after hydration so the durable placeholder cannot overwrite
+        // a newer account/connection event. The adapter replays its latest state.
+        subscribe();
+        await adapter.connectAccount();
+      })().catch((error: unknown) => {
+        if (!active) return;
+        // Project/Worker hydration failure must not disable account recovery.
+        if (!unsubscribe) subscribe();
+        setNotice({ kind: 'error', text: toMessage(error) });
+      });
+    }
     return () => {
       active = false;
+      unsubscribe?.();
     };
   }, [adapter]);
 
@@ -186,7 +199,6 @@ export function App({
             task={task}
             setTask={setTask}
             account={workbench.account}
-            dispatch={dispatch}
             report={report}
           />
         )}
@@ -464,7 +476,7 @@ function DashboardAside({
       <section className="codex-status" aria-labelledby="codex-heading">
         <h2 id="codex-heading">Codex 连接状态</h2>
         <p className={workbench.runtime.status === 'connected' ? 'connected' : 'muted'}>
-          <span className="connection-dot" />
+          <span className="connection-dot" data-connected={workbench.runtime.status === 'connected'} aria-hidden="true" />
           {workbench.runtime.status === 'connected' ? '已连接' : '不可用'}
         </p>
         <p className="muted">{workbench.runtime.detail}</p>
@@ -531,14 +543,12 @@ function TasksPage({
   task,
   setTask,
   account,
-  dispatch,
   report,
 }: {
   adapter: DesktopAdapter;
   task: TaskSummary | null;
   setTask: (task: TaskSummary) => void;
   account: WorkbenchState['account'];
-  dispatch: (action: WorkbenchAction) => void;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
@@ -580,8 +590,7 @@ function TasksPage({
   };
   const connect = async () => {
     try {
-      const next = await adapter.connectAccount();
-      dispatch({ type: 'account-updated', account: next });
+      await adapter.connectAccount();
     } catch (error) {
       await report(async () => {
         throw error;
@@ -683,8 +692,8 @@ function TasksPage({
         </section>
         <aside className="connection-panel">
           <h2>Codex 账户</h2>
-          <p className="connected">
-            <span className="connection-dot" />
+          <p className={account.status === 'connected' ? 'connected' : 'muted'}>
+            <span className="connection-dot" data-connected={account.status === 'connected'} aria-hidden="true" />
             {account.status === 'connected'
               ? `${account.email ?? '已连接'} · ${account.plan ?? 'ChatGPT'}`
               : account.status === 'logged_out'
@@ -1780,8 +1789,8 @@ function SettingsPage({
         </section>
         <section>
           <h2>账户状态</h2>
-          <p className={runtime.status === 'connected' ? 'connected' : 'muted'}>
-            <span className="connection-dot" />
+          <p className={account.status === 'connected' ? 'connected' : 'muted'}>
+            <span className="connection-dot" data-connected={account.status === 'connected'} aria-hidden="true" />
             {account.status === 'connected'
               ? `${account.email ?? '账户已连接'} · ${account.plan ?? 'ChatGPT'}`
               : account.status === 'logged_out'

@@ -78,6 +78,28 @@ class DeferredStartBridge implements TauriBridge {
   }
 }
 
+class DeferredStopBridge extends FakeTauriBridge {
+  readonly stopObserved: Promise<void>;
+  private markStopObserved!: () => void;
+  private completeStop!: () => void;
+
+  constructor() {
+    super();
+    this.stopObserved = new Promise((resolve) => { this.markStopObserved = resolve; });
+  }
+
+  override async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+    const result = await super.invoke<T>(command, args);
+    if (command === 'stop_codex_app_server') {
+      this.markStopObserved();
+      await new Promise<void>((resolve) => { this.completeStop = resolve; });
+    }
+    return result;
+  }
+
+  finishStop(): void { this.completeStop(); }
+}
+
 describe('typed Tauri Codex transport', () => {
   it('maps process commands and typed events without an HTTP boundary', async () => {
     const bridge = new FakeTauriBridge();
@@ -126,6 +148,22 @@ describe('typed Tauri Codex transport', () => {
     bridge.emit('codex-app-server://stdout', { generation: 2, line: 'current' });
     expect(lines).toEqual(['current']);
     expect(bridge.listenerCount('codex-app-server://stdout')).toBe(1);
+  });
+
+  it('rejects writes and ignores late notifications from an exited process until restart', async () => {
+    const bridge = new FakeTauriBridge();
+    const transport = new TauriCodexTransport(null, bridge);
+    const lines: string[] = [];
+    transport.onLine((line) => lines.push(line));
+    await transport.start();
+    bridge.emit('codex-app-server://exit', { generation: 1, code: 70, signal: null });
+    bridge.emit('codex-app-server://stdout', { generation: 1, line: '{"method":"account/updated"}' });
+
+    expect(lines).toEqual([]);
+    await expect(transport.send('{"method":"account/read"}')).rejects.toThrow('not running');
+    await transport.start();
+    bridge.emit('codex-app-server://stdout', { generation: 2, line: 'current' });
+    expect(lines).toEqual(['current']);
   });
 
   it('ignores stdout and exit events from a superseded process generation', async () => {
@@ -228,5 +266,26 @@ describe('typed Tauri Codex transport', () => {
     });
     expect(bridge.commands.filter(({ command }) => command === 'start_codex_app_server').at(-1))
       .toEqual({ command: 'start_codex_app_server', args: { configuredPath: '/saved/codex' } });
+  });
+
+  it('waits for a pending path-change stop before binding the restarted process', async () => {
+    const bridge = new DeferredStopBridge();
+    const transport = new TauriCodexTransport(null, bridge);
+    const lines: string[] = [];
+    transport.onLine((line) => lines.push(line));
+    await transport.start();
+
+    const savingPath = transport.setConfiguredPath('/other/codex');
+    await bridge.stopObserved;
+    const restarting = transport.start();
+    await Promise.resolve();
+    const startsBeforeStopCompleted = bridge.commands.filter(({ command }) => command === 'start_codex_app_server').length;
+    bridge.finishStop();
+    await Promise.all([savingPath, restarting]);
+    bridge.emit('codex-app-server://stdout', { generation: 2, line: 'current' });
+
+    expect(startsBeforeStopCompleted).toBe(1);
+    expect(lines).toEqual(['current']);
+    expect(bridge.listenerCount('codex-app-server://stdout')).toBe(1);
   });
 });

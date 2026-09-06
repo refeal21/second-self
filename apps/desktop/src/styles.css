@@ -158,6 +158,10 @@ p {
   border-radius: 50%;
   background: #38bb5a;
 }
+.connection-dot[data-connected='false'] {
+  background: #8b929e;
+  margin-right: 11px;
+}
 .app-main {
   min-width: 0;
   background: #fff;

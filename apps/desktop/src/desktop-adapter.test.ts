@@ -1,32 +1,52 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   createTauriDesktopAdapter,
+  createDemoDesktopAdapter,
+  type ConnectionSummary,
+  type DesktopAdapter,
   type NativeAppServerTransport,
   type NativeJsonRpcMessage,
 } from './desktop-adapter.js';
+import { TauriCodexTransport, type TauriBridge } from './codex-transport.js';
 import type { WorkflowWorkerGateway } from './workflow-worker-client.js';
 
 class ScriptedNativeServer implements NativeAppServerTransport {
   readonly sent: NativeJsonRpcMessage[] = [];
+  starts = 0;
+  startError: Error | null = null;
+  accountReadError: string | null = null;
+  holdAccountReads = false;
+  readonly heldAccountReads: NativeJsonRpcMessage[] = [];
   private lineListener: ((line: string) => void) | undefined;
   private exitListener:
     | ((detail: { code: number | null; signal: string | null }) => void)
     | undefined;
 
   constructor(
-    private readonly account: unknown = {
+    public account: unknown = {
       type: 'chatgpt',
       email: 'person@example.com',
       planType: 'plus',
     },
   ) {}
 
-  async start(): Promise<void> {}
+  async start(): Promise<void> {
+    this.starts += 1;
+    if (this.startError) throw this.startError;
+  }
 
   async send(line: string): Promise<void> {
     const message = JSON.parse(line) as NativeJsonRpcMessage;
     this.sent.push(message);
     if (message.id === undefined || message.method === undefined) return;
+    if (message.method === 'account/read' && this.holdAccountReads) {
+      this.heldAccountReads.push(message);
+      return;
+    }
+    if (message.method === 'account/read' && this.accountReadError) {
+      this.emit({ id: message.id, error: { code: -32000, message: this.accountReadError } });
+      return;
+    }
     const result = this.responseFor(message.method);
     queueMicrotask(() =>
       this.lineListener?.(JSON.stringify({ id: message.id, result })),
@@ -63,6 +83,8 @@ class ScriptedNativeServer implements NativeAppServerTransport {
         return {};
       case 'account/read':
         return { account: this.account, requiresOpenaiAuth: this.account === null };
+      case 'account/login/start':
+        return { type: 'chatgpt', loginId: 'login-1', authUrl: 'https://auth.openai.com/login' };
       case 'thread/start':
         return { thread: { id: 'thread-native-1' } };
       case 'thread/resume':
@@ -74,6 +96,258 @@ class ScriptedNativeServer implements NativeAppServerTransport {
     }
   }
 }
+
+function observeConnection(adapter: DesktopAdapter) {
+  // A missing subscription or a publication that leaves runtime at its placeholder breaks the UI contract.
+  expect(typeof adapter.subscribeConnection).toBe('function');
+  const updates: ConnectionSummary[] = [];
+  const unsubscribe = adapter.subscribeConnection((snapshot) => updates.push(snapshot));
+  return { updates, unsubscribe };
+}
+
+class NativeConnectionBridge implements TauriBridge {
+  readonly commands: Array<{ command: string; args?: Record<string, unknown> }> = [];
+  private generation = 0;
+  private readonly listeners = new Map<string, Set<(event: { payload: unknown }) => void>>();
+
+  async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+    this.commands.push({ command, args });
+    if (command === 'start_codex_app_server') {
+      return { binaryPath: '/local/codex', generation: ++this.generation } as T;
+    }
+    if (command === 'send_codex_app_server_line') {
+      const message = JSON.parse(args?.line as string) as NativeJsonRpcMessage;
+      if (message.id !== undefined) {
+        const result = message.method === 'account/read'
+          ? { account: { type: 'chatgpt', email: 'native@example.com', planType: 'pro' }, requiresOpenaiAuth: false }
+          : {};
+        queueMicrotask(() => {
+          for (const listener of this.listeners.get('codex-app-server://stdout') ?? []) {
+            listener({ payload: { generation: args?.generation, line: JSON.stringify({ id: message.id, result }) } });
+          }
+        });
+      }
+    }
+    return { status: '已保存' } as T;
+  }
+
+  async listen<T>(event: string, handler: (event: { payload: T }) => void): Promise<() => void> {
+    const listeners = this.listeners.get(event) ?? new Set();
+    const listener = handler as (event: { payload: unknown }) => void;
+    listeners.add(listener);
+    this.listeners.set(event, listeners);
+    return () => { listeners.delete(listener); };
+  }
+}
+
+describe('desktop connection snapshots', () => {
+  it('publishes a real account and connected local runtime, and replays the latest snapshot', async () => {
+    const transport = new ScriptedNativeServer();
+    const adapter = createTauriDesktopAdapter(transport, vi.fn());
+    const { updates } = observeConnection(adapter);
+    expect(updates.at(-1)).toMatchObject({ account: { status: 'unavailable' }, runtime: { status: 'unavailable' } });
+
+    await expect(adapter.connectAccount()).resolves.toEqual({ email: 'person@example.com', plan: 'plus', status: 'connected' });
+
+    expect(updates.at(-1)).toEqual({
+      account: { email: 'person@example.com', plan: 'plus', status: 'connected' },
+      runtime: {
+        status: 'connected', detail: expect.stringContaining('plus'),
+        address: 'stdio（本机进程）', model: null, uptime: null, queue: null,
+      },
+    });
+    expect(observeConnection(adapter).updates).toEqual([updates.at(-1)]);
+  });
+
+  it('keeps the service connected while an unauthenticated account waits for login', async () => {
+    const adapter = createTauriDesktopAdapter(new ScriptedNativeServer(null), vi.fn());
+    const { updates } = observeConnection(adapter);
+    await adapter.connectAccount();
+    expect(updates.at(-1)).toMatchObject({
+      account: { email: null, plan: null, status: 'logged_out' },
+      runtime: { status: 'connected', detail: expect.stringMatching(/登录/), address: 'stdio（本机进程）' },
+    });
+  });
+
+  it('clears a crashed connection and establishes a new handshake when reconnected', async () => {
+    const transport = new ScriptedNativeServer();
+    const adapter = createTauriDesktopAdapter(transport, vi.fn());
+    const { updates } = observeConnection(adapter);
+    await adapter.connectAccount();
+    transport.crash();
+    expect(updates.at(-1)).toMatchObject({
+      account: { email: null, plan: null, status: 'unavailable' },
+      runtime: { status: 'unavailable', address: null },
+    });
+
+    transport.account = { type: 'chatgpt', email: 'second@example.com', planType: 'pro' };
+    await adapter.connectAccount();
+    expect(transport.starts).toBe(2);
+    expect(updates.at(-1)).toMatchObject({ account: { email: 'second@example.com', plan: 'pro' }, runtime: { status: 'connected' } });
+  });
+
+  it('refreshes connection state after recovering a crashed task without starting another turn', async () => {
+    const { adapter, transport, task } = await runningNativeTask();
+    const { updates } = observeConnection(adapter);
+    transport.crash();
+    transport.account = { type: 'chatgpt', email: 'recovered@example.com', planType: 'pro' };
+
+    await expect(adapter.recoverTask(task.id)).resolves.toMatchObject({ status: 'ready' });
+
+    expect(updates.at(-1)).toMatchObject({
+      account: { email: 'recovered@example.com', plan: 'pro', status: 'connected' },
+      runtime: { status: 'connected', address: 'stdio（本机进程）' },
+    });
+    expect(transport.sent.filter(({ method }) => method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('keeps connection unavailable if reading the account after task recovery fails', async () => {
+    const { adapter, transport, task } = await runningNativeTask();
+    const { updates } = observeConnection(adapter);
+    transport.crash();
+    transport.accountReadError = 'recovered account unavailable';
+
+    await expect(adapter.recoverTask(task.id)).rejects.toThrow('recovered account unavailable');
+
+    expect(updates.at(-1)).toMatchObject({
+      account: { email: null, plan: null, status: 'unavailable' },
+      runtime: { status: 'unavailable', detail: expect.stringContaining('recovered account unavailable') },
+    });
+    expect(transport.sent.filter(({ method }) => method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('never publishes connected runtime if starting the local process fails', async () => {
+    const transport = new ScriptedNativeServer();
+    transport.startError = new Error('binary unavailable');
+    const adapter = createTauriDesktopAdapter(transport, vi.fn());
+    const { updates } = observeConnection(adapter);
+    await expect(adapter.connectAccount()).rejects.toThrow('binary unavailable');
+    expect(updates.every(({ runtime }) => runtime.status === 'unavailable')).toBe(true);
+    expect(updates.at(-1)?.runtime.detail).toContain('binary unavailable');
+  });
+
+  it('clears an earlier successful snapshot when an account refresh fails', async () => {
+    const transport = new ScriptedNativeServer();
+    const adapter = createTauriDesktopAdapter(transport, vi.fn());
+    const { updates } = observeConnection(adapter);
+    await adapter.connectAccount();
+    transport.accountReadError = 'account refresh failed';
+    await expect(adapter.connectAccount()).rejects.toThrow('account refresh failed');
+    expect(updates.at(-1)).toMatchObject({
+      account: { email: null, plan: null, status: 'unavailable' },
+      runtime: { status: 'unavailable', detail: expect.stringContaining('account refresh failed') },
+    });
+  });
+
+  it.each(['account/login/completed', 'account/updated'] as const)('refreshes the real email on %s without looping on account/read', async (method) => {
+    const transport = new ScriptedNativeServer(null);
+    const adapter = createTauriDesktopAdapter(transport, vi.fn());
+    const { updates } = observeConnection(adapter);
+    await adapter.connectAccount();
+    if (method === 'account/login/completed') await adapter.startLogin();
+    transport.account = { type: 'chatgpt', email: 'logged-in@example.com', planType: 'pro' };
+    transport.emit({ method, params: method === 'account/login/completed'
+      ? { loginId: 'login-1', success: true, error: null }
+      : { authMode: 'chatgpt', planType: 'pro' } });
+
+    await vi.waitFor(() => expect(updates.at(-1)).toMatchObject({
+      account: { email: 'logged-in@example.com', plan: 'pro', status: 'connected' },
+      runtime: { status: 'connected' },
+    }));
+    expect(transport.sent.filter(({ method: sent }) => sent === 'account/read')).toHaveLength(2);
+  });
+
+  it.each([
+    [null, 'logged_out'],
+    ['apikey', 'unavailable'],
+  ])('prevents a stale read from restoring an account after auth mode becomes %s', async (authMode, status) => {
+    const transport = new ScriptedNativeServer();
+    const adapter = createTauriDesktopAdapter(transport, vi.fn());
+    const { updates } = observeConnection(adapter);
+    await adapter.connectAccount();
+    transport.holdAccountReads = true;
+    const refreshing = adapter.connectAccount();
+    await vi.waitFor(() => expect(transport.heldAccountReads).toHaveLength(1));
+    transport.emit({ method: 'account/updated', params: { authMode, planType: null } });
+    expect(updates.at(-1)).toMatchObject({ account: { email: null, plan: null, status }, runtime: { status: 'connected' } });
+    transport.emit({ id: transport.heldAccountReads[0]!.id, result: {
+      account: { type: 'chatgpt', email: 'stale@example.com', planType: 'plus' }, requiresOpenaiAuth: false,
+    } });
+    await expect(refreshing).rejects.toThrow(/失效|superseded/);
+    expect(updates.at(-1)).toMatchObject({ account: { email: null, plan: null, status } });
+  });
+
+  it('blocks a superseded task account check instead of accepting the last connected account', async () => {
+    const transport = new ScriptedNativeServer();
+    const adapter = createTauriDesktopAdapter(transport, async () => '/validated/workspace');
+    await adapter.connectAccount();
+    transport.holdAccountReads = true;
+    const task = adapter.startTask('不得使用之前的登录状态');
+    const checking = adapter.connectAccount();
+    const outcomes = Promise.allSettled([task, checking]);
+    await vi.waitFor(() => expect(transport.heldAccountReads).toHaveLength(1));
+    transport.emit({ id: transport.heldAccountReads[0]!.id, result: { account: null, requiresOpenaiAuth: true } });
+
+    const [taskOutcome] = await outcomes;
+    expect(taskOutcome.status).toBe('rejected');
+    expect(transport.sent.some(({ method }) => method === 'thread/start')).toBe(false);
+    expect(transport.sent.some(({ method }) => method === 'turn/start')).toBe(false);
+    expect(observeConnection(adapter).updates.at(-1)?.account.status).toBe('logged_out');
+  });
+
+  it('stops publishing to an unsubscribed listener and isolates replayed snapshots', async () => {
+    const adapter = createTauriDesktopAdapter(new ScriptedNativeServer(), vi.fn());
+    const { updates, unsubscribe } = observeConnection(adapter);
+    updates[0]!.account.email = 'mutated@example.com';
+    expect(observeConnection(adapter).updates[0]!.account.email).toBeNull();
+    unsubscribe();
+    await adapter.connectAccount();
+    expect(updates).toHaveLength(1);
+  });
+
+  it('publishes connection state when starting a task performs the account check', async () => {
+    const { adapter } = await runningNativeTask();
+    expect(observeConnection(adapter).updates.at(-1)).toMatchObject({
+      account: { email: 'person@example.com', status: 'connected' }, runtime: { status: 'connected' },
+    });
+  });
+
+  it('publishes logged-out service state when a PPT account check blocks execution', async () => {
+    const adapter = createTauriDesktopAdapter(new ScriptedNativeServer(null), vi.fn());
+    const { updates } = observeConnection(adapter);
+    await expect(adapter.requestVisual('project', 'slide')).rejects.toThrow('ChatGPT');
+    expect(updates.at(-1)).toMatchObject({ account: { status: 'logged_out' }, runtime: { status: 'connected' } });
+  });
+
+  it('invalidates a saved Codex path and reconnects through a fresh native process', async () => {
+    const bridge = new NativeConnectionBridge();
+    const adapter = createTauriDesktopAdapter(new TauriCodexTransport(null, bridge), bridge.invoke.bind(bridge));
+    const { updates } = observeConnection(adapter);
+    await adapter.connectAccount();
+    await adapter.saveSettings({ workspacePath: '/workspace', codexPath: '/other/codex' });
+    expect(updates.at(-1)).toMatchObject({ account: { email: null, status: 'unavailable' }, runtime: { status: 'unavailable' } });
+    await adapter.connectAccount();
+    expect(updates.at(-1)).toMatchObject({ account: { email: 'native@example.com' }, runtime: { status: 'connected' } });
+    expect(bridge.commands.filter(({ command }) => command === 'start_codex_app_server')).toEqual([
+      { command: 'start_codex_app_server', args: { configuredPath: null } },
+      { command: 'start_codex_app_server', args: { configuredPath: '/other/codex' } },
+    ]);
+  });
+
+  it('replays and publishes an explicitly identified demo connection', async () => {
+    const adapter = createDemoDesktopAdapter();
+    const { updates, unsubscribe } = observeConnection(adapter);
+    await adapter.connectAccount();
+    expect(updates).toHaveLength(2);
+    expect(updates.at(-1)).toMatchObject({
+      account: { email: 'demo@workbench.local', status: 'connected' },
+      runtime: { status: 'connected', detail: expect.stringContaining('演示') },
+    });
+    unsubscribe();
+    await adapter.connectAccount();
+    expect(updates).toHaveLength(2);
+  });
+});
 
 async function runningNativeTask() {
   const transport = new ScriptedNativeServer();

@@ -86,7 +86,7 @@ Worker SEA 使用当前 Node 22 可执行文件构建，同时把该 Node 发行
 
 ## 只读账号冒烟测试
 
-打开 `.app`，进入“通用任务”，点击“检查连接”。该操作只启动 `codex app-server --listen stdio://`，发送 `initialize` / `initialized` / `account/read`，不会创建 thread/turn，也不会为了测试消耗一个模型回合。账户状态应显示本机 Codex 已登录的 ChatGPT 计划。
+打开 `.app` 后会自动执行一次只读连接检查，也可以进入“通用任务”点击“检查连接”重试。该操作只启动 `codex app-server --listen stdio://`，发送 `initialize` / `initialized` / `account/read`，不会创建 thread/turn，也不会为了测试消耗一个模型回合。首页、通用任务和设置同步显示连接结果；服务已连接但 ChatGPT 未登录时会提示等待登录，任务保持禁用。浏览器登录完成后自动重新读取账号；进程退出时清除旧状态，点击“检查连接”可重连。未测量的模型、运行时间和队列数据继续显示“未提供”。
 
 ## 打包 Worker 的完整流程冒烟测试
 

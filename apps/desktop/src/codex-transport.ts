@@ -38,6 +38,7 @@ export class TauriCodexTransport {
   private readonly lineListeners = new Set<(line: string) => void>();
   private readonly exitListeners = new Set<(detail: CodexExit) => void>();
   private binding: Promise<void> | null = null;
+  private stopping: Promise<void> | null = null;
   private unlisteners: Array<() => void> = [];
   private activeGeneration: number | null = null;
   private startAttempt = 0;
@@ -58,6 +59,7 @@ export class TauriCodexTransport {
   }
 
   async start(): Promise<void> {
+    await this.stopping;
     const attempt = ++this.startAttempt;
     await this.bindEvents();
     if (attempt !== this.startAttempt) return;
@@ -81,7 +83,7 @@ export class TauriCodexTransport {
     this.pendingStartEvents = null;
     this.activeGeneration = started.generation;
     for (const event of bufferedEvents) {
-      if (event.payload.generation === started.generation) this.dispatch(event);
+      if (event.payload.generation === this.activeGeneration) this.dispatch(event);
     }
   }
 
@@ -94,10 +96,27 @@ export class TauriCodexTransport {
   }
 
   async stop(): Promise<void> {
+    if (this.stopping) return this.stopping;
+    // Install the barrier before notifying clients, which can immediately reconnect.
+    const stopping = Promise.resolve().then(() => this.stopProcess());
+    this.stopping = stopping;
+    try {
+      await stopping;
+    } finally {
+      if (this.stopping === stopping) this.stopping = null;
+    }
+  }
+
+  private async stopProcess(): Promise<void> {
     this.startAttempt += 1;
     const generation = this.activeGeneration;
+    const hadProcess = generation !== null || this.binding !== null;
     this.activeGeneration = null;
     this.pendingStartEvents = null;
+    // The native exit can arrive after listeners are removed. Invalidate clients now.
+    if (hadProcess) {
+      for (const listener of this.exitListeners) listener({ code: null, signal: null });
+    }
     try {
       if (generation !== null) {
         await this.bridge.invoke<void>('stop_codex_app_server', { generation });
@@ -152,6 +171,7 @@ export class TauriCodexTransport {
       for (const listener of this.lineListeners) listener(event.payload.line);
       return;
     }
+    this.activeGeneration = null;
     const { code, signal } = event.payload;
     for (const listener of this.exitListeners) listener({ code, signal });
   }

@@ -19,6 +19,8 @@ pnpm --filter @digital-twin/desktop tauri build --bundles app
 
 ## Codex 账户不可用
 
+首页的“Codex 连接状态”表示本机服务是否可达，账户状态表示是否有活动 ChatGPT 登录，两者并不相同。新版在启动、检查连接、登录完成和进程退出时同步更新所有页面；服务已连接但未登录时仍显示“已连接”，并明确提示等待 ChatGPT 登录。若旧版在通用任务显示邮箱、首页却一直显示“等待连接本机 Codex App Server”，请完全退出旧应用后打开重新构建的 `.app`。无需反复登录。
+
 应用按以下顺序查找 Codex：设置中的绝对路径、系统 PATH、ChatGPT 应用内置 Codex。推荐保持路径为空并使用自动检测。进入“通用任务”点击“检查连接”；若显示未登录，再点击“登录或重新登录”。Codex 返回的 HTTPS 登录地址会显示为真实链接，桌面端使用系统浏览器安全打开；登录过程由 Codex 管理。
 
 应用不接受 OpenAI API Key。API-key、未知账户类型、登出状态或空计划都会保持“开始任务”禁用；即使 UI 状态过期，所有通用任务和 PPT 结构化生成也会在 `thread/start` 前重新执行 `account/read` 并原子拒绝。ChatGPT/Codex 未提供 ImageGen 能力时，页面会明确显示不可用；这不是网络重试问题，也不会回退到收费 API。

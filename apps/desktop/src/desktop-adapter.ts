@@ -60,6 +60,10 @@ export interface RuntimeSummary {
   uptime: string | null;
   queue: number | null;
 }
+export interface ConnectionSummary {
+  account: AccountSummary;
+  runtime: RuntimeSummary;
+}
 export type CollectionAvailability = 'unavailable' | 'loading' | 'loaded';
 export interface DesktopSettings {
   workspacePath: string;
@@ -110,6 +114,7 @@ export interface DesktopAdapter {
   readonly initialState: DesktopInitialState;
   loadInitialState(): Promise<DesktopInitialState>;
   connectAccount(): Promise<AccountSummary>;
+  subscribeConnection(listener: (state: ConnectionSummary) => void): () => void;
   startLogin(): Promise<{ message: string; authUrl: string }>;
   startTask(prompt: string): Promise<TaskSummary>;
   cancelTask(taskId: string): Promise<TaskSummary>;
@@ -205,6 +210,8 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
   const initialState = structuredClone(demoInitialState);
   const tasks = new Map<string, TaskSummary>();
   const listeners = new Map<string, Set<(task: TaskSummary) => void>>();
+  const connectionListeners = new Set<(state: ConnectionSummary) => void>();
+  const demoConnection = () => structuredClone({ account: initialState.account, runtime: initialState.runtime });
   const delay = async (key: keyof NonNullable<DemoAdapterOptions['delays']>) => {
     const milliseconds = options.delays?.[key] ?? 0;
     if (milliseconds > 0) await new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -213,7 +220,15 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
     mode: 'demo',
     initialState,
     async loadInitialState() { return structuredClone(initialState); },
-    async connectAccount() { return structuredClone(demoInitialState.account); },
+    async connectAccount() {
+      for (const listener of connectionListeners) listener(demoConnection());
+      return structuredClone(initialState.account);
+    },
+    subscribeConnection(listener) {
+      connectionListeners.add(listener);
+      listener(demoConnection());
+      return () => { connectionListeners.delete(listener); };
+    },
     async startLogin() {
       return { message: '演示数据：浏览器登录流程已准备好。', authUrl: 'https://chatgpt.com/' };
     },
@@ -326,6 +341,14 @@ class TauriDesktopAdapter implements DesktopAdapter {
   private readonly taskIds = new Set<string>();
   private readonly taskPrompts = new Map<string, string>();
   private readonly listeners = new Map<string, Set<(task: TaskSummary) => void>>();
+  private readonly connectionListeners = new Set<(state: ConnectionSummary) => void>();
+  private connection: ConnectionSummary = {
+    account: structuredClone(nativeInitialState.account),
+    runtime: structuredClone(nativeInitialState.runtime),
+  };
+  private connectionGeneration = 0;
+  private accountRevision = 0;
+  private serviceConnected = false;
   private taskCounter = 1;
   private codexPath = '';
 
@@ -338,10 +361,26 @@ class TauriDesktopAdapter implements DesktopAdapter {
     this.tasks = new GeneralTaskManager(this.client);
     this.client.onServerMessage((message) => {
       const params = asRecord(message.params);
+      if (message.method === 'account/updated' && params) {
+        if (params.authMode === 'chatgpt') {
+          void this.connectAccount().catch(() => {});
+        } else {
+          this.accountRevision += 1;
+          this.publishConnection({
+            email: null, plan: null,
+            status: params.authMode == null ? 'logged_out' : 'unavailable',
+          });
+        }
+      } else if (message.method === 'account/login/completed' && params?.success === true) {
+        void this.connectAccount().catch(() => {});
+      }
       const threadId = typeof params?.threadId === 'string' ? params.threadId : null;
       if (threadId) this.publishThread(threadId);
     });
-    this.client.onExit(() => this.publishAll());
+    this.client.onExit(() => {
+      this.invalidateConnection('本机 Codex App Server 已断开，请重新检测连接。');
+      this.publishAll();
+    });
   }
 
   async loadInitialState(): Promise<DesktopInitialState> {
@@ -355,19 +394,39 @@ class TauriDesktopAdapter implements DesktopAdapter {
   }
 
   async connectAccount(): Promise<AccountSummary> {
-    await this.client.connect();
-    const account = await this.client.readAccount();
-    if (account?.planType.trim()) {
-      return { email: account.email, plan: account.planType, status: 'connected' };
+    const generation = this.connectionGeneration;
+    const revision = ++this.accountRevision;
+    try {
+      await this.connectService();
+      if (generation !== this.connectionGeneration || revision !== this.accountRevision) {
+        throw new Error('ChatGPT 账号检测已失效，请重新检测连接。');
+      }
+      const account = await this.client.readAccount();
+      // Logout, account changes, exits, and newer reads supersede an in-flight response.
+      if (generation !== this.connectionGeneration || revision !== this.accountRevision) {
+        throw new Error('ChatGPT 账号检测已失效，请重新检测连接。');
+      }
+      this.publishConnection(account?.planType.trim()
+        ? { email: account.email, plan: account.planType, status: 'connected' }
+        : {
+            email: null, plan: null,
+            status: this.client.getAuthState().status === 'logged_out' ? 'logged_out' : 'unavailable',
+          });
+      return structuredClone(this.connection.account);
+    } catch (error) {
+      if (generation === this.connectionGeneration && revision === this.accountRevision) {
+        this.invalidateConnection(`无法读取本机 Codex 连接：${error instanceof Error ? error.message : String(error)}`);
+      }
+      throw error;
     }
-    return {
-      email: null,
-      plan: null,
-      status: this.client.getAuthState().status === 'logged_out' ? 'logged_out' : 'unavailable',
-    };
+  }
+  subscribeConnection(listener: (state: ConnectionSummary) => void): () => void {
+    this.connectionListeners.add(listener);
+    listener(structuredClone(this.connection));
+    return () => { this.connectionListeners.delete(listener); };
   }
   async startLogin(): Promise<{ message: string; authUrl: string }> {
-    await this.client.connect();
+    await this.connectService();
     const response = await this.client.startChatGptLogin();
     const url = new URL(response.authUrl);
     if (url.protocol !== 'https:') throw new Error('Codex 返回了不安全的 ChatGPT 登录地址。');
@@ -393,6 +452,7 @@ class TauriDesktopAdapter implements DesktopAdapter {
   async recoverTask(taskId: string): Promise<TaskSummary> {
     await this.tasks.recoverTask(taskId);
     this.publish(taskId);
+    await this.connectAccount();
     return this.toTaskSummary(this.requireTask(taskId));
   }
   subscribeTask(taskId: string, listener: (task: TaskSummary) => void): () => void {
@@ -557,6 +617,9 @@ class TauriDesktopAdapter implements DesktopAdapter {
       ...input,
       pdfRendererPath: input.pdfRendererPath ?? '',
     });
+    if (this.codexPath.trim() !== input.codexPath.trim()) {
+      this.invalidateConnection('Codex 路径已更新，请重新检测连接。');
+    }
     this.codexPath = input.codexPath;
     if (this.transport instanceof TauriCodexTransport) await this.transport.setConfiguredPath(input.codexPath);
     return result;
@@ -605,18 +668,49 @@ class TauriDesktopAdapter implements DesktopAdapter {
   }
 
   private callNative<T>(command: string, args?: Record<string, unknown>): Promise<T> { return this.nativeInvoke(command, args) as Promise<T>; }
+  private async connectService(): Promise<void> {
+    const generation = this.connectionGeneration;
+    try {
+      await this.client.connect();
+      if (generation !== this.connectionGeneration) throw new Error('Codex 连接已失效，请重新检测连接。');
+      this.serviceConnected = true;
+      this.publishConnection(this.connection.account);
+    } catch (error) {
+      if (generation === this.connectionGeneration) {
+        this.invalidateConnection(`无法连接本机 Codex：${error instanceof Error ? error.message : String(error)}`);
+      }
+      throw error;
+    }
+  }
+  private publishConnection(account: AccountSummary): void {
+    const detail = account.status === 'connected'
+      ? `已连接本机 Codex App Server · ChatGPT ${account.plan}`
+      : account.status === 'logged_out'
+        ? '已连接本机 Codex App Server，等待 ChatGPT 登录。'
+        : '已连接本机 Codex App Server，等待有效的 ChatGPT 账号。';
+    this.connection = {
+      account: { ...account },
+      runtime: this.serviceConnected
+        ? { status: 'connected', detail, address: 'stdio（本机进程）', model: null, uptime: null, queue: null }
+        : this.connection.runtime,
+    };
+    for (const listener of this.connectionListeners) listener(structuredClone(this.connection));
+  }
+  private invalidateConnection(detail: string): void {
+    this.connectionGeneration += 1;
+    this.accountRevision += 1;
+    this.serviceConnected = false;
+    this.connection.runtime = { status: 'unavailable', detail, address: null, model: null, uptime: null, queue: null };
+    this.publishConnection({ email: null, plan: null, status: 'unavailable' });
+  }
   private async requireActiveChatGptAccount(): Promise<void> {
-    await this.client.connect();
-    const account = await this.client.readAccount();
-    if (!account) {
+    const account = await this.connectAccount();
+    if (account.status !== 'connected') {
       const auth = this.client.getAuthState();
       if (auth.status === 'invalidated' && /apikey/i.test(auth.reason)) {
         throw new Error('API-key authentication is not supported; sign in with an active ChatGPT account.');
       }
-      throw new Error('A ChatGPT login is required before starting a model task.');
-    }
-    if (!account.planType.trim()) {
-      throw new Error('An active ChatGPT account is required before starting a model task.');
+      throw new Error('An active ChatGPT login is required before starting a model task.');
     }
   }
   private requireTask(taskId: string): GeneralTask {

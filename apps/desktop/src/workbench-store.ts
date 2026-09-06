@@ -3,6 +3,7 @@ import type {
   ApprovalResult,
   ApprovalSummary,
   CollectionAvailability,
+  ConnectionSummary,
   DesktopSettings,
   DesktopInitialState,
   MemorySummary,
@@ -58,7 +59,7 @@ type SlideMutationResult = RegenerateResult | ApprovalResult | { status: string 
 
 export type WorkbenchAction =
   | { type: 'state-loaded'; state: DesktopInitialState }
-  | { type: 'account-updated'; account: AccountSummary }
+  | { type: 'connection-updated'; connection: ConnectionSummary }
   | { type: 'project-selected'; projectId: string }
   | { type: 'project-created'; project: ProjectSummary }
   | { type: 'project-renamed'; projectId: string; name: string }
@@ -124,8 +125,8 @@ export function workbenchReducer(
   switch (action.type) {
     case 'state-loaded':
       return createWorkbenchState(action.state);
-    case 'account-updated':
-      return { ...state, account: action.account };
+    case 'connection-updated':
+      return { ...state, account: action.connection.account, runtime: action.connection.runtime };
     case 'project-selected':
       return state.projects.some((project) => project.id === action.projectId)
         ? { ...state, selectedProjectId: action.projectId }

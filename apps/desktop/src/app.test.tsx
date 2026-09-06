@@ -405,16 +405,14 @@ describe('desktop workbench interactions', () => {
   it('blocks model tasks until active ChatGPT login and exposes the real safe login URL', async () => {
     const user = userEvent.setup();
     const base = createDemoDesktopAdapter();
+    // The demo subscription replays its initial state, so control that same source.
+    base.initialState.account = { email: null, plan: null, status: 'logged_out' };
     const startLogin = vi.fn(async () => ({
       message: '请继续登录。',
       authUrl: 'https://auth.example.test/chatgpt',
     }));
     const adapter = {
       ...base,
-      initialState: {
-        ...base.initialState,
-        account: { email: null, plan: null, status: 'logged_out' as const },
-      },
       startLogin,
     } satisfies DesktopAdapter;
     render(<App adapter={adapter} initialRoute="tasks" />);

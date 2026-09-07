@@ -25,6 +25,7 @@ import {
 } from './workbench-store.js';
 import './styles.css';
 import { NativeWorkspacePage } from './native-workspace.js';
+import { formatProjectTime, parseProjectTime, projectStatus, sortProjectsByUpdatedAt } from './task-presentation.js';
 
 type Route =
   | 'dashboard'
@@ -82,21 +83,33 @@ export function App({
     createWorkbenchState,
   );
   const [task, setTask] = useState<TaskSummary | null>(null);
+  const [workspaceProjectId, setWorkspaceProjectId] = useState(projectIdFromHash);
+  const [listRefresh, setListRefresh] = useState(0);
+  const previousRoute = useRef(route);
   const [notice, setNotice] = useState<Notice>(null);
   const mutationCounter = useRef(0);
   const selectedProject =
     workbench.projects.find(
-      (project) => project.id === workbench.selectedProjectId,
+      (project) => project.id === (workspaceProjectId ?? workbench.selectedProjectId),
     ) ?? null;
 
   useEffect(() => {
-    const onPopState = () => setRoute(routeFromHash() ?? 'dashboard');
+    const onPopState = () => {
+      setRoute(routeFromHash() ?? 'dashboard');
+      setWorkspaceProjectId(projectIdFromHash());
+      setNotice(null);
+    };
     window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
+    window.addEventListener('hashchange', onPopState);
+    return () => {
+      window.removeEventListener('popstate', onPopState);
+      window.removeEventListener('hashchange', onPopState);
+    };
   }, []);
 
   useEffect(() => {
     let active = true;
+    let projectsHydrated = false;
     let unsubscribe: (() => void) | undefined;
     const subscribe = () => {
       unsubscribe = adapter.subscribeConnection((connection) => {
@@ -110,6 +123,7 @@ export function App({
         const state = await adapter.loadInitialState();
         if (!active) return;
         dispatch({ type: 'state-loaded', state });
+        projectsHydrated = true;
         // Subscribe after hydration so the durable placeholder cannot overwrite
         // a newer account/connection event. The adapter replays its latest state.
         subscribe();
@@ -118,6 +132,7 @@ export function App({
         if (!active) return;
         // Project/Worker hydration failure must not disable account recovery.
         if (!unsubscribe) subscribe();
+        if (!projectsHydrated) dispatch({ type: 'projects-availability', availability: 'unavailable' });
         setNotice({ kind: 'error', text: toMessage(error) });
       });
     }
@@ -128,16 +143,39 @@ export function App({
   }, [adapter]);
 
   useEffect(() => {
+    const entered = previousRoute.current !== route;
+    previousRoute.current = route;
+    if (adapter.mode !== 'tauri' || !['dashboard', 'projects'].includes(route)
+      || (!entered && listRefresh === 0)) return;
+    let active = true;
+    dispatch({ type: 'projects-availability', availability: 'loading' });
+    void adapter.listProjects().then((projects) => {
+      if (active) dispatch({ type: 'projects-loaded', projects });
+    }).catch(() => {
+      if (active) dispatch({ type: 'projects-availability', availability: 'unavailable' });
+    });
+    // Do not let a slow list request replace the selected project after opening it.
+    return () => { active = false; };
+  }, [adapter, route, listRefresh]);
+
+  useEffect(() => {
     if (!task) return;
     return adapter.subscribeTask(task.id, setTask);
   }, [adapter, task?.id]);
 
-  const navigate = (next: Route) => {
+  const navigate = (next: Route, projectId?: string) => {
     setNotice(null);
     setRoute(next);
-    window.history.pushState({ route: next }, '', `#/${next}`);
+    setWorkspaceProjectId(next === 'workspace' ? projectId ?? null : null);
+    window.history.pushState({ route: next }, '', next === 'workspace' && projectId
+      ? `#/workspace/${encodeURIComponent(projectId)}` : `#/${next}`);
     document.documentElement.scrollTop = 0;
     document.body.scrollTop = 0;
+  };
+
+  const openProject = (projectId: string) => {
+    dispatch({ type: 'project-selected', projectId });
+    navigate('workspace', projectId);
   };
 
   const report = async (
@@ -159,6 +197,7 @@ export function App({
         <Sidebar adapter={adapter} route="projects" navigate={navigate} />
         {selectedProject ? (
           adapter.mode === 'tauri' ? <NativeWorkspacePage
+            key={selectedProject.id}
             adapter={adapter}
             projectId={selectedProject.id}
             projectName={selectedProject.name}
@@ -172,6 +211,8 @@ export function App({
             navigate={navigate}
             report={report}
           />
+        ) : workbench.collections.projects === 'loading' ? (
+          <main id="main-content" className="workspace-unavailable"><p role="status">正在加载项目…</p></main>
         ) : (
           <main id="main-content" className="workspace-unavailable">
             <h1>项目工作台不可用</h1>
@@ -191,7 +232,8 @@ export function App({
     ) : (
       <AppShell adapter={adapter} route={route} navigate={navigate}>
         {route === 'dashboard' && (
-          <DashboardPage workbench={workbench} navigate={navigate} />
+          <DashboardPage workbench={workbench} navigate={navigate} openProject={openProject}
+            retryProjects={() => setListRefresh((value) => value + 1)} />
         )}
         {route === 'tasks' && (
           <TasksPage
@@ -207,6 +249,7 @@ export function App({
             adapter={adapter}
             projects={workbench.projects}
             availability={workbench.collections.projects}
+            retryProjects={() => setListRefresh((value) => value + 1)}
             dispatch={dispatch}
             navigate={navigate}
             report={report}
@@ -248,7 +291,17 @@ export function App({
 
   return (
     <>
-      <a className="skip-link" href="#main-content">
+      <a className="skip-link" href="#main-content" onClick={(event) => {
+        // The hash belongs to the router; moving focus must not replace a
+        // workspace/<id> URL with a fragment that routes back to the dashboard.
+        event.preventDefault();
+        const main = document.getElementById('main-content');
+        if (main) {
+          main.tabIndex = -1;
+          main.focus({ preventScroll: true });
+          main.scrollIntoView?.({ block: 'start' });
+        }
+      }}>
         跳到主要内容
       </a>
       <div className="desktop-window">
@@ -339,9 +392,13 @@ function Sidebar({
 function DashboardPage({
   workbench,
   navigate,
+  openProject,
+  retryProjects,
 }: {
   workbench: WorkbenchState;
   navigate: (route: Route) => void;
+  openProject: (id: string) => void;
+  retryProjects: () => void;
 }) {
   return (
     <div className="dashboard-layout">
@@ -387,47 +444,54 @@ function DashboardPage({
           aria-labelledby="recent-heading"
         >
           <h2 id="recent-heading">最近工作</h2>
-          <div className="work-table" role="table" aria-label="最近工作">
-            <div className="work-head" role="row">
-              <span>名称</span>
-              <span>类型</span>
-              <span>当前阶段</span>
-              <span>状态</span>
-              <span>进度</span>
-              <span>更新时间</span>
-            </div>
-            {workbench.projects.map((item) => (
-              <div className="work-row" role="row" key={item.id}>
-                <div className="work-name">
-                  <span className="work-icon file">
-                    <Icon name="file" />
-                  </span>
-                  <span>
-                    <strong>{item.name}</strong>
-                    <small>{item.goal}</small>
-                  </span>
-                </div>
-                <span>PPT 项目</span>
-                <span>{item.stage}</span>
-                <span className="text-accent">
-                  {item.pendingMutation ? '处理中' : '进行中'}
-                </span>
-                <span className="progress-cell">
-                  <Progress value={item.progress} />
-                  <em>{item.progress}%</em>
-                </span>
-                <span>{item.updatedAt}</span>
-              </div>
-            ))}
-            {!workbench.projects.length && (
-              <div className="empty-inline" role="row">
-                {collectionMessage(
-                  workbench.collections.projects,
-                  '当前没有项目。',
-                  '项目数据',
+          <ProjectListFeedback availability={workbench.collections.projects}
+            hasProjects={workbench.projects.length > 0} retry={retryProjects} />
+          <div className="work-table-scroll" role="region" aria-label="最近工作表格，可横向滚动" tabIndex={0}>
+            <table className="work-table" aria-label="最近工作" aria-busy={workbench.collections.projects === 'loading'}>
+              <colgroup>
+                <col className="work-col-name" /><col className="work-col-type" />
+                <col className="work-col-stage" /><col className="work-col-status" />
+                <col className="work-col-progress" /><col className="work-col-time" />
+              </colgroup>
+              <thead><tr className="work-head">
+                <th scope="col">名称</th><th scope="col">类型</th><th scope="col">当前阶段</th>
+                <th scope="col">状态</th><th scope="col">进度</th><th scope="col">更新时间</th>
+              </tr></thead>
+              <tbody>
+                {sortProjectsByUpdatedAt(workbench.projects).map((item) => {
+                  const status = projectStatus(item);
+                  const timestamp = parseProjectTime(item.updatedAt);
+                  const progress = Number.isFinite(item.progress) ? Math.max(0, Math.min(100, item.progress)) : 0;
+                  return <tr className="work-row" key={item.id} onClick={(event) => {
+                    if ((event.target as Element).closest('a, button, input, select, textarea')) return;
+                    if (window.getSelection()?.toString()) return;
+                    openProject(item.id);
+                  }}>
+                    <td><div className="work-name">
+                      <span className="work-icon file"><Icon name="file" /></span>
+                      <span>
+                        <a href={`#/workspace/${encodeURIComponent(item.id)}`} title={item.name}
+                          onClick={(event) => {
+                            if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                            event.preventDefault(); openProject(item.id);
+                          }}>{item.name}</a>
+                        <small title={item.goal}>{item.goal}</small>
+                      </span>
+                    </div></td>
+                    <td>PPT 项目</td><td>{item.stage}</td>
+                    <td><span className={`work-status is-${status.tone}`}>{status.label}</span></td>
+                    <td><span className="progress-cell"><Progress value={progress} /><em>{progress}%</em></span></td>
+                    <td><time className="work-time" dateTime={timestamp === null ? undefined : new Date(timestamp).toISOString()}
+                      title={timestamp === null ? '更新时间不可用' : `${formatProjectTime(item.updatedAt)}（本地时间）`}>
+                      {formatProjectTime(item.updatedAt)}
+                    </time></td>
+                  </tr>;
+                })}
+                {!workbench.projects.length && workbench.collections.projects === 'loaded' && (
+                  <tr><td className="empty-inline" colSpan={6}>当前没有项目。</td></tr>
                 )}
-              </div>
-            )}
+              </tbody>
+            </table>
           </div>
           <button
             className="text-action center-action"
@@ -440,6 +504,20 @@ function DashboardPage({
       <DashboardAside workbench={workbench} navigate={navigate} />
     </div>
   );
+}
+
+function ProjectListFeedback({ availability, hasProjects, retry }: {
+  availability: CollectionAvailability;
+  hasProjects: boolean;
+  retry: () => void;
+}) {
+  if (availability === 'loaded') return null;
+  return <div className="project-list-feedback" role={availability === 'unavailable' ? 'alert' : 'status'}>
+    <span>{availability === 'loading'
+      ? (hasProjects ? '正在刷新项目，暂时显示上次结果…' : '项目数据正在加载…')
+      : `项目列表加载失败${hasProjects ? '，当前显示上次结果。' : '，请重试。'}`}</span>
+    {availability === 'unavailable' && <button className="text-action" onClick={retry}>重试加载项目</button>}
+  </div>;
 }
 
 function DashboardAside({
@@ -884,6 +962,7 @@ function ProjectsPage({
   adapter,
   projects,
   availability,
+  retryProjects,
   dispatch,
   navigate,
   report,
@@ -891,8 +970,9 @@ function ProjectsPage({
   adapter: DesktopAdapter;
   projects: WorkbenchProject[];
   availability: CollectionAvailability;
+  retryProjects: () => void;
   dispatch: (action: WorkbenchAction) => void;
-  navigate: (route: Route) => void;
+  navigate: (route: Route, projectId?: string) => void;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
@@ -910,7 +990,7 @@ function ProjectsPage({
         goal: goal.trim(),
       });
       dispatch({ type: 'project-created', project: created });
-      navigate('workspace');
+      navigate('workspace', created.id);
     } catch (error) {
       await report(async () => {
         throw error;
@@ -929,21 +1009,22 @@ function ProjectsPage({
         <section className="project-list">
           <div className="section-heading">
             <h2>项目列表</h2>
-            <span className="muted">{projects.length} 个进行中</span>
+            <span className="muted">{projects.length} 个项目</span>
           </div>
-          {projects.map((project) => (
+          <ProjectListFeedback availability={availability} hasProjects={projects.length > 0} retry={retryProjects} />
+          {sortProjectsByUpdatedAt(projects).map((project) => (
             <button
               className="project-row"
               key={project.id}
               onClick={() => {
                 dispatch({ type: 'project-selected', projectId: project.id });
-                navigate('workspace');
+                navigate('workspace', project.id);
               }}
             >
               <span className="file-avatar"><Icon name="file" /></span>
               <span>
                 <strong>{project.name}</strong>
-                <small>{project.stage} · 更新于 {project.updatedAt}</small>
+                <small>{project.stage} · 更新于 {formatProjectTime(project.updatedAt)}</small>
               </span>
               <span className="project-progress">
                 <Progress value={project.progress} />{project.progress}%
@@ -951,7 +1032,7 @@ function ProjectsPage({
               <Icon name="arrowRight" />
             </button>
           ))}
-          {!projects.length && (
+          {!projects.length && availability === 'loaded' && (
             <div className="empty-inline">
               {collectionMessage(
                 availability,
@@ -1914,6 +1995,7 @@ function Icon({ name }: { name: IconName }) {
 }
 
 function routeFromHash(): Route | null {
+  if (window.location.hash.startsWith('#/workspace/')) return 'workspace';
   const candidate = window.location.hash.replace(/^#\//, '') as Route;
   return [
     'dashboard',
@@ -1926,6 +2008,13 @@ function routeFromHash(): Route | null {
   ].includes(candidate)
     ? candidate
     : null;
+}
+
+function projectIdFromHash(): string | null {
+  if (!window.location.hash.startsWith('#/workspace/')) return null;
+  const id = window.location.hash.slice('#/workspace/'.length);
+  // A malformed/empty ID must not silently open the default project.
+  try { return decodeURIComponent(id) || '\0'; } catch { return '\0'; }
 }
 
 function toMessage(error: unknown): string {

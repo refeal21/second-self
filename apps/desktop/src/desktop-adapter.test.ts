@@ -425,6 +425,25 @@ describe('native desktop general-task bridge', () => {
     });
   });
 
+  it('refreshes project summaries without starting AI processes or replacing connection state', async () => {
+    const transport = new ScriptedNativeServer();
+    const persisted = createDemoDesktopAdapter().initialState;
+    const invoke = vi.fn(async (command: string) => {
+      if (command !== 'load_desktop_state') throw new Error('Unexpected native command');
+      return persisted;
+    });
+    const adapter = createTauriDesktopAdapter(transport, invoke);
+    await adapter.connectAccount();
+    const states: ConnectionSummary[] = [];
+    adapter.subscribeConnection((state) => states.push(state));
+    const sentBefore = transport.sent.length;
+    expect(await adapter.listProjects()).toEqual(persisted.projects);
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('load_desktop_state', undefined);
+    expect(transport.sent).toHaveLength(sentBefore);
+    expect(states).toHaveLength(1);
+    expect(states[0]?.account).toEqual({ email: 'person@example.com', plan: 'plus', status: 'connected' });
+  });
+
   it('loads persisted collections through the native command boundary', async () => {
     const transport = new ScriptedNativeServer();
     const persisted = {

@@ -115,6 +115,7 @@ export interface DesktopAdapter {
   readonly mode: DesktopAdapterMode;
   readonly initialState: DesktopInitialState;
   loadInitialState(): Promise<DesktopInitialState>;
+  listProjects(): Promise<ProjectSummary[]>;
   connectAccount(): Promise<AccountSummary>;
   subscribeConnection(listener: (state: ConnectionSummary) => void): () => void;
   startLogin(): Promise<{ message: string; authUrl: string }>;
@@ -223,6 +224,7 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
     mode: 'demo',
     initialState,
     async loadInitialState() { return structuredClone(initialState); },
+    async listProjects() { return structuredClone(initialState.projects); },
     async connectAccount() {
       for (const listener of connectionListeners) listener(demoConnection());
       return structuredClone(initialState.account);
@@ -395,6 +397,13 @@ class TauriDesktopAdapter implements DesktopAdapter {
       await this.transport.setConfiguredPath(state.settings.codexPath);
     }
     return state;
+  }
+
+  async listProjects(): Promise<ProjectSummary[]> {
+    // A list refresh only reads SQLite. It must not reconnect Codex, restart
+    // the Worker, or overwrite the live account/settings with startup defaults.
+    const state = await this.callNative<DesktopInitialState>('load_desktop_state', undefined);
+    return state.projects;
   }
 
   async connectAccount(): Promise<AccountSummary> {

@@ -321,7 +321,8 @@ describe('desktop workbench interactions', () => {
     expect(screen.getByText('不可用')).toBeInTheDocument();
     expect(screen.getByText('尚未从本地服务读取')).toBeInTheDocument();
     expect(screen.queryByText('年度经营复盘与增长计划')).not.toBeInTheDocument();
-    expect(screen.getByText('项目数据不可用')).toBeInTheDocument();
+    expect(screen.getByText(/项目列表加载失败/)).toBeInTheDocument();
+    expect(screen.queryByText('当前没有项目。')).not.toBeInTheDocument();
   });
 
   it('disables reopen for an unstarted future slide', async () => {

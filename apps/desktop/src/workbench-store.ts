@@ -59,6 +59,8 @@ type SlideMutationResult = RegenerateResult | ApprovalResult | { status: string 
 
 export type WorkbenchAction =
   | { type: 'state-loaded'; state: DesktopInitialState }
+  | { type: 'projects-loaded'; projects: ProjectSummary[] }
+  | { type: 'projects-availability'; availability: CollectionAvailability }
   | { type: 'connection-updated'; connection: ConnectionSummary }
   | { type: 'project-selected'; projectId: string }
   | { type: 'project-created'; project: ProjectSummary }
@@ -125,6 +127,16 @@ export function workbenchReducer(
   switch (action.type) {
     case 'state-loaded':
       return createWorkbenchState(action.state);
+    case 'projects-loaded':
+      return {
+        ...state,
+        projects: action.projects.map(toWorkbenchProject),
+        // Preserve the requested identity, even when it no longer exists.
+        selectedProjectId: state.selectedProjectId,
+        collections: { ...state.collections, projects: 'loaded' },
+      };
+    case 'projects-availability':
+      return { ...state, collections: { ...state.collections, projects: action.availability } };
     case 'connection-updated':
       return { ...state, account: action.connection.account, runtime: action.connection.runtime };
     case 'project-selected':

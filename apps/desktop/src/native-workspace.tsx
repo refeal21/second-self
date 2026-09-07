@@ -160,14 +160,15 @@ export function NativeWorkspacePage({
           {status === 'intake' && <label className="button button-secondary">选择材料<input hidden type="file" multiple onChange={(event) => void attachFiles(event)} /></label>}
         </aside>
 
-        <section className="canvas-area" aria-live="polite">
+        <section className="canvas-area" aria-label="PPT 阶段内容" tabIndex={0} aria-live="polite">
           {status === 'intake' && <StageCard title="1. 附加材料">
             <p>只会读取你主动选择的文件。附加后由 Codex 从项目 sources 目录进行可追溯分析。</p>
             <button className="button button-primary" disabled={busy || pipeline.sources.length === 0} onClick={() => void update(() => adapter.analyzeProject(projectId), '材料分析已保存。')}>用 Codex 分析材料</button>
           </StageCard>}
-          {status === 'source_analysis' && <StageCard title="2. 材料分析">
-            <pre>{JSON.stringify(pipeline.analysis?.output, null, 2)}</pre>
+          {status === 'source_analysis' && <StageCard title="2. 材料分析" actions={
             <button className="button button-primary" disabled={busy} onClick={() => void update(() => adapter.generateOutline(projectId), '整份大纲已生成，等待你审核。')}>生成整份大纲</button>
+          }>
+            <pre>{JSON.stringify(pipeline.analysis?.output, null, 2)}</pre>
           </StageCard>}
           {status === 'outline_review' && <StageCard title="3. 审核整份大纲">
             <textarea rows={22} value={outlineText} onChange={(event) => setOutlineText(event.target.value)} />
@@ -262,8 +263,11 @@ export function NativeWorkspacePage({
   );
 }
 
-function StageCard({ title, children }: { title: string; children: ReactNode }) {
-  return <article className="project-create"><h2>{title}</h2>{children}</article>;
+function StageCard({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
+  return <article className="project-create">
+    <header className="native-stage-header"><h2>{title}</h2>{actions}</header>
+    {children}
+  </article>;
 }
 
 function parseJson<T>(value: string): T {

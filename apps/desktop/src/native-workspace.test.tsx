@@ -70,6 +70,44 @@ function visualPipeline(
 }
 
 describe('native PPT QA workspace', () => {
+  it('lets keyboard users focus long stage content and advance from saved analysis to outline review', async () => {
+    const user = userEvent.setup();
+    const initial = createNativePipeline({
+      id: 'project-analysis-ui', name: '材料分析回归', goal: '先分析，再审核大纲',
+      createdAt: '2026-09-07T00:00:00.000Z',
+    });
+    initial.project.workflowStatus = 'source_analysis';
+    initial.analysis = {
+      requestId: 'analysis-1', artifactRelativePath: 'sources/analysis.json', sha256: 'a'.repeat(64),
+      output: { findings: Array.from({ length: 40 }, (_, index) => ({
+        id: `finding-${index}`, text: `材料中的第 ${index + 1} 条结论`, sourceIds: ['source-1'],
+      })), dataPoints: [], sourceMap: [{ sourceId: 'source-1', title: '材料', locator: '第 1 页' }] },
+    };
+    const generated = structuredClone(initial);
+    generated.project.workflowStatus = 'outline_review';
+    generated.outline = {
+      version: { id: 'outline-v1', projectId: initial.project.id, sequence: 1,
+        status: 'draft', createdAt: initial.project.createdAt, frozenAt: null },
+      value: { title: '待审核大纲', slides: [{ id: 'slide-1', title: '概览',
+        purpose: '总结材料', sourceIds: ['source-1'] }] },
+    };
+    const generateOutline = vi.fn(async () => generated);
+    const adapter = { ...createDemoDesktopAdapter(), mode: 'tauri' as const,
+      loadProjectPipeline: vi.fn(async () => initial), generateOutline } satisfies DesktopAdapter;
+    render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
+      projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
+
+    const content = await screen.findByRole('region', { name: 'PPT 阶段内容' });
+    content.focus();
+    expect(content).toHaveFocus();
+    expect(content).toHaveTextContent('材料中的第 40 条结论');
+    await user.click(screen.getByRole('button', { name: '生成整份大纲' }));
+    expect(generateOutline).toHaveBeenCalledWith(initial.project.id);
+    expect(await screen.findByRole('heading', { name: '3. 审核整份大纲' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '批准整份大纲' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: '生成逐页细化' })).not.toBeInTheDocument();
+  });
+
   it('renders the current PNG at 16:9, gates approval on image load, and sends revision feedback', async () => {
     const user = userEvent.setup();
     const initial = visualPipeline();

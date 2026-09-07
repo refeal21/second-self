@@ -27,6 +27,10 @@ pnpm --filter @digital-twin/desktop tauri build --bundles app
 
 桌面端登录链接只可由系统默认浏览器打开，并且 Tauri capability 只允许 `https://auth.openai.com/*`、`https://chatgpt.com/*` 和兼容旧登录跳转的 `https://chat.openai.com/*`。`http:`、`file:`、第三方域名、任意指定应用、文件/目录打开、Finder reveal 和 shell 命令都不在此权限内；若登录链接被拒绝，请检查本机 Codex 是否返回上述官方 HTTPS 域名，而不要放宽 capability。
 
+## 材料分析无法滚动或找不到下一步
+
+新版原生 PPT 工作台的中间内容区可以独立上下滚动，也可以先用 Tab 聚焦内容区再按方向键滚动。“生成整份大纲”位于材料分析顶部，桌面窗口滚动时仍可见；窄窗口采用可滚动的单列布局。旧版会把超过窗口高度的分析结果裁掉，按钮也会被隐藏在下方。请完全退出旧应用再打开新构建；如果检查点已是 `source_analysis`，直接继续生成大纲，不必重新上传或分析。只重新点击应用图标可能激活尚未退出的旧进程，并不会加载新构建。
+
 ## LibreOffice QA 失败或中文方框
 
 先确认 LibreOffice 能从命令行启动。macOS 无头 LibreOffice 可能看不到系统中文字体，因此 QA 为每次运行在工作区外的隔离临时目录生成局部 Fontconfig，显式包含 `/System/Library/Fonts`、`/System/Library/Fonts/Supplemental` 和 `/Library/Fonts`，并把 `FONTCONFIG_FILE`、`FONTCONFIG_PATH`、`XDG_CACHE_HOME` 传给 LibreOffice 与 pdftoppm。临时字体缓存随本轮准备清理，不会写入项目交付目录。QA 除了检查字体文件，还会对真实 rendered PNG 检测连续方框/tofu；检测到不可读中文会进入可恢复的 `qa-rendering` 阻塞。

@@ -1979,6 +1979,99 @@ textarea::placeholder {
   }
 }
 
+/* The native workflow has a variable-height header and long documents, unlike
+   the fixed-size demo canvas. Each desktop column owns its scroll area. */
+.native-workspace {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  overflow-wrap: anywhere;
+}
+.native-workspace > .workspace-header {
+  flex-shrink: 0;
+}
+.native-workspace > .workspace-layout {
+  flex: 1;
+  height: auto;
+  min-height: 0;
+  grid-template-columns: minmax(140px, 180px) minmax(0, 1fr) minmax(190px, 250px);
+}
+.native-workspace .workspace-layout > aside,
+.native-workspace .canvas-area {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+.native-workspace .canvas-area {
+  display: block;
+  padding: 24px;
+}
+.native-workspace .project-create {
+  padding: 0;
+  border: 0;
+}
+.native-stage-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+  padding: 12px 0;
+  background: #fbfcfd;
+}
+.native-stage-header h2,
+.native-stage-header .button {
+  margin: 0;
+}
+.native-workspace pre {
+  max-width: 100%;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.native-workspace textarea {
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+.native-workspace .source-list {
+  padding-left: 18px;
+}
+.native-workspace .source-list small {
+  display: block;
+}
+
+@media (max-width: 956px) {
+  /* Native stages have no demo-only tab switcher. Keep every pane reachable,
+     with the active stage first and normal document scrolling on small windows. */
+  .native-workspace {
+    height: auto;
+    overflow: visible;
+  }
+  .native-workspace > .workspace-layout {
+    display: flex;
+    flex: none;
+    flex-direction: column;
+  }
+  .native-workspace .workspace-layout > aside,
+  .native-workspace .canvas-area {
+    display: block;
+    overflow: visible;
+  }
+  .native-workspace .canvas-area {
+    order: -1;
+  }
+  .native-stage-header {
+    position: static;
+  }
+}
+
 .native-visual-preview {
   margin: 20px 0;
 }

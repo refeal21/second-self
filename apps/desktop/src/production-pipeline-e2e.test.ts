@@ -23,6 +23,7 @@ import {
 
 class ScriptedPptAppServer implements NativeAppServerTransport {
   readonly prompts: string[] = [];
+  hold = false;
   private line: ((line: string) => void) | null = null;
   private turn = 0;
   async start(): Promise<void> {}
@@ -43,17 +44,21 @@ class ScriptedPptAppServer implements NativeAppServerTransport {
     queueMicrotask(() => this.line?.(JSON.stringify({ id: message.id, result })));
     if (message.method === 'turn/start') {
       const output = [goldenSourceAnalysis(), goldenOutline(), goldenSlideSpecs()][this.turn - 1];
+      if (this.hold) return;
+      const turn = this.turn;
       setTimeout(() => {
-        this.line?.(JSON.stringify({ method: 'item/agentMessage/delta', params: {
-          threadId: `thread-${this.turn}`, turnId: `turn-${this.turn}`,
-          itemId: `answer-${this.turn}`, delta: JSON.stringify(output),
-        }}));
-        this.line?.(JSON.stringify({ method: 'turn/completed', params: {
-          threadId: `thread-${this.turn}`,
-          turn: { id: `turn-${this.turn}`, status: 'completed', error: null },
-        }}));
+        this.complete(output, turn);
       }, 0);
     }
+  }
+  complete(output: unknown, turn = this.turn) {
+    this.line?.(JSON.stringify({ method: 'item/agentMessage/delta', params: {
+      threadId: `thread-${turn}`, turnId: `turn-${turn}`,
+      itemId: `answer-${turn}`, delta: JSON.stringify(output),
+    }}));
+    this.line?.(JSON.stringify({ method: 'turn/completed', params: {
+      threadId: `thread-${turn}`, turn: { id: `turn-${turn}`, status: 'completed', error: null },
+    }}));
   }
   onLine(listener: (line: string) => void): () => void { this.line = listener; return () => { this.line = null; }; }
   onExit(): () => void { return () => {}; }
@@ -90,7 +95,9 @@ function nativePersistenceHarness() {
     if (command === 'ppt_load_pipeline') return structuredClone(state.pipeline);
     if (command === 'ppt_project_directory') return resolve('../..', 'fixtures/golden-project');
     if (command === 'ppt_commit_pipeline') {
-      const input = args?.input as { pipeline: NativePptPipeline; writes: Array<{ relativePath: string; contentsBase64: string }> };
+      const input = args?.input as { expectedRevision: number; pipeline: NativePptPipeline; writes: Array<{ relativePath: string; contentsBase64: string }> };
+      // Match the real Rust optimistic-concurrency gate before any file/state writes.
+      if (input.expectedRevision !== state.pipeline.revision) throw new Error('stale pipeline revision');
       for (const write of input.writes) state.files.set(write.relativePath, write.contentsBase64);
       state.pipeline = structuredClone(input.pipeline);
       return structuredClone(state.pipeline);
@@ -120,6 +127,97 @@ function nativePersistenceHarness() {
 }
 
 describe('production-equivalent UI adapter → App Server → Worker → Rust persistence flow', () => {
+  it.each(['analysis', 'outline', 'details'] as const)('keeps %s single-flight across subscriptions and completes only after durable commit', async (kind) => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    let releaseCommit!: () => void;
+    let commitEntered = false;
+    let holdCommit = false;
+    const adapter = createTauriDesktopAdapter(server, async (command, args) => {
+      if (command === 'ppt_commit_pipeline' && holdCommit) {
+        commitEntered = true;
+        await new Promise<void>((resolve) => { releaseCommit = resolve; });
+      }
+      return native.invoke(command, args);
+    }, new DirectWorker());
+    if (kind !== 'analysis') await adapter.analyzeProject('project-e2e');
+    if (kind === 'details') { await adapter.generateOutline('project-e2e'); await adapter.approveOutline('project-e2e'); }
+    server.hold = true;
+    holdCommit = true;
+    const turns = server.prompts.length;
+    const generate = () => kind === 'analysis' ? adapter.analyzeProject('project-e2e')
+      : kind === 'outline' ? adapter.generateOutline('project-e2e') : adapter.generateDetails('project-e2e');
+    const first = generate();
+    expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({ kind, status: 'running' });
+    const duplicate = generate();
+    await vi.waitFor(() => expect(server.prompts).toHaveLength(turns + 1));
+    const listener = vi.fn();
+    const stop = adapter.subscribeProjectGeneration('project-e2e', listener);
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'running' }));
+    stop();
+    server.complete(kind === 'analysis' ? goldenSourceAnalysis() : kind === 'outline' ? goldenOutline() : goldenSlideSpecs());
+    await vi.waitFor(() => expect(commitEntered).toBe(true));
+    expect(adapter.getProjectGeneration('project-e2e')!.status).toBe('running');
+    expect(native.state.pipeline.slideSpecs).toBeNull();
+    releaseCommit();
+    const [saved, reused] = await Promise.all([first, duplicate]);
+    expect(reused).toEqual(saved);
+    expect(server.prompts).toHaveLength(turns + 1);
+    expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({ status: 'completed', pipeline: native.state.pipeline });
+    if (kind === 'details') {
+      await expect(generate()).rejects.toThrow('已有逐页细化');
+      expect(server.prompts).toHaveLength(turns + 1);
+    }
+  });
+
+  it('retains persistence failures off-page and releases the generation lock for an explicit retry', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    let failCommit = true;
+    const adapter = createTauriDesktopAdapter(server, async (command, args) => {
+      if (command === 'ppt_commit_pipeline' && failCommit) throw new Error('磁盘写入失败');
+      return native.invoke(command, args);
+    }, new DirectWorker());
+    await expect(adapter.analyzeProject('project-e2e')).rejects.toThrow('磁盘写入失败');
+    expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({ status: 'failed', error: '磁盘写入失败', pipeline: null });
+    expect(native.state.pipeline.analysis).toBeNull();
+    expect(server.prompts).toHaveLength(1);
+    failCommit = false;
+    server.hold = true;
+    const retry = adapter.analyzeProject('project-e2e');
+    await vi.waitFor(() => expect(server.prompts).toHaveLength(2));
+    server.complete(goldenSourceAnalysis());
+    await retry;
+    expect(adapter.getProjectGeneration('project-e2e')!.status).toBe('completed');
+  });
+
+  it('fails an obsolete generation commit without overwriting a newer persisted checkpoint', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    let releaseCommit!: () => void;
+    let commitEntered = false;
+    const adapter = createTauriDesktopAdapter(server, async (command, args) => {
+      if (command === 'ppt_commit_pipeline') {
+        commitEntered = true;
+        await new Promise<void>((resolve) => { releaseCommit = resolve; });
+      }
+      return native.invoke(command, args);
+    }, new DirectWorker());
+    const generation = adapter.analyzeProject('project-e2e');
+    await vi.waitFor(() => expect(commitEntered).toBe(true));
+    const newer = structuredClone(native.state.pipeline);
+    newer.revision += 1;
+    newer.promptContext = { taskBrief: '另一次操作保存的新背景', sourceInstructions: {}, outlineRequirements: '' };
+    native.state.pipeline = newer;
+    const failed = expect(generation).rejects.toThrow('stale pipeline revision');
+    releaseCommit();
+    await failed;
+    expect(native.state.pipeline).toEqual(newer);
+    expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({ status: 'failed', pipeline: null });
+    expect(server.prompts).toHaveLength(1);
+    expect(native.state.files.size).toBe(0);
+  });
+
   it('persists document edits, page order and references across restart and rejects editing a frozen outline', async () => {
     const native = nativePersistenceHarness();
     const server = new ScriptedPptAppServer();

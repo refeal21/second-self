@@ -1,6 +1,7 @@
 import {
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ChangeEvent,
   type ReactNode,
@@ -9,6 +10,7 @@ import {
 import type { DesktopAdapter } from './desktop-adapter.js';
 import type { NativePptPipeline, NativePromptContext } from '../../worker/src/native-pipeline.js';
 import type { PptOutline, SlideSpec } from '../../worker/src/ppt-project.js';
+import type { ProjectGeneration } from './project-generation.js';
 import { OutlineEditor, outlineDraftError } from './outline-editor.js';
 import {
   buildPptPrompt,
@@ -35,7 +37,10 @@ export function NativeWorkspacePage({
   const [pipeline, setPipeline] = useState<NativePptPipeline | null>(null);
   const [outlineDraft, setOutlineDraft] = useState<PptOutline | null>(null);
   const [detailsText, setDetailsText] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [localBusy, setLocalBusy] = useState(false);
+  const [generation, setGeneration] = useState<ProjectGeneration | null>(
+    () => adapter.getProjectGeneration(projectId),
+  );
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const [visualFeedback, setVisualFeedback] = useState('');
@@ -46,31 +51,69 @@ export function NativeWorkspacePage({
   });
   const [contextConfirmation, setContextConfirmation] = useState('');
   const [promptContextExpanded, setPromptContextExpanded] = useState(false);
+  const mounted = useRef(true);
+  const pipelineRef = useRef<NativePptPipeline | null>(null);
+  const busy = localBusy || generation?.status === 'running';
+
+  const applyPipeline = (next: NativePptPipeline, onlyIfNewer = false) => {
+    const current = pipelineRef.current;
+    if (onlyIfNewer && current?.project.id === next.project.id && next.revision <= current.revision) return false;
+    pipelineRef.current = next;
+    setPipeline(next);
+    return true;
+  };
 
   const update = async (operation: () => Promise<NativePptPipeline>, success: string) => {
     if (busy) return false;
-    setBusy(true); setError(''); setNotice('');
+    setLocalBusy(true); setError(''); setNotice('');
     try {
       const next = await operation();
-      setPipeline(next); setNotice(success);
+      if (!mounted.current) return true;
+      applyPipeline(next); setNotice(success);
       return true;
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (mounted.current) setError(reason instanceof Error ? reason.message : String(reason));
       return false;
-    } finally { setBusy(false); }
+    } finally { if (mounted.current) setLocalBusy(false); }
   };
 
   useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  useEffect(() => adapter.subscribeProjectGeneration(projectId, (next) => {
+    setGeneration(next);
+    if (next?.status === 'running') {
+      setError('');
+      setNotice('');
+    } else if (next?.status === 'completed' && next.pipeline) {
+      if (applyPipeline(next.pipeline, true)) {
+        setError('');
+        setNotice(generationSuccessLabel(next.kind));
+      }
+    } else if (next?.status === 'failed' && generationMatchesPipeline(next, pipelineRef.current)) {
+      setNotice('');
+      setError(next.error || '生成失败，请重试。');
+    }
+  }), [adapter, projectId]);
+
+  useEffect(() => {
     let active = true;
-    setBusy(true);
+    setLocalBusy(true);
     void adapter.loadProjectPipeline(projectId).then((loaded) => {
       if (active) {
-        setPromptContext(normalizePromptContext(loaded, getPromptContext(loaded)));
-        setPipeline(loaded);
+        if (applyPipeline(loaded, true)) {
+          setPromptContext(normalizePromptContext(loaded, getPromptContext(loaded)));
+          if (!generationMatchesPipeline(adapter.getProjectGeneration(projectId), loaded)) {
+            setError('');
+            setNotice('');
+          }
+        }
       }
     }).catch((reason: unknown) => {
       if (active) setError(reason instanceof Error ? reason.message : String(reason));
-    }).finally(() => { if (active) setBusy(false); });
+    }).finally(() => { if (active) setLocalBusy(false); });
     return () => { active = false; };
   }, [adapter, projectId]);
 
@@ -163,7 +206,7 @@ export function NativeWorkspacePage({
   };
 
   if (!pipeline) {
-    return <main id="main-content" className="workspace-unavailable"><h1>{projectName}</h1><p>{error || '正在恢复完整工作流检查点…'}</p></main>;
+    return <main id="main-content" className="workspace-unavailable"><h1>{projectName}</h1><p role={error ? 'alert' : 'status'}>{error || generationRunningLabel(generation) || '正在恢复完整工作流检查点…'}</p></main>;
   }
 
   const status = pipeline.project.workflowStatus;
@@ -231,6 +274,9 @@ export function NativeWorkspacePage({
         </div>
         <div><strong>{stageLabel(status)}</strong><p>检查点 r{pipeline.revision}</p></div>
       </header>
+      {generation?.status === 'running' && <p className="app-notice" role="status">
+        {generationRunningLabel(generation)}，离开本页后仍会继续。
+      </p>}
       {(notice || error) && <p className={error ? 'app-notice is-error' : 'app-notice'} role={error ? 'alert' : 'status'}>{error || notice}</p>}
       <div className="workspace-layout">
         <aside className="workflow-rail" aria-label="PPT 工作流">
@@ -298,10 +344,10 @@ export function NativeWorkspacePage({
           </details>
           {status === 'intake' && <StageCard title="1. 附加材料">
             <p>只会读取你主动选择的文件。附加后由 Codex 从项目 sources 目录进行可追溯分析。</p>
-            <button className="button button-primary" disabled={busy || promptContextDirty || pipeline.sources.length === 0} onClick={() => void update(() => adapter.analyzeProject(projectId), '材料分析已保存。')}>用 Codex 分析材料</button>
+            <button className="button button-primary" disabled={busy || promptContextDirty || pipeline.sources.length === 0} onClick={() => void update(() => adapter.analyzeProject(projectId), '材料分析已保存。')}>{generationActionLabel('analysis', generation, '用 Codex 分析材料')}</button>
           </StageCard>}
           {status === 'source_analysis' && <StageCard title="2. 材料分析" actions={
-            <button className="button button-primary" disabled={busy || promptContextDirty} onClick={() => void update(() => adapter.generateOutline(projectId), '整份大纲已生成，等待你审核。')}>生成整份大纲</button>
+            <button className="button button-primary" disabled={busy || promptContextDirty} onClick={() => void update(() => adapter.generateOutline(projectId), '整份大纲已生成，等待你审核。')}>{generationActionLabel('outline', generation, '生成整份大纲')}</button>
           }>
             <pre>{JSON.stringify(pipeline.analysis?.output, null, 2)}</pre>
           </StageCard>}
@@ -327,10 +373,10 @@ export function NativeWorkspacePage({
             </details>}
           {status === 'detail_review' && !pipeline.slideSpecs && <StageCard title="4. 生成全部页面细化">
             <p>已批准大纲不会被后续操作覆盖。</p>
-            <button className="button button-primary" disabled={busy} onClick={() => void update(() => adapter.generateDetails(projectId), '全部页面细化已生成。')}>生成逐页细化</button>
+            <button className="button button-primary" disabled={busy} onClick={() => void update(() => adapter.generateDetails(projectId), '全部页面细化已生成。')}>{generationActionLabel('details', generation, '生成逐页细化')}</button>
           </StageCard>}
           {status === 'detail_review' && pipeline.slideSpecs && <StageCard title="4. 审核全部页面细化">
-            <textarea aria-label="逐页细化 JSON" rows={24} value={detailsText} onChange={(event) => setDetailsText(event.target.value)} />
+            <textarea aria-label="逐页细化 JSON" rows={24} value={detailsText} disabled={busy} onChange={(event) => setDetailsText(event.target.value)} />
             <div className="review-actions">
               <button className="button button-secondary" disabled={busy || pipeline.slideSpecs.version.status === 'frozen'} onClick={() => void update(() => adapter.saveDetails(projectId, parseJson<SlideSpec[]>(detailsText)), '逐页细化修改已保存。')}>保存修改</button>
               <button className="button button-primary" disabled={busy || pipeline.slideSpecs.version.status !== 'draft'} onClick={() => void update(() => adapter.approveDetails(projectId), '全部页面细化已批准并冻结。')}>批准全部细化</button>
@@ -355,7 +401,7 @@ export function NativeWorkspacePage({
             {currentVisual && !previewSrc && previewState === 'loading' && <p role="status">正在安全读取完整 PNG…</p>}
             <label className="native-feedback">修改意见
               <textarea aria-label="修改意见" rows={3} value={visualFeedback}
-                onChange={(event) => setVisualFeedback(event.target.value)}
+                disabled={busy} onChange={(event) => setVisualFeedback(event.target.value)}
                 placeholder="例如：减少装饰，突出数据；不要在图中生成标题文字。" />
             </label>
             <div className="review-actions">
@@ -364,7 +410,7 @@ export function NativeWorkspacePage({
                 () => adapter.requestVisual(projectId, pipeline.currentSlideId!, visualFeedback),
                 '已按修改意见生成新候选，请重新检查完整 PNG。',
               )}>按意见重新生成</button>}
-              <label className="button button-secondary">上传替换 PNG<input hidden type="file" accept="image/png" onChange={(event) => void replaceVisual(event)} /></label>
+              <label className={`button button-secondary${busy ? ' is-disabled' : ''}`} aria-disabled={busy}>上传替换 PNG<input hidden type="file" accept="image/png" disabled={busy} onChange={(event) => void replaceVisual(event)} /></label>
               <button className="button button-primary" disabled={busy || !canApproveCurrent} onClick={() => void update(() => adapter.approveVisual(projectId, pipeline.currentSlideId!), '当前页已批准，检查点已保存。')}>批准当前页</button>
             </div>
           </StageCard>}
@@ -400,10 +446,14 @@ export function NativeWorkspacePage({
           <p>审批记录：{pipeline.approvals.length}</p>
           <p>产物哈希：{pipeline.exportReceipt?.sha256 ?? '尚无'}</p>
           <button className="button button-secondary" disabled={busy || pipeline.approvals.length === 0} onClick={() => void (async () => {
-            setBusy(true); setError('');
-            try { const result = await adapter.proposeProjectMemory(projectId); setNotice(result.status); }
-            catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-            finally { setBusy(false); }
+            setLocalBusy(true); setError('');
+            try {
+              const result = await adapter.proposeProjectMemory(projectId);
+              if (mounted.current) setNotice(result.status);
+            } catch (reason) {
+              if (mounted.current) setError(reason instanceof Error ? reason.message : String(reason));
+            }
+            finally { if (mounted.current) setLocalBusy(false); }
           })()}>请 AI 提议可复用偏好</button>
         </aside>
       </div>
@@ -483,4 +533,36 @@ function stageLabel(stage: string): string {
   return ({ intake: '材料', source_analysis: '材料分析', outline_review: '大纲审批',
     detail_review: '逐页细化', visual_review: '视觉审批', blocked: '可恢复阻塞',
     conversion: '可编辑转换', qa: '质量检查', completed: '已完成' } as Record<string, string>)[stage] ?? stage;
+}
+
+function generationRunningLabel(generation: ProjectGeneration | null): string {
+  if (generation?.status !== 'running') return '';
+  return ({ analysis: '正在分析材料', outline: '正在生成整份大纲', details: '正在生成逐页细化' })[generation.kind];
+}
+
+function generationSuccessLabel(kind: ProjectGeneration['kind']): string {
+  return ({ analysis: '材料分析已保存。', outline: '整份大纲已生成，等待你审核。', details: '全部页面细化已生成。' })[kind];
+}
+
+function generationActionLabel(
+  kind: ProjectGeneration['kind'],
+  generation: ProjectGeneration | null,
+  idle: string,
+): string {
+  if (generation?.kind !== kind) return idle;
+  if (generation.status === 'running') return ({ analysis: '正在分析材料…', outline: '正在生成整份大纲…', details: '正在生成逐页细化…' })[kind];
+  if (generation.status === 'failed') return ({ analysis: '重试分析材料', outline: '重试生成整份大纲', details: '重试生成逐页细化' })[kind];
+  return idle;
+}
+
+function generationMatchesPipeline(
+  generation: ProjectGeneration | null,
+  pipeline: NativePptPipeline | null,
+): boolean {
+  if (!generation || !pipeline) return Boolean(generation);
+  const expected = pipeline.project.workflowStatus === 'intake' ? 'analysis'
+    : pipeline.project.workflowStatus === 'source_analysis' ? 'outline'
+      : pipeline.project.workflowStatus === 'detail_review' && !pipeline.slideSpecs ? 'details'
+        : null;
+  return generation.kind === expected;
 }

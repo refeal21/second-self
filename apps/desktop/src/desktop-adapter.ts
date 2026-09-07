@@ -14,6 +14,7 @@ import type {
 import type { PptOutline, SlideSpec, SourceAnalysis } from '../../worker/src/ppt-project.js';
 import { TauriCodexTransport } from './codex-transport.js';
 import { buildPptPrompt, promptContextError } from './ppt-prompts.js';
+import { ProjectGenerationRegistry, type ProjectGeneration } from './project-generation.js';
 import {
   TauriWorkflowWorkerClient,
   type WorkflowWorkerGateway,
@@ -127,6 +128,8 @@ export interface DesktopAdapter {
   respondToTaskInput(taskId: string, answers: Record<string, string[]>): Promise<{ status: string }>;
   createProject(input: CreateProjectInput): Promise<ProjectSummary>;
   loadProjectPipeline(projectId: string): Promise<NativePptPipeline>;
+  getProjectGeneration(projectId: string): ProjectGeneration | null;
+  subscribeProjectGeneration(projectId: string, listener: (state: ProjectGeneration | null) => void): () => void;
   attachSource(projectId: string, input: SourceFileInput): Promise<NativePptPipeline>;
   saveProjectContext(projectId: string, context: NativePromptContext): Promise<NativePptPipeline>;
   analyzeProject(projectId: string): Promise<NativePptPipeline>;
@@ -213,6 +216,7 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
   let counter = 1;
   const initialState = structuredClone(demoInitialState);
   const tasks = new Map<string, TaskSummary>();
+  const generations = new ProjectGenerationRegistry();
   const listeners = new Map<string, Set<(task: TaskSummary) => void>>();
   const connectionListeners = new Set<(state: ConnectionSummary) => void>();
   const demoConnection = () => structuredClone({ account: initialState.account, runtime: initialState.runtime });
@@ -299,6 +303,8 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
       return { id: `ppt-demo-${counter++}`, name: input.name, goal: input.goal, stage: '材料', progress: 10, updatedAt: '刚刚' };
     },
     async loadProjectPipeline() { throw new Error('演示模式不使用本地持久化 PPT 管线。'); },
+    getProjectGeneration: (projectId) => generations.get(projectId),
+    subscribeProjectGeneration: (projectId, listener) => generations.subscribe(projectId, listener),
     async attachSource() { throw new Error('演示模式不会写入本地材料。'); },
     async saveProjectContext() { throw new Error('演示模式不会保存项目说明。'); },
     async analyzeProject() { throw new Error('演示模式不会消耗 Codex 任务。'); },
@@ -344,6 +350,7 @@ class TauriDesktopAdapter implements DesktopAdapter {
   readonly initialState = structuredClone(nativeInitialState);
   private readonly client: CodexAppServerClient;
   private readonly tasks: GeneralTaskManager;
+  private readonly generations = new ProjectGenerationRegistry();
   private readonly taskIds = new Set<string>();
   private readonly taskPrompts = new Map<string, string>();
   private readonly listeners = new Map<string, Set<(task: TaskSummary) => void>>();
@@ -492,6 +499,10 @@ class TauriDesktopAdapter implements DesktopAdapter {
     await this.worker.restoreProject(pipeline);
     return pipeline;
   }
+  getProjectGeneration(projectId: string): ProjectGeneration | null { return this.generations.get(projectId); }
+  subscribeProjectGeneration(projectId: string, listener: (state: ProjectGeneration | null) => void): () => void {
+    return this.generations.subscribe(projectId, listener);
+  }
   async attachSource(projectId: string, input: SourceFileInput): Promise<NativePptPipeline> {
     const pipeline = await this.callNative<NativePptPipeline>('ppt_attach_source', {
       input: { projectId, ...input },
@@ -499,15 +510,17 @@ class TauriDesktopAdapter implements DesktopAdapter {
     await this.worker.restoreProject(pipeline);
     return pipeline;
   }
-  async analyzeProject(projectId: string): Promise<NativePptPipeline> {
-    const pipeline = await this.loadProjectPipeline(projectId);
-    if (pipeline.project.workflowStatus !== 'intake' || pipeline.sources.length === 0) {
-      throw new Error('请先附加材料；重新分析前请保存本次说明并确认返回材料阶段。');
-    }
-    const output = await this.runStructured<SourceAnalysis>(projectId, buildPptPrompt(pipeline, 'analysis'));
-    return this.applyPipeline(projectId, pipeline, {
-      kind: 'analysis.commit', at: new Date().toISOString(),
-      requestId: `analysis-${pipeline.revision + 1}`, output,
+  analyzeProject(projectId: string): Promise<NativePptPipeline> {
+    return this.generations.run(projectId, 'analysis', async () => {
+      const pipeline = await this.loadProjectPipeline(projectId);
+      if (pipeline.project.workflowStatus !== 'intake' || pipeline.sources.length === 0) {
+        throw new Error('请先附加材料；重新分析前请保存本次说明并确认返回材料阶段。');
+      }
+      const output = await this.runStructured<SourceAnalysis>(projectId, buildPptPrompt(pipeline, 'analysis'));
+      return this.applyPipeline(projectId, pipeline, {
+        kind: 'analysis.commit', at: new Date().toISOString(),
+        requestId: `analysis-${pipeline.revision + 1}`, output,
+      });
     });
   }
   async saveProjectContext(projectId: string, context: NativePromptContext): Promise<NativePptPipeline> {
@@ -521,13 +534,15 @@ class TauriDesktopAdapter implements DesktopAdapter {
   async saveOutline(projectId: string, outline: PptOutline): Promise<NativePptPipeline> {
     return this.applyCurrent(projectId, { kind: 'outline.submit', at: new Date().toISOString(), outline });
   }
-  async generateOutline(projectId: string): Promise<NativePptPipeline> {
-    const pipeline = await this.loadProjectPipeline(projectId);
-    if (!pipeline.analysis || pipeline.project.workflowStatus !== 'source_analysis') {
-      throw new Error('请先完成材料分析；已有大纲请先审核，或修改说明后重新生成。');
-    }
-    const outline = await this.runStructured<PptOutline>(projectId, buildPptPrompt(pipeline, 'outline'));
-    return this.applyPipeline(projectId, pipeline, { kind: 'outline.submit', at: new Date().toISOString(), outline });
+  generateOutline(projectId: string): Promise<NativePptPipeline> {
+    return this.generations.run(projectId, 'outline', async () => {
+      const pipeline = await this.loadProjectPipeline(projectId);
+      if (!pipeline.analysis || pipeline.project.workflowStatus !== 'source_analysis') {
+        throw new Error('请先完成材料分析；已有大纲请先审核，或修改说明后重新生成。');
+      }
+      const outline = await this.runStructured<PptOutline>(projectId, buildPptPrompt(pipeline, 'outline'));
+      return this.applyPipeline(projectId, pipeline, { kind: 'outline.submit', at: new Date().toISOString(), outline });
+    });
   }
   async approveOutline(projectId: string): Promise<NativePptPipeline> {
     return this.applyCurrent(projectId, { kind: 'outline.approve', at: new Date().toISOString() });
@@ -535,13 +550,16 @@ class TauriDesktopAdapter implements DesktopAdapter {
   async saveDetails(projectId: string, specs: readonly SlideSpec[]): Promise<NativePptPipeline> {
     return this.applyCurrent(projectId, { kind: 'details.submit', at: new Date().toISOString(), specs });
   }
-  async generateDetails(projectId: string): Promise<NativePptPipeline> {
-    const pipeline = await this.loadProjectPipeline(projectId);
-    if (pipeline.outline?.version.status !== 'frozen' || pipeline.project.workflowStatus !== 'detail_review') {
-      throw new Error('请先批准整份大纲，并在逐页细化阶段生成内容。');
-    }
-    const specs = await this.runStructured<readonly SlideSpec[]>(projectId, buildPptPrompt(pipeline, 'details'));
-    return this.applyPipeline(projectId, pipeline, { kind: 'details.submit', at: new Date().toISOString(), specs });
+  generateDetails(projectId: string): Promise<NativePptPipeline> {
+    return this.generations.run(projectId, 'details', async () => {
+      const pipeline = await this.loadProjectPipeline(projectId);
+      if (pipeline.outline?.version.status !== 'frozen' || pipeline.project.workflowStatus !== 'detail_review') {
+        throw new Error('请先批准整份大纲，并在逐页细化阶段生成内容。');
+      }
+      if (pipeline.slideSpecs) throw new Error('已有逐页细化，请审核或保存修改，不要重复生成。');
+      const specs = await this.runStructured<readonly SlideSpec[]>(projectId, buildPptPrompt(pipeline, 'details'));
+      return this.applyPipeline(projectId, pipeline, { kind: 'details.submit', at: new Date().toISOString(), specs });
+    });
   }
   async approveDetails(projectId: string): Promise<NativePptPipeline> {
     return this.applyCurrent(projectId, { kind: 'details.approve', at: new Date().toISOString() });

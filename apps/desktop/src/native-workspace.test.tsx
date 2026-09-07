@@ -434,10 +434,10 @@ describe('native PPT QA workspace', () => {
     render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
       projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
 
-    const editor = await screen.findByRole('textbox', { name: '整份大纲 JSON' });
+    const editor = await screen.findByRole('textbox', { name: '第 1 页标题' });
     const edited = structuredClone(initial.outline.value);
     edited.slides[0]!.title = '用户修改后的标题';
-    fireEvent.change(editor, { target: { value: JSON.stringify(edited) } });
+    fireEvent.change(editor, { target: { value: edited.slides[0]!.title } });
     await user.click(screen.getByRole('button', { name: '保存修改' }));
     expect(saveOutline).toHaveBeenCalledWith(initial.project.id, edited);
     expect(await screen.findByDisplayValue(/用户修改后的标题/)).toBeInTheDocument();
@@ -476,7 +476,8 @@ describe('native PPT QA workspace', () => {
     render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
       projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
 
-    const editor = await screen.findByRole('textbox', { name: '逐页细化 JSON' });
+    // Wait for the persisted document, not the empty textbox on the loading render.
+    const editor = await screen.findByDisplayValue(/旧文案/);
     const edited = structuredClone(initial.slideSpecs.value);
     edited[0]!.body = ['用户修改后的文案'];
     fireEvent.change(editor, { target: { value: JSON.stringify(edited) } });

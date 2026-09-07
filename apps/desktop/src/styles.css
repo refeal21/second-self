@@ -2173,6 +2173,15 @@ textarea::placeholder {
 .native-stage-header .button {
   margin: 0;
 }
+.native-stage-header .review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+}
+.native-stage-header .review-actions .button {
+  white-space: nowrap;
+}
 .native-workspace pre {
   max-width: 100%;
   margin: 0;
@@ -2180,6 +2189,31 @@ textarea::placeholder {
   overflow-wrap: anywhere;
   font-size: 13px;
   line-height: 1.6;
+}
+
+.native-outline-save-state {
+  margin: 0 0 16px;
+  color: #687386;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.native-approved-outline {
+  margin-bottom: 24px;
+  padding: 16px;
+  border: 1px solid #dfe3ec;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.native-approved-outline > summary {
+  cursor: pointer;
+  color: #3543c7;
+  font-weight: 650;
+}
+
+.native-approved-outline[open] > summary {
+  margin-bottom: 16px;
 }
 .native-workspace textarea {
   display: block;
@@ -2196,6 +2230,10 @@ textarea::placeholder {
 @media (max-width: 956px) {
   /* Native stages have no demo-only tab switcher. Keep every pane reachable,
      with the active stage first and normal document scrolling on small windows. */
+  .desktop-window:has(.native-workspace) {
+    /* clip preserves clipping without creating a non-scrolling sticky ancestor. */
+    overflow: clip;
+  }
   .native-workspace {
     height: auto;
     overflow: visible;
@@ -2215,7 +2253,7 @@ textarea::placeholder {
   }
   .native-stage-header {
     position: sticky;
-    top: 0;
+    top: 61px;
   }
   .native-prompt-context {
     padding: 14px 16px;
@@ -2229,6 +2267,12 @@ textarea::placeholder {
   }
   .native-prompt-context-heading .button {
     width: 100%;
+  }
+}
+
+@media (max-width: 620px) {
+  .native-workspace .native-stage-header {
+    top: 55px;
   }
 }
 

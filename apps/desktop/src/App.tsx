@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useReducer,
   useRef,
@@ -36,6 +37,9 @@ type Route =
   | 'memory'
   | 'settings';
 type Notice = { kind: 'status' | 'error'; text: string } | null;
+
+const nativeUnsavedNavigationMessage =
+  '大纲或生成说明尚未保存。离开将丢弃这些修改，是否继续？';
 
 const navItems: Array<{
   route: Exclude<Route, 'workspace'>;
@@ -88,6 +92,14 @@ export function App({
   const previousRoute = useRef(route);
   const [notice, setNotice] = useState<Notice>(null);
   const mutationCounter = useRef(0);
+  const nativeWorkspaceDirty = useRef(false);
+  const acceptedLocation = useRef({
+    href: window.location.href,
+    state: window.history.state,
+  });
+  const handleNativeWorkspaceDirtyChange = useCallback((dirty: boolean) => {
+    nativeWorkspaceDirty.current = dirty;
+  }, []);
   const selectedProject =
     workbench.projects.find(
       (project) => project.id === (workspaceProjectId ?? workbench.selectedProjectId),
@@ -95,6 +107,20 @@ export function App({
 
   useEffect(() => {
     const onPopState = () => {
+      const nextHref = window.location.href;
+      if (nextHref === acceptedLocation.current.href) return;
+      if (nativeWorkspaceDirty.current) {
+        if (!window.confirm(nativeUnsavedNavigationMessage)) {
+          const current = acceptedLocation.current;
+          window.history.pushState(current.state, '', current.href);
+          return;
+        }
+        nativeWorkspaceDirty.current = false;
+      }
+      acceptedLocation.current = {
+        href: nextHref,
+        state: window.history.state,
+      };
       setRoute(routeFromHash() ?? 'dashboard');
       setWorkspaceProjectId(projectIdFromHash());
       setNotice(null);
@@ -105,6 +131,16 @@ export function App({
       window.removeEventListener('popstate', onPopState);
       window.removeEventListener('hashchange', onPopState);
     };
+  }, []);
+
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!nativeWorkspaceDirty.current) return;
+      event.preventDefault();
+      event.returnValue = true;
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
   }, []);
 
   useEffect(() => {
@@ -164,11 +200,19 @@ export function App({
   }, [adapter, task?.id]);
 
   const navigate = (next: Route, projectId?: string) => {
+    if (nativeWorkspaceDirty.current) {
+      if (!window.confirm(nativeUnsavedNavigationMessage)) return;
+      nativeWorkspaceDirty.current = false;
+    }
     setNotice(null);
     setRoute(next);
     setWorkspaceProjectId(next === 'workspace' ? projectId ?? null : null);
     window.history.pushState({ route: next }, '', next === 'workspace' && projectId
       ? `#/workspace/${encodeURIComponent(projectId)}` : `#/${next}`);
+    acceptedLocation.current = {
+      href: window.location.href,
+      state: window.history.state,
+    };
     document.documentElement.scrollTop = 0;
     document.body.scrollTop = 0;
   };
@@ -203,6 +247,7 @@ export function App({
             projectName={selectedProject.name}
             projectGoal={selectedProject.goal}
             onBack={() => navigate('projects')}
+            onDirtyChange={handleNativeWorkspaceDirtyChange}
           /> : <WorkspacePage
             adapter={adapter}
             project={selectedProject}

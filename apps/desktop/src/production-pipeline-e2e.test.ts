@@ -120,6 +120,36 @@ function nativePersistenceHarness() {
 }
 
 describe('production-equivalent UI adapter → App Server → Worker → Rust persistence flow', () => {
+  it('persists document edits, page order and references across restart and rejects editing a frozen outline', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    const adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    await adapter.analyzeProject('project-e2e');
+    const generated = await adapter.generateOutline('project-e2e');
+    const original = generated.outline!;
+    const edited = {
+      ...original.value, title: '董事会审阅稿',
+      slides: [original.value.slides[2]!,
+        { ...original.value.slides[0]!, title: '先看决策', purpose: '明确本次需要批准的事项' },
+        { id: 'slide-new-summary', title: '讨论与总结', purpose: '确认后续行动', sourceIds: [] }],
+    };
+    const saved = await adapter.saveOutline('project-e2e', edited);
+    expect(saved.outline?.value).toEqual(edited);
+    expect(saved.outline?.version.id).toBe(original.version.id);
+    const outlineFiles = [...native.state.files.entries()].filter(([path]) => path.startsWith('outline/'));
+    expect(outlineFiles.length).toBeGreaterThan(0);
+    // Persistence canonicalizes object keys; page/array ordering remains exact.
+    expect(outlineFiles.map(([, contents]) =>
+      JSON.parse(Buffer.from(contents, 'base64').toString('utf8')) as unknown)).toContainEqual(edited);
+    const restarted = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    expect((await restarted.loadProjectPipeline('project-e2e')).outline?.value).toEqual(edited);
+    const approved = await restarted.approveOutline('project-e2e');
+    expect(approved.outline).toMatchObject({ value: edited, version: { status: 'frozen' } });
+    await expect(restarted.saveOutline('project-e2e', { ...edited, title: '不应覆盖' })).rejects.toThrow();
+    expect(native.state.pipeline.outline?.value).toEqual(edited);
+    expect(server.prompts).toHaveLength(2);
+  });
+
   it('persists the three instructions and sends the same preview through analysis, outline and approved details after restart', async () => {
     const native = nativePersistenceHarness();
     const server = new ScriptedPptAppServer();

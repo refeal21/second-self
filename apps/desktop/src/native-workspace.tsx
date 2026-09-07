@@ -9,6 +9,7 @@ import {
 import type { DesktopAdapter } from './desktop-adapter.js';
 import type { NativePptPipeline, NativePromptContext } from '../../worker/src/native-pipeline.js';
 import type { PptOutline, SlideSpec } from '../../worker/src/ppt-project.js';
+import { OutlineEditor, outlineDraftError } from './outline-editor.js';
 import {
   buildPptPrompt,
   getPromptContext,
@@ -22,15 +23,17 @@ export function NativeWorkspacePage({
   projectName,
   projectGoal,
   onBack,
+  onDirtyChange,
 }: {
   adapter: DesktopAdapter;
   projectId: string;
   projectName: string;
   projectGoal: string;
   onBack: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [pipeline, setPipeline] = useState<NativePptPipeline | null>(null);
-  const [outlineText, setOutlineText] = useState('');
+  const [outlineDraft, setOutlineDraft] = useState<PptOutline | null>(null);
   const [detailsText, setDetailsText] = useState('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
@@ -71,10 +74,16 @@ export function NativeWorkspacePage({
     return () => { active = false; };
   }, [adapter, projectId]);
 
+  const savedOutlineKey = JSON.stringify(pipeline?.outline?.value ?? null);
   useEffect(() => {
-    if (pipeline?.outline) setOutlineText(JSON.stringify(pipeline.outline.value, null, 2));
+    // Saving a draft retains its version ID. Sync only when persisted content
+    // changes, never when an unrelated checkpoint response refreshes the page.
+    setOutlineDraft(JSON.parse(savedOutlineKey) as PptOutline | null);
+  }, [projectId, savedOutlineKey]);
+
+  useEffect(() => {
     if (pipeline?.slideSpecs) setDetailsText(JSON.stringify(pipeline.slideSpecs.value, null, 2));
-  }, [pipeline?.outline?.version.id, pipeline?.slideSpecs?.version.id]);
+  }, [pipeline?.slideSpecs?.version.id]);
 
   const savedPromptContextKey = pipeline ? JSON.stringify(getPromptContext(pipeline)) : '';
   useEffect(() => {
@@ -119,6 +128,16 @@ export function NativeWorkspacePage({
     setVisualFeedback('');
   }, [pipeline?.currentSlideId]);
 
+  const outlineDirty = pipeline?.project.workflowStatus === 'outline_review' &&
+    outlineDraft !== null && JSON.stringify(outlineDraft) !== savedOutlineKey;
+  const promptContextDirty = pipeline !== null &&
+    JSON.stringify(normalizePromptContext(pipeline, promptContext)) !==
+    JSON.stringify(normalizePromptContext(pipeline, getPromptContext(pipeline)));
+  useEffect(() => {
+    onDirtyChange?.(outlineDirty || promptContextDirty);
+  }, [onDirtyChange, outlineDirty, promptContextDirty]);
+  useEffect(() => () => { onDirtyChange?.(false); }, [onDirtyChange]);
+
   const attachFiles = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = [...(event.target.files ?? [])];
     for (const file of files) {
@@ -154,7 +173,8 @@ export function NativeWorkspacePage({
     currentVisual.byteLength > 0 && previewState === 'ready';
   const savedPromptContext = normalizePromptContext(pipeline, getPromptContext(pipeline));
   const normalizedPromptContext = normalizePromptContext(pipeline, promptContext);
-  const promptContextDirty = JSON.stringify(normalizedPromptContext) !== JSON.stringify(savedPromptContext);
+  const outlineValidationError = outlineDraft ? outlineDraftError(outlineDraft) : '尚无可审核的大纲。';
+  const outlineEditable = status === 'outline_review' && pipeline.outline?.version.status === 'draft';
   const contextValidationError = promptContextError(pipeline, normalizedPromptContext);
   const contextEditable = status === 'intake' || status === 'source_analysis' ||
     (status === 'outline_review' && pipeline.outline?.version.status !== 'frozen');
@@ -163,7 +183,7 @@ export function NativeWorkspacePage({
     status === 'outline_review' || status === 'detail_review';
 
   const savePromptContext = async (confirmed = false) => {
-    if (!promptContextDirty || contextValidationError || !contextEditable || busy) return;
+    if (!promptContextDirty || contextValidationError || !contextEditable || busy || outlineDirty) return;
     const confirmation = promptInvalidationMessage(pipeline, savedPromptContext, normalizedPromptContext);
     if (confirmation && !confirmed) {
       setContextConfirmation(confirmation);
@@ -182,7 +202,10 @@ export function NativeWorkspacePage({
   };
 
   const backToProjects = () => {
-    if (promptContextDirty && !window.confirm('生成说明尚未保存。返回 PPT 项目将丢弃这些修改，是否继续？')) return;
+    // App handles sidebar/history navigation too; standalone consumers still
+    // get a local guard without displaying a second confirmation in App.
+    if (!onDirtyChange && (promptContextDirty || outlineDirty) &&
+      !window.confirm('大纲或生成说明尚未保存。返回 PPT 项目将丢弃这些修改，是否继续？')) return;
     onBack();
   };
 
@@ -228,7 +251,7 @@ export function NativeWorkspacePage({
             <div className="native-prompt-context-body">
               <div className="native-prompt-context-heading">
                 <p>先保存这里的说明，再继续分析、生成或人工审批。</p>
-                <button className="button button-secondary" disabled={busy || !contextEditable || !promptContextDirty || Boolean(contextValidationError)}
+                <button className="button button-secondary" disabled={busy || outlineDirty || !contextEditable || !promptContextDirty || Boolean(contextValidationError)}
                   onClick={() => void savePromptContext()}>保存说明</button>
               </div>
               <p className="native-carried-goal"><strong>项目目标（自动携带）</strong><span>{projectGoal}</span></p>
@@ -257,12 +280,13 @@ export function NativeWorkspacePage({
                   onChange={(event) => updatePromptContext({ ...promptContext, outlineRequirements: event.target.value })} />
               </label>
               {contextValidationError && <p className="native-context-warning" role="alert">{contextValidationError}</p>}
+              {outlineDirty && <p className="native-save-hint">请先保存大纲修改，再更改生成说明。</p>}
               {promptContextDirty && !contextValidationError && <p className="native-save-hint">请先保存说明，再继续生成或审批。</p>}
               {contextConfirmation && <div className="native-context-confirmation" role="alert">
                 <p>{contextConfirmation}</p>
                 <div className="review-actions">
                   <button className="button button-secondary" disabled={busy} onClick={() => setContextConfirmation('')}>取消保存</button>
-                  <button className="button button-primary" disabled={busy} onClick={() => void savePromptContext(true)}>确认保存并清除</button>
+                  <button className="button button-primary" disabled={busy || outlineDirty} onClick={() => void savePromptContext(true)}>确认保存并清除</button>
                 </div>
               </div>}
               {showPromptPreview && <details className="native-prompt-preview">
@@ -281,13 +305,26 @@ export function NativeWorkspacePage({
           }>
             <pre>{JSON.stringify(pipeline.analysis?.output, null, 2)}</pre>
           </StageCard>}
-          {status === 'outline_review' && <StageCard title="3. 审核整份大纲">
-            <textarea aria-label="整份大纲 JSON" rows={22} value={outlineText} onChange={(event) => setOutlineText(event.target.value)} />
-            <div className="review-actions">
-              <button className="button button-secondary" disabled={busy || promptContextDirty || pipeline.outline?.version.status === 'frozen'} onClick={() => void update(() => adapter.saveOutline(projectId, parseJson<PptOutline>(outlineText)), '大纲修改已保存。')}>保存修改</button>
-              <button className="button button-primary" disabled={busy || promptContextDirty || pipeline.outline?.version.status !== 'draft'} onClick={() => void update(() => adapter.approveOutline(projectId), '大纲已批准并冻结。')}>批准整份大纲</button>
-            </div>
+          {status === 'outline_review' && <StageCard title="3. 审核整份大纲" actions={<div className="review-actions">
+            <button className="button button-secondary" disabled={busy || !outlineEditable || !outlineDirty || Boolean(outlineValidationError)}
+              onClick={() => { if (outlineDraft && outlineDirty && !outlineValidationError) void update(
+                () => adapter.saveOutline(projectId, outlineDraft), '大纲修改已保存。'); }}>保存修改</button>
+            <button className="button button-primary" disabled={busy || promptContextDirty || outlineDirty || !outlineEditable || Boolean(outlineValidationError)}
+              onClick={() => { if (!outlineDirty && !promptContextDirty && !outlineValidationError) void update(
+                () => adapter.approveOutline(projectId), '大纲已批准并冻结。'); }}>批准整份大纲</button>
+          </div>}>
+            <p className="native-outline-save-state">{outlineDirty ? '有未保存的修改，请先保存，再批准。' : '正在审核已保存的大纲。批准后将冻结，并进入逐页细化。'}</p>
+            {outlineValidationError && <p className="native-context-warning">{outlineValidationError}</p>}
+            {outlineDraft && <OutlineEditor outline={outlineDraft} analysis={pipeline.analysis?.output ?? null}
+              sources={pipeline.sources} readOnly={!outlineEditable} disabled={busy}
+              onChange={(next) => { setOutlineDraft(next); setNotice(''); setError(''); }} />}
           </StageCard>}
+          {status !== 'outline_review' && pipeline.outline?.version.status === 'frozen' &&
+            <details className="native-approved-outline">
+              <summary>已批准大纲（只读）</summary>
+              <OutlineEditor outline={pipeline.outline.value} analysis={pipeline.analysis?.output ?? null}
+                sources={pipeline.sources} readOnly disabled={busy} onChange={() => {}} />
+            </details>}
           {status === 'detail_review' && !pipeline.slideSpecs && <StageCard title="4. 生成全部页面细化">
             <p>已批准大纲不会被后续操作覆盖。</p>
             <button className="button button-primary" disabled={busy} onClick={() => void update(() => adapter.generateDetails(projectId), '全部页面细化已生成。')}>生成逐页细化</button>

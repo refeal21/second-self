@@ -205,4 +205,41 @@ describe('single workbench project and slide store', () => {
     });
     expect(state.selectedProjectId).toBe('ppt-demo-002');
   });
+
+  it('refreshes persisted collections without replacing live account or task-adjacent state', () => {
+    const state = demoState();
+    const live = {
+      ...state,
+      account: { email: 'live@example.com', plan: 'pro', status: 'connected' as const },
+      runtime: { ...state.runtime, detail: 'live app server', queue: 2 },
+      settings: { ...state.settings, workspacePath: '/live/workspace' },
+      selectedProjectId: 'ppt-demo-002',
+      pendingApprovals: { 'approval-live': 91 },
+    };
+
+    const refreshed = workbenchReducer(live, {
+      type: 'collections-loaded',
+      collections: {
+        approvals: [{
+          id: 'ppt-review:project-live:details:v1', projectId: 'project-live',
+          title: '新审批', detail: '全部页面细化待审核', author: 'PPT 工作流', time: '刚刚',
+        }],
+        memories: [{ id: 'memory-new', title: '新偏好', content: '保存后的建议', status: '待决定' }],
+        availability: { approvals: 'loaded', memories: 'loaded' },
+      },
+    });
+
+    expect(refreshed.account).toEqual(live.account);
+    expect(refreshed.runtime).toEqual(live.runtime);
+    expect(refreshed.projects).toEqual(live.projects);
+    expect(refreshed.selectedProjectId).toBe('ppt-demo-002');
+    expect(refreshed.pendingApprovals).toEqual({ 'approval-live': 91 });
+    expect(refreshed.settings).toEqual(live.settings);
+    expect(refreshed.approvals.map(({ id }) => id)).toEqual([
+      'ppt-review:project-live:details:v1',
+    ]);
+    expect(refreshed.memories[0]).toMatchObject({
+      id: 'memory-new', status: '待决定', pendingToken: null,
+    });
+  });
 });

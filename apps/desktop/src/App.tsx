@@ -89,6 +89,8 @@ export function App({
   const [task, setTask] = useState<TaskSummary | null>(null);
   const [workspaceProjectId, setWorkspaceProjectId] = useState(projectIdFromHash);
   const [listRefresh, setListRefresh] = useState(0);
+  const [collectionRefresh, setCollectionRefresh] = useState(0);
+  const [collectionsReady, setCollectionsReady] = useState(adapter.mode === 'demo');
   const previousRoute = useRef(route);
   const [notice, setNotice] = useState<Notice>(null);
   const mutationCounter = useRef(0);
@@ -160,12 +162,14 @@ export function App({
         if (!active) return;
         dispatch({ type: 'state-loaded', state });
         projectsHydrated = true;
+        setCollectionsReady(true);
         // Subscribe after hydration so the durable placeholder cannot overwrite
         // a newer account/connection event. The adapter replays its latest state.
         subscribe();
         await adapter.connectAccount();
       })().catch((error: unknown) => {
         if (!active) return;
+        setCollectionsReady(true);
         // Project/Worker hydration failure must not disable account recovery.
         if (!unsubscribe) subscribe();
         if (!projectsHydrated) dispatch({ type: 'projects-availability', availability: 'unavailable' });
@@ -177,6 +181,43 @@ export function App({
       unsubscribe?.();
     };
   }, [adapter]);
+
+  useEffect(() => {
+    if (
+      adapter.mode !== 'tauri' || !adapter.loadCollections || !collectionsReady ||
+      !['dashboard', 'approvals', 'memory'].includes(route)
+    ) return;
+    let active = true;
+    const collection = route === 'memory' ? 'memories' : 'approvals';
+    dispatch({ type: 'collection-availability', collection, availability: 'loading' });
+    void adapter.loadCollections().then((collections) => {
+      if (active) dispatch({ type: 'collections-loaded', collections });
+    }).catch(() => {
+      if (active) dispatch({ type: 'collection-availability', collection, availability: 'unavailable' });
+    });
+    return () => { active = false; };
+  }, [adapter, collectionRefresh, collectionsReady, route]);
+
+  useEffect(() => {
+    if (
+      adapter.mode !== 'tauri' || !['dashboard', 'memory'].includes(route) ||
+      !adapter.loadCollections
+    ) return;
+    const completed = new Set<string>();
+    const unsubscribers = workbench.projects.map(({ id }) =>
+      adapter.subscribeProjectGeneration(id, (generation) => {
+        if (
+          generation?.status !== 'completed' ||
+          (route === 'memory'
+            ? generation.kind !== 'memory'
+            : !['outline', 'details'].includes(generation.kind)) ||
+          completed.has(generation.operationId)
+        ) return;
+        completed.add(generation.operationId);
+        setCollectionRefresh((value) => value + 1);
+      }));
+    return () => { for (const unsubscribe of unsubscribers) unsubscribe(); };
+  }, [adapter, route, workbench.projects]);
 
   useEffect(() => {
     const entered = previousRoute.current !== route;
@@ -308,6 +349,8 @@ export function App({
             pending={workbench.pendingApprovals}
             dispatch={dispatch}
             nextMutationToken={() => ++mutationCounter.current}
+            navigate={navigate}
+            refreshCollections={() => setCollectionRefresh((value) => value + 1)}
             report={report}
           />
         )}
@@ -318,6 +361,7 @@ export function App({
             availability={workbench.collections.memories}
             dispatch={dispatch}
             nextMutationToken={() => ++mutationCounter.current}
+            refreshCollections={() => setCollectionRefresh((value) => value + 1)}
             report={report}
           />
         )}
@@ -648,6 +692,8 @@ function DashboardAside({
 }
 
 function ApprovalRow({ item }: { item: ApprovalSummary }) {
+  const timestamp = parseProjectTime(item.time);
+  const formattedTime = formatProjectTime(item.time);
   return (
     <div className="approval-row">
       <Icon name="file" />
@@ -656,7 +702,12 @@ function ApprovalRow({ item }: { item: ApprovalSummary }) {
         <span>{item.detail}</span>
         <small>发起人：{item.author}</small>
       </div>
-      <time>{item.time}</time>
+      <time
+        dateTime={timestamp === null ? undefined : new Date(timestamp).toISOString()}
+        title={timestamp === null ? '审批时间不可用' : `${formattedTime}（本地时间）`}
+      >
+        {formattedTime}
+      </time>
     </div>
   );
 }
@@ -1665,6 +1716,8 @@ function ApprovalsPage({
   pending,
   dispatch,
   nextMutationToken,
+  navigate,
+  refreshCollections,
   report,
 }: {
   adapter: DesktopAdapter;
@@ -1673,6 +1726,8 @@ function ApprovalsPage({
   pending: Record<string, number>;
   dispatch: (action: WorkbenchAction) => void;
   nextMutationToken: () => number;
+  navigate: (route: Route, projectId?: string) => void;
+  refreshCollections: () => void;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
@@ -1687,6 +1742,7 @@ function ApprovalsPage({
     try {
       const result = await adapter.decideApproval(id, decision);
       dispatch({ type: 'approval-mutation-resolved', approvalId: id, token });
+      refreshCollections();
       await report(async () => result);
     } catch (error) {
       dispatch({ type: 'approval-mutation-failed', approvalId: id, token });
@@ -1716,7 +1772,18 @@ function ApprovalsPage({
           items.map((item) => (
             <div className="approval-board-row" key={item.id}>
               <ApprovalRow item={item} />
-              <div>
+              {item.projectId ? (
+                <a
+                  className="button button-primary"
+                  href={`#/workspace/${encodeURIComponent(item.projectId)}`}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    navigate('workspace', item.projectId);
+                  }}
+                >
+                  前往审核
+                </a>
+              ) : <div>
                 <button
                   className="button button-secondary"
                   disabled={pending[item.id] !== undefined}
@@ -1731,7 +1798,7 @@ function ApprovalsPage({
                 >
                   批准
                 </button>
-              </div>
+              </div>}
             </div>
           ))
         ) : (
@@ -1748,6 +1815,7 @@ function MemoryPage({
   availability,
   dispatch,
   nextMutationToken,
+  refreshCollections,
   report,
 }: {
   adapter: DesktopAdapter;
@@ -1755,6 +1823,7 @@ function MemoryPage({
   availability: CollectionAvailability;
   dispatch: (action: WorkbenchAction) => void;
   nextMutationToken: () => number;
+  refreshCollections: () => void;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
@@ -1772,6 +1841,7 @@ function MemoryPage({
         token,
         status: result.status,
       });
+      refreshCollections();
     } catch (error) {
       dispatch({ type: 'memory-mutation-failed', memoryId: id, token });
       await report(async () => {

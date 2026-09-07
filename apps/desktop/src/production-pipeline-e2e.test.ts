@@ -11,6 +11,7 @@ import type { WorkflowWorkerGateway, WorkflowWorkerHealth } from './workflow-wor
 import {
   createNativePipeline,
   NativePptRpcRuntime,
+  parseNativePipelineAction,
   type NativePipelineAction,
   type NativePptPipeline,
 } from '../../worker/src/native-pipeline.js';
@@ -26,6 +27,9 @@ class ScriptedPptAppServer implements NativeAppServerTransport {
   hold = false;
   private line: ((line: string) => void) | null = null;
   private turn = 0;
+  constructor(private readonly outputs: readonly unknown[] = [
+    goldenSourceAnalysis(), goldenOutline(), goldenSlideSpecs(),
+  ]) {}
   async start(): Promise<void> {}
   async send(line: string): Promise<void> {
     const message = JSON.parse(line) as NativeJsonRpcMessage;
@@ -43,7 +47,7 @@ class ScriptedPptAppServer implements NativeAppServerTransport {
     }
     queueMicrotask(() => this.line?.(JSON.stringify({ id: message.id, result })));
     if (message.method === 'turn/start') {
-      const output = [goldenSourceAnalysis(), goldenOutline(), goldenSlideSpecs()][this.turn - 1];
+      const output = this.outputs[this.turn - 1];
       if (this.hold) return;
       const turn = this.turn;
       setTimeout(() => {
@@ -71,7 +75,7 @@ class DirectWorker implements WorkflowWorkerGateway {
     return { pipeline: this.runtime.create(input), writes: [], message: '已创建' };
   }
   async restoreProject(pipeline: NativePptPipeline) { return this.runtime.restore(pipeline); }
-  async executeProject(projectId: string, action: NativePipelineAction) { return this.runtime.execute(projectId, action); }
+  async executeProject(projectId: string, action: NativePipelineAction) { return this.runtime.execute(projectId, parseNativePipelineAction(action)); }
   async snapshotProject(projectId: string) { return this.runtime.snapshot(projectId); }
 }
 
@@ -127,6 +131,32 @@ function nativePersistenceHarness() {
 }
 
 describe('production-equivalent UI adapter → App Server → Worker → Rust persistence flow', () => {
+  it('accepts real-world legacy detail forms through strict Worker parsing and keeps them pending review after reload', async () => {
+    const raw = structuredClone(goldenSlideSpecs()) as unknown as Record<string, unknown>[];
+    raw[0] = { ...raw[0], body: '业务背景。\n\n建设目标。',
+      shapes: [{ id: 'concept-1', type: 'layeredDiagram', layers: ['入口', '业务'], note: '规划关系' }],
+      tables: [{ id: 'table-1', title: '层级数', columns: ['项目', '数量'], rows: [['层级', 2]], note: '材料结构计数' }],
+      sourceMap: [{ sourceId: 'source-report', locator: '第 1 页', targets: ['body'], note: '依据当前分析' }],
+    };
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer([goldenSourceAnalysis(), goldenOutline(), raw]);
+    const adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    await adapter.analyzeProject('project-e2e');
+    await adapter.generateOutline('project-e2e');
+    await adapter.approveOutline('project-e2e');
+    const before = structuredClone(native.state.pipeline);
+    await adapter.generateDetails('project-e2e');
+    const reopened = await createTauriDesktopAdapter(server, native.invoke, new DirectWorker()).loadProjectPipeline('project-e2e');
+    expect(reopened.slideSpecs?.version.status).toBe('draft');
+    expect(reopened.slideSpecs?.value[0]?.body).toEqual(['业务背景。\n\n建设目标。']);
+    expect(reopened.slideSpecs?.value[0]?.imageGenerationBrief).toContain('规划关系');
+    expect(reopened.project.workflowStatus).toBe('detail_review');
+    expect(reopened.approvals).toEqual(before.approvals);
+    expect(reopened.outline).toEqual(before.outline);
+    expect(reopened.tasks.at(-1)?.kind).toBe('detail_generation');
+    expect(native.state.files.has('slide-specs/slide-specs-v1.json')).toBe(true);
+    expect(server.prompts).toHaveLength(3);
+  });
   it.each(['analysis', 'outline', 'details'] as const)('keeps %s single-flight across subscriptions and completes only after durable commit', async (kind) => {
     const native = nativePersistenceHarness();
     const server = new ScriptedPptAppServer();
@@ -216,6 +246,90 @@ describe('production-equivalent UI adapter → App Server → Worker → Rust pe
     expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({ status: 'failed', pipeline: null });
     expect(server.prompts).toHaveLength(1);
     expect(native.state.files.size).toBe(0);
+  });
+
+  it('grounds a single-flight memory proposal in the approved snapshot and holds it through native persistence', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer([
+      goldenSourceAnalysis(), goldenOutline(), goldenSlideSpecs(),
+      { title: '图表优先', content: '数据页优先使用已批准图表风格' },
+    ]);
+    let persistenceEntered = false;
+    let releasePersistence!: () => void;
+    const adapter = createTauriDesktopAdapter(server, async (command, args) => {
+      if (command === 'memory_propose') {
+        persistenceEntered = true;
+        await new Promise<void>((resolve) => { releasePersistence = resolve; });
+      }
+      return native.invoke(command, args);
+    }, new DirectWorker());
+    await adapter.analyzeProject('project-e2e');
+    await adapter.generateOutline('project-e2e');
+    await adapter.approveOutline('project-e2e');
+    await adapter.generateDetails('project-e2e');
+    await adapter.approveDetails('project-e2e');
+    const [approvedSlide, draftSlide] = goldenSlideSpecs();
+    const background = new Uint8Array(await readFile(resolve('../..', 'fixtures/golden-project/sources/market-background.png')));
+    await adapter.replaceVisual('project-e2e', approvedSlide!.id,
+      Buffer.from(createDistinctApprovedVisual(background, 0)).toString('base64'),
+      '已批准的图表视觉决策');
+    await adapter.approveVisual('project-e2e', approvedSlide!.id);
+    await adapter.replaceVisual('project-e2e', draftSlide!.id,
+      Buffer.from(createDistinctApprovedVisual(background, 1)).toString('base64'),
+      '未批准的草稿视觉不应进入快照');
+
+    const first = adapter.proposeProjectMemory('project-e2e');
+    const duplicate = adapter.proposeProjectMemory('project-e2e');
+    expect(duplicate).toBe(first);
+    await vi.waitFor(() => expect(persistenceEntered).toBe(true));
+    expect(server.prompts).toHaveLength(4);
+    expect(server.prompts[3]).toContain('五页经营复盘');
+    expect(server.prompts[3]).toContain('project-e2e-slide-specs-v1');
+    expect(server.prompts[3]).toContain('已批准的图表视觉决策');
+    expect(server.prompts[3]).not.toContain('未批准的草稿视觉不应进入快照');
+    expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({
+      kind: 'memory', status: 'running', pipeline: null, result: null,
+    });
+
+    releasePersistence();
+    await expect(first).resolves.toEqual({ status: '偏好建议等待用户批准' });
+    expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({
+      kind: 'memory', status: 'completed', pipeline: null,
+      result: { status: '偏好建议等待用户批准' },
+    });
+    expect(native.invoke).toHaveBeenCalledWith('memory_propose', {
+      title: '图表优先', content: '数据页优先使用已批准图表风格',
+    });
+  });
+
+  it('retains memory persistence failure and spends another turn only after explicit retry', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer([
+      { title: '简洁表达', content: '保持简洁' },
+      { title: '简洁表达', content: '保持简洁' },
+    ]);
+    let failPersistence = true;
+    const adapter = createTauriDesktopAdapter(server, async (command, args) => {
+      if (command === 'memory_propose' && failPersistence) throw new Error('偏好建议写入失败');
+      return native.invoke(command, args);
+    }, new DirectWorker());
+
+    await expect(adapter.proposeProjectMemory('project-e2e')).rejects.toThrow('偏好建议写入失败');
+    expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({
+      kind: 'memory', status: 'failed', error: '偏好建议写入失败', result: null,
+    });
+    expect(server.prompts).toHaveLength(1);
+    await Promise.resolve();
+    expect(server.prompts).toHaveLength(1);
+
+    failPersistence = false;
+    await expect(adapter.proposeProjectMemory('project-e2e')).resolves.toEqual({
+      status: '偏好建议等待用户批准',
+    });
+    expect(server.prompts).toHaveLength(2);
+    expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({
+      kind: 'memory', status: 'completed', error: null,
+    });
   });
 
   it('persists document edits, page order and references across restart and rejects editing a frozen outline', async () => {

@@ -1,4 +1,5 @@
 import type { NativePptPipeline, NativePromptContext } from '../../worker/src/native-pipeline.js';
+import { DETAIL_SPEC_CONTRACT } from '../../worker/src/slide-spec-contract.js';
 
 export type PptPromptStage = 'analysis' | 'outline' | 'details';
 
@@ -51,6 +52,7 @@ export function buildPptPrompt(pipeline: NativePptPipeline, stage: PptPromptStag
     details: [
       '依据下方 approvedOutline 和 currentAnalysis 指定的当前分析产物生成全部页面细化。',
       '只返回严格 JSON 数组，每页：{id,title,body,findingIds,dataPointIds,tables,charts,shapes,sourceMap,imageGenerationBrief}。',
+      DETAIL_SPEC_CONTRACT,
       '保持已批准大纲的页序、id、标题和页面目的；补充说明不能覆盖已批准内容。文案和数据必须有 sourceMap。',
     ],
   }[stage];

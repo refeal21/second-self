@@ -87,6 +87,12 @@ export function NativeWorkspacePage({
     if (next?.status === 'running') {
       setError('');
       setNotice('');
+    } else if (next?.status === 'completed' && next.kind === 'memory') {
+      const status = memoryGenerationStatus(next);
+      if (status) {
+        setError('');
+        setNotice(status);
+      }
     } else if (next?.status === 'completed' && next.pipeline) {
       if (applyPipeline(next.pipeline, true)) {
         setError('');
@@ -263,6 +269,17 @@ export function NativeWorkspacePage({
     }
     setError('');
     setPreviewState('ready');
+  };
+
+  const proposeMemory = async () => {
+    if (busy) return;
+    setError(''); setNotice('');
+    try {
+      const result = await adapter.proposeProjectMemory(projectId);
+      if (mounted.current) setNotice(result.status);
+    } catch (reason) {
+      if (mounted.current) setError(reason instanceof Error ? reason.message : String(reason));
+    }
   };
 
   return (
@@ -444,17 +461,12 @@ export function NativeWorkspacePage({
           <h2>真实检查点</h2>
           <p>状态：{status}</p><p>任务记录：{pipeline.tasks.length}</p>
           <p>审批记录：{pipeline.approvals.length}</p>
+          <p>逐页细化审核：{pipeline.slideSpecs
+            ? '已就绪'
+            : '未就绪（detail_review 仅表示已进入该阶段，不代表细化内容已生成）'}</p>
           <p>产物哈希：{pipeline.exportReceipt?.sha256 ?? '尚无'}</p>
-          <button className="button button-secondary" disabled={busy || pipeline.approvals.length === 0} onClick={() => void (async () => {
-            setLocalBusy(true); setError('');
-            try {
-              const result = await adapter.proposeProjectMemory(projectId);
-              if (mounted.current) setNotice(result.status);
-            } catch (reason) {
-              if (mounted.current) setError(reason instanceof Error ? reason.message : String(reason));
-            }
-            finally { if (mounted.current) setLocalBusy(false); }
-          })()}>请 AI 提议可复用偏好</button>
+          <button className="button button-secondary" disabled={busy || pipeline.approvals.length === 0}
+            onClick={() => void proposeMemory()}>{memoryActionLabel(generation)}</button>
         </aside>
       </div>
     </main>
@@ -537,11 +549,13 @@ function stageLabel(stage: string): string {
 
 function generationRunningLabel(generation: ProjectGeneration | null): string {
   if (generation?.status !== 'running') return '';
-  return ({ analysis: '正在分析材料', outline: '正在生成整份大纲', details: '正在生成逐页细化' })[generation.kind];
+  return ({ analysis: '正在分析材料', outline: '正在生成整份大纲', details: '正在生成逐页细化',
+    memory: '正在提议可复用偏好' })[generation.kind];
 }
 
 function generationSuccessLabel(kind: ProjectGeneration['kind']): string {
-  return ({ analysis: '材料分析已保存。', outline: '整份大纲已生成，等待你审核。', details: '全部页面细化已生成。' })[kind];
+  return ({ analysis: '材料分析已保存。', outline: '整份大纲已生成，等待你审核。',
+    details: '全部页面细化已生成。', memory: '偏好建议已提交。' })[kind];
 }
 
 function generationActionLabel(
@@ -550,9 +564,19 @@ function generationActionLabel(
   idle: string,
 ): string {
   if (generation?.kind !== kind) return idle;
-  if (generation.status === 'running') return ({ analysis: '正在分析材料…', outline: '正在生成整份大纲…', details: '正在生成逐页细化…' })[kind];
-  if (generation.status === 'failed') return ({ analysis: '重试分析材料', outline: '重试生成整份大纲', details: '重试生成逐页细化' })[kind];
+  if (generation.status === 'running') return ({ analysis: '正在分析材料…', outline: '正在生成整份大纲…',
+    details: '正在生成逐页细化…', memory: '正在提议可复用偏好…' })[kind];
+  if (generation.status === 'failed') return ({ analysis: '重试分析材料', outline: '重试生成整份大纲',
+    details: '重试生成逐页细化', memory: '重试提议可复用偏好' })[kind];
   return idle;
+}
+
+function memoryActionLabel(generation: ProjectGeneration | null): string {
+  return generationActionLabel('memory', generation, '请 AI 提议可复用偏好');
+}
+
+function memoryGenerationStatus(generation: ProjectGeneration): string {
+  return generation.kind === 'memory' ? generation.result?.status ?? '' : '';
 }
 
 function generationMatchesPipeline(
@@ -560,6 +584,7 @@ function generationMatchesPipeline(
   pipeline: NativePptPipeline | null,
 ): boolean {
   if (!generation || !pipeline) return Boolean(generation);
+  if (generation.kind === 'memory') return true;
   const expected = pipeline.project.workflowStatus === 'intake' ? 'analysis'
     : pipeline.project.workflowStatus === 'source_analysis' ? 'outline'
       : pipeline.project.workflowStatus === 'detail_review' && !pipeline.slideSpecs ? 'details'

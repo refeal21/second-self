@@ -14,7 +14,9 @@ import type {
 import type { PptOutline, SlideSpec, SourceAnalysis } from '../../worker/src/ppt-project.js';
 import { TauriCodexTransport } from './codex-transport.js';
 import { buildPptPrompt, promptContextError } from './ppt-prompts.js';
+import { normalizeGeneratedSlideSpecs } from '../../worker/src/slide-spec-contract.js';
 import { ProjectGenerationRegistry, type ProjectGeneration } from './project-generation.js';
+import { derivePendingPptApprovals } from './collection-read-model.js';
 import {
   TauriWorkflowWorkerClient,
   type WorkflowWorkerGateway,
@@ -44,6 +46,7 @@ export interface ProjectSummary {
 }
 export interface ApprovalSummary {
   id: string;
+  projectId?: string;
   title: string;
   detail: string;
   author: string;
@@ -86,6 +89,14 @@ export interface DesktopInitialState {
   };
   settings: DesktopSettings;
 }
+export interface DesktopCollectionSnapshot {
+  approvals: ApprovalSummary[];
+  memories: MemorySummary[];
+  availability: {
+    approvals: CollectionAvailability;
+    memories: CollectionAvailability;
+  };
+}
 export interface PendingTaskInteraction {
   requestId: number | string;
   kind: 'command_approval' | 'file_change_approval' | 'user_input';
@@ -117,6 +128,7 @@ export interface DesktopAdapter {
   readonly initialState: DesktopInitialState;
   loadInitialState(): Promise<DesktopInitialState>;
   listProjects(): Promise<ProjectSummary[]>;
+  loadCollections?(): Promise<DesktopCollectionSnapshot>;
   connectAccount(): Promise<AccountSummary>;
   subscribeConnection(listener: (state: ConnectionSummary) => void): () => void;
   startLogin(): Promise<{ message: string; authUrl: string }>;
@@ -413,6 +425,19 @@ class TauriDesktopAdapter implements DesktopAdapter {
     return state.projects;
   }
 
+  async loadCollections(): Promise<DesktopCollectionSnapshot> {
+    // Collection refresh is intentionally a read-only native boundary. Loading
+    // a pipeline through loadProjectPipeline would also restore Worker state.
+    const state = await this.callNative<DesktopInitialState>('load_desktop_state', undefined);
+    const pipelines = await Promise.all(state.projects.map(({ id }) =>
+      this.callNative<NativePptPipeline>('ppt_load_pipeline', { projectId: id })));
+    return {
+      approvals: derivePendingPptApprovals(pipelines),
+      memories: structuredClone(state.memories),
+      availability: { approvals: 'loaded', memories: state.collections.memories },
+    };
+  }
+
   async connectAccount(): Promise<AccountSummary> {
     const generation = this.connectionGeneration;
     const revision = ++this.accountRevision;
@@ -557,7 +582,8 @@ class TauriDesktopAdapter implements DesktopAdapter {
         throw new Error('请先批准整份大纲，并在逐页细化阶段生成内容。');
       }
       if (pipeline.slideSpecs) throw new Error('已有逐页细化，请审核或保存修改，不要重复生成。');
-      const specs = await this.runStructured<readonly SlideSpec[]>(projectId, buildPptPrompt(pipeline, 'details'));
+      const output = await this.runStructured<unknown>(projectId, buildPptPrompt(pipeline, 'details'));
+      const specs = normalizeGeneratedSlideSpecs(output, pipeline.outline.value, pipeline.analysis!.output);
       return this.applyPipeline(projectId, pipeline, { kind: 'details.submit', at: new Date().toISOString(), specs });
     });
   }
@@ -593,13 +619,15 @@ class TauriDesktopAdapter implements DesktopAdapter {
       kind: 'deck.qa', at: new Date().toISOString(), preparation,
     });
   }
-  async proposeProjectMemory(projectId: string): Promise<{ status: string }> {
-    const proposal = await this.runStructured<{ title: string; content: string }>(projectId, [
-      '根据这个 PPT 项目的已批准大纲、细化和视觉决策，提议一条未来可复用的工作偏好。',
-      '只返回严格 JSON：{title,content}。不要 Markdown。',
-      '这只是建议，必须由用户后续明确批准，不要声称已保存为记忆。',
-    ].join('\n'));
-    return this.callNative('memory_propose', proposal);
+  proposeProjectMemory(projectId: string): Promise<{ status: string }> {
+    return this.generations.run(projectId, 'memory', async () => {
+      const pipeline = await this.loadProjectPipeline(projectId);
+      const proposal = await this.runStructured<{ title: string; content: string }>(
+        projectId,
+        memoryProposalPrompt(pipeline),
+      );
+      return this.callNative('memory_propose', proposal);
+    });
   }
   renameProject(projectId: string, name: string): Promise<{ status: string }> { return this.callNative('ppt_rename_project', { projectId, name }); }
   async regenerateSlide(projectId: string, slide: number, comment: string): Promise<RegenerateResult> {
@@ -796,6 +824,38 @@ function formatUsage(usage: Record<string, unknown> | null): string {
   if (tokens === null) return '等待 App Server 使用量更新';
   return context === null ? `${tokens} tokens` : `${tokens} / ${context} tokens`;
 }
+
+function memoryProposalPrompt(pipeline: NativePptPipeline): string {
+  const approvedVisuals = Object.values(pipeline.visuals).flatMap((versions) => versions
+    .filter(({ version }) => version.status === 'frozen')
+    .map(({ slideId, version, relativePath, usage, textFree, altText }) => ({
+      slideId, versionId: version.id, approvedAt: version.frozenAt,
+      relativePath, usage, textFree, altText,
+    })));
+  const approvedSnapshot = {
+    project: {
+      id: pipeline.project.id,
+      name: pipeline.project.name,
+      goal: pipeline.project.goal,
+      workflowStatus: pipeline.project.workflowStatus,
+      revision: pipeline.revision,
+    },
+    savedInstructions: pipeline.promptContext ?? null,
+    approvedOutline: pipeline.outline?.version.status === 'frozen' ? pipeline.outline : null,
+    approvedSlideSpecs: pipeline.slideSpecs?.version.status === 'frozen' ? pipeline.slideSpecs : null,
+    approvedVisuals,
+    approvedDecisions: pipeline.approvals.filter(({ status }) => status === 'approved'),
+    passedQa: pipeline.qaReport?.status === 'passed' ? pipeline.qaReport : null,
+  };
+  return [
+    '根据下方由 Rust 加载的真实 PPT 项目检查点，提议一条未来可复用的工作偏好。',
+    '只根据明确批准或冻结的内容归纳工作方式；不要把项目事实、指标或专有名称写成长期偏好。',
+    '只返回严格 JSON：{title,content}。不要 Markdown。',
+    '这只是建议，必须由用户后续明确批准，不要声称已保存为记忆。',
+    JSON.stringify(approvedSnapshot, null, 2),
+  ].join('\n');
+}
+
 function cloneTask(task: TaskSummary): TaskSummary { return structuredClone(task); }
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;

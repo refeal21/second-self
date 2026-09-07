@@ -1,6 +1,8 @@
 import type { NativePptPipeline } from '../../worker/src/native-pipeline.js';
 
-export type ProjectGenerationKind = 'analysis' | 'outline' | 'details';
+export type ProjectGenerationKind = 'analysis' | 'outline' | 'details' | 'memory';
+export interface ProjectMemoryProposalResult { status: string }
+export type ProjectGenerationResult = NativePptPipeline | ProjectMemoryProposalResult;
 export interface ProjectGeneration {
   projectId: string;
   operationId: string;
@@ -10,6 +12,7 @@ export interface ProjectGeneration {
   updatedAt: string;
   error: string | null;
   pipeline: NativePptPipeline | null;
+  result: ProjectMemoryProposalResult | null;
 }
 type Listener = (state: ProjectGeneration | null) => void;
 
@@ -17,7 +20,7 @@ type Listener = (state: ProjectGeneration | null) => void;
  * not a promise of continuing generation after the application exits. */
 export class ProjectGenerationRegistry {
   private readonly states = new Map<string, ProjectGeneration>();
-  private readonly active = new Map<string, { kind: ProjectGenerationKind; promise: Promise<NativePptPipeline> }>();
+  private readonly active = new Map<string, { kind: ProjectGenerationKind; promise: Promise<ProjectGenerationResult> }>();
   private readonly listeners = new Map<string, Set<Listener>>();
   private counter = 0;
 
@@ -36,7 +39,12 @@ export class ProjectGenerationRegistry {
     };
   }
 
-  run(projectId: string, kind: ProjectGenerationKind, operation: () => Promise<NativePptPipeline>): Promise<NativePptPipeline> {
+  run(projectId: string, kind: Exclude<ProjectGenerationKind, 'memory'>,
+    operation: () => Promise<NativePptPipeline>): Promise<NativePptPipeline>;
+  run(projectId: string, kind: 'memory',
+    operation: () => Promise<ProjectMemoryProposalResult>): Promise<ProjectMemoryProposalResult>;
+  run(projectId: string, kind: ProjectGenerationKind,
+    operation: () => Promise<ProjectGenerationResult>): Promise<ProjectGenerationResult> {
     const pending = this.active.get(projectId);
     if (pending) return pending.kind === kind
       ? pending.promise
@@ -44,13 +52,15 @@ export class ProjectGenerationRegistry {
     const at = new Date().toISOString();
     const state: ProjectGeneration = {
       projectId, kind, operationId: `generation-${++this.counter}`, status: 'running',
-      startedAt: at, updatedAt: at, error: null, pipeline: null,
+      startedAt: at, updatedAt: at, error: null, pipeline: null, result: null,
     };
     // Install the single-flight lock before both the first await and notification.
-    const promise = Promise.resolve().then(operation).then((pipeline) => {
+    const promise = Promise.resolve().then(operation).then((result) => {
       this.active.delete(projectId);
-      this.publish({ ...state, status: 'completed', updatedAt: new Date().toISOString(), pipeline });
-      return pipeline;
+      this.publish({ ...state, status: 'completed', updatedAt: new Date().toISOString(),
+        result: kind === 'memory' ? result as ProjectMemoryProposalResult : null,
+        pipeline: kind === 'memory' ? null : result as NativePptPipeline });
+      return result;
     }, (error: unknown) => {
       this.active.delete(projectId);
       this.publish({ ...state, status: 'failed', updatedAt: new Date().toISOString(),

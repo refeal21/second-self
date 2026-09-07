@@ -90,4 +90,48 @@ describe('project generation lifetime', () => {
     await first;
     expect(operation).toHaveBeenCalledTimes(1);
   });
+
+  it('keeps a memory proposal single-flight until its persisted result is available', async () => {
+    const registry = new ProjectGenerationRegistry();
+    const persisted = deferred<{ status: string }>();
+    const operation = vi.fn(() => persisted.promise);
+
+    const first = registry.run('p1', 'memory', operation);
+    const duplicate = registry.run('p1', 'memory', operation);
+
+    expect(duplicate).toBe(first);
+    expect(registry.get('p1')).toMatchObject({
+      kind: 'memory', status: 'running', pipeline: null, result: null,
+    });
+    await Promise.resolve();
+    expect(operation).toHaveBeenCalledOnce();
+
+    persisted.resolve({ status: '偏好建议已持久化' });
+    await expect(first).resolves.toEqual({ status: '偏好建议已持久化' });
+    expect(registry.get('p1')).toMatchObject({
+      kind: 'memory', status: 'completed', pipeline: null,
+      result: { status: '偏好建议已持久化' },
+    });
+  });
+
+  it('replays memory persistence failures and starts a new attempt only on explicit retry', async () => {
+    const registry = new ProjectGenerationRegistry();
+    const operation = vi.fn()
+      .mockRejectedValueOnce(new Error('偏好建议写入失败'))
+      .mockResolvedValueOnce({ status: '重试后已保存' });
+
+    await expect(registry.run('p1', 'memory', operation)).rejects.toThrow('偏好建议写入失败');
+    const failedId = registry.get('p1')!.operationId;
+    const returned = vi.fn();
+    registry.subscribe('p1', returned);
+    expect(returned).toHaveBeenLastCalledWith(expect.objectContaining({
+      kind: 'memory', status: 'failed', error: '偏好建议写入失败', result: null,
+    }));
+    expect(operation).toHaveBeenCalledOnce();
+
+    await expect(registry.run('p1', 'memory', operation)).resolves.toEqual({ status: '重试后已保存' });
+    expect(operation).toHaveBeenCalledTimes(2);
+    expect(registry.get('p1')).toMatchObject({ kind: 'memory', status: 'completed' });
+    expect(registry.get('p1')!.operationId).not.toBe(failedId);
+  });
 });

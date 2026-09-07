@@ -8,6 +8,7 @@ import {
   type NativeJsonRpcMessage,
 } from './desktop-adapter.js';
 import { TauriCodexTransport, type TauriBridge } from './codex-transport.js';
+import { createNativePipeline } from '../../worker/src/native-pipeline.js';
 import type { WorkflowWorkerGateway } from './workflow-worker-client.js';
 
 class ScriptedNativeServer implements NativeAppServerTransport {
@@ -442,6 +443,63 @@ describe('native desktop general-task bridge', () => {
     expect(transport.sent).toHaveLength(sentBefore);
     expect(states).toHaveLength(1);
     expect(states[0]?.account).toEqual({ email: 'person@example.com', plan: 'plus', status: 'connected' });
+  });
+
+  it('refreshes memories and derives approvals from ready pipeline drafts without starting services', async () => {
+    const transport = new ScriptedNativeServer();
+    const persisted = structuredClone(createDemoDesktopAdapter().initialState);
+    persisted.projects = [{
+      id: 'project-review', name: '真实待审核项目', goal: '审核真实草稿',
+      stage: '逐页细化', progress: 40, updatedAt: '刚刚',
+    }];
+    persisted.approvals = [{
+      id: 'historical-approved', title: '历史记录', detail: '不应作为待处理项',
+      author: '本机用户', time: '昨天',
+    }];
+    persisted.memories = [{
+      id: 'proposal-saved', title: '已落盘建议', content: '不用再次生成即可看到', status: '待决定',
+    }];
+    const draft = createNativePipeline({
+      id: 'project-review', name: '真实待审核项目', goal: '审核真实草稿',
+      createdAt: '2026-09-07T02:00:00.000Z',
+    });
+    draft.project.workflowStatus = 'detail_review';
+    draft.slideSpecs = {
+      version: {
+        id: 'project-review-slide-specs-v1', projectId: 'project-review', sequence: 1,
+        status: 'draft', createdAt: '2026-09-07T03:00:00.000Z', frozenAt: null,
+      },
+      value: [],
+    };
+    const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'load_desktop_state') return persisted;
+      if (command === 'ppt_load_pipeline' && args?.projectId === 'project-review') return draft;
+      throw new Error(`Unexpected native command: ${command}`);
+    });
+    const worker: WorkflowWorkerGateway = {
+      health: vi.fn(async () => ({
+        protocolVersion: 1 as const, worker: 'digital-twin-workflow-worker' as const,
+        status: 'ready' as const,
+      })),
+      createProject: vi.fn(async () => ({} as never)),
+      restoreProject: vi.fn(async (pipeline) => pipeline),
+      executeProject: vi.fn(async () => ({} as never)),
+      snapshotProject: vi.fn(async () => ({} as never)),
+    };
+    const adapter = createTauriDesktopAdapter(transport, invoke, worker);
+
+    await expect(adapter.loadCollections?.()).resolves.toEqual({
+      approvals: [{
+        id: 'ppt-review:project-review:details:project-review-slide-specs-v1',
+        projectId: 'project-review', title: '真实待审核项目', detail: '全部页面细化待审核',
+        author: 'PPT 工作流', time: '2026-09-07T02:00:00.000Z',
+      }],
+      memories: persisted.memories,
+      availability: { approvals: 'loaded', memories: 'loaded' },
+    });
+    expect(transport.sent).toEqual([]);
+    expect(worker.health).not.toHaveBeenCalled();
+    expect(worker.restoreProject).not.toHaveBeenCalled();
   });
 
   it('loads persisted collections through the native command boundary', async () => {

@@ -545,6 +545,24 @@ p {
   font-size: 12px;
   white-space: nowrap;
 }
+.dashboard-aside .approval-row {
+  grid-template-areas:
+    "icon content"
+    ". time";
+  grid-template-columns: 34px minmax(0, 1fr);
+  row-gap: 4px;
+}
+.dashboard-aside .approval-row > .icon {
+  grid-area: icon;
+}
+.dashboard-aside .approval-row > div {
+  grid-area: content;
+  min-width: 0;
+}
+.dashboard-aside .approval-row time {
+  grid-area: time;
+  padding-top: 0;
+}
 .codex-status {
   margin-top: 24px;
 }

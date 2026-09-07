@@ -61,6 +61,22 @@ export type WorkbenchAction =
   | { type: 'state-loaded'; state: DesktopInitialState }
   | { type: 'projects-loaded'; projects: ProjectSummary[] }
   | { type: 'projects-availability'; availability: CollectionAvailability }
+  | {
+      type: 'collection-availability';
+      collection: 'approvals' | 'memories';
+      availability: CollectionAvailability;
+    }
+  | {
+      type: 'collections-loaded';
+      collections: {
+        approvals: ApprovalSummary[];
+        memories: MemorySummary[];
+        availability: {
+          approvals: CollectionAvailability;
+          memories: CollectionAvailability;
+        };
+      };
+    }
   | { type: 'connection-updated'; connection: ConnectionSummary }
   | { type: 'project-selected'; projectId: string }
   | { type: 'project-created'; project: ProjectSummary }
@@ -137,6 +153,25 @@ export function workbenchReducer(
       };
     case 'projects-availability':
       return { ...state, collections: { ...state.collections, projects: action.availability } };
+    case 'collection-availability':
+      return {
+        ...state,
+        collections: { ...state.collections, [action.collection]: action.availability },
+      };
+    case 'collections-loaded':
+      return {
+        ...state,
+        approvals: structuredClone(action.collections.approvals),
+        memories: action.collections.memories.map((memory) => ({
+          ...structuredClone(memory),
+          pendingToken: state.memories.find(({ id }) => id === memory.id)?.pendingToken ?? null,
+        })),
+        collections: {
+          ...state.collections,
+          approvals: action.collections.availability.approvals,
+          memories: action.collections.availability.memories,
+        },
+      };
     case 'connection-updated':
       return { ...state, account: action.connection.account, runtime: action.connection.runtime };
     case 'project-selected':

@@ -24,6 +24,9 @@ function detailPipeline(projectId: string, revision = 1, completed = false): Nat
   pipeline.outline = { version: { id: `${projectId}-outline-v1`, projectId, sequence: 1,
     status: 'frozen', createdAt: pipeline.project.createdAt, frozenAt: pipeline.project.createdAt },
   value: { title: '经营复盘', slides: [{ id: 'slide-1', title: '封面', purpose: '开场', sourceIds: [] }] } };
+  pipeline.approvals = [{ id: `${projectId}-outline-approval`, projectId,
+    versionId: pipeline.outline.version.id, stage: 'outline_review', status: 'approved',
+    decidedAt: pipeline.project.createdAt }];
   if (completed) pipeline.slideSpecs = { version: { id: `${projectId}-details-v1`, projectId,
     sequence: 1, status: 'draft', createdAt: pipeline.project.createdAt, frozenAt: null }, value: [{
       id: 'slide-1', title: '封面', body: ['关键结论'], tables: [], charts: [], shapes: [], sourceMap: [],
@@ -36,16 +39,22 @@ function harness(projectIds = ['project-a']) {
   const saved = new Map(projectIds.map((id) => [id, detailPipeline(id)]));
   const registry = new ProjectGenerationRegistry();
   const attempts = new Map<string, ReturnType<typeof deferred<NativePptPipeline>>[]>();
+  const memoryAttempts = new Map<string, ReturnType<typeof deferred<{ status: string }>>[]>();
   const generateDetails = vi.fn((projectId: string) => {
     const job = deferred<NativePptPipeline>();
     attempts.set(projectId, [...attempts.get(projectId) ?? [], job]);
     return registry.run(projectId, 'details', () => job.promise);
   });
+  const proposeProjectMemory = vi.fn((projectId: string) => {
+    const job = deferred<{ status: string }>();
+    memoryAttempts.set(projectId, [...memoryAttempts.get(projectId) ?? [], job]);
+    return registry.run(projectId, 'memory', () => job.promise);
+  });
   const adapter = { ...createDemoDesktopAdapter(), mode: 'tauri' as const,
     loadProjectPipeline: vi.fn(async (projectId: string) => structuredClone(saved.get(projectId)!)),
     getProjectGeneration: (projectId: string) => registry.get(projectId),
     subscribeProjectGeneration: (projectId: string, listener: Parameters<ProjectGenerationRegistry['subscribe']>[1]) =>
-      registry.subscribe(projectId, listener), generateDetails,
+      registry.subscribe(projectId, listener), generateDetails, proposeProjectMemory,
   } as DesktopAdapter;
   const mount = (projectId = projectIds[0]!) => render(<NativeWorkspacePage adapter={adapter}
     projectId={projectId} projectName={`项目 ${projectId}`} projectGoal="管理层决策" onBack={() => {}} />);
@@ -54,7 +63,7 @@ function harness(projectIds = ['project-a']) {
     attempts.get(projectId)![attempt]!.resolve(structuredClone(next));
     return next;
   };
-  return { adapter, registry, attempts, mount, finish, saved };
+  return { adapter, registry, attempts, memoryAttempts, mount, finish, saved };
 }
 
 describe('native generation lifecycle review', () => {
@@ -187,5 +196,47 @@ describe('native generation lifecycle review', () => {
     a.unmount();
     test.mount('project-b');
     expect(await screen.findByRole('button', { name: '生成逐页细化' })).toBeEnabled();
+  });
+
+  it('replays a running memory proposal after navigation and reports its persisted result', async () => {
+    const test = harness();
+    const first = test.mount();
+    fireEvent.click(await screen.findByRole('button', { name: '请 AI 提议可复用偏好' }));
+    expect(screen.getByRole('button', { name: '正在提议可复用偏好…' })).toBeDisabled();
+    first.unmount();
+
+    test.mount();
+    expect(await screen.findByRole('status')).toHaveTextContent('正在提议可复用偏好');
+    expect(test.adapter.proposeProjectMemory).toHaveBeenCalledOnce();
+    test.memoryAttempts.get('project-a')![0]!.resolve({ status: '偏好建议已持久化' });
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('偏好建议已持久化'));
+  });
+
+  it('replays memory persistence failure and retries only after an explicit click', async () => {
+    const test = harness();
+    const first = test.mount();
+    fireEvent.click(await screen.findByRole('button', { name: '请 AI 提议可复用偏好' }));
+    first.unmount();
+    test.memoryAttempts.get('project-a')![0]!.reject(new Error('偏好建议写入失败'));
+    await waitFor(() => expect(test.registry.get('project-a')?.status).toBe('failed'));
+
+    test.mount();
+    expect(await screen.findByRole('alert')).toHaveTextContent('偏好建议写入失败');
+    expect(test.adapter.proposeProjectMemory).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole('button', { name: '重试提议可复用偏好' }));
+    expect(test.adapter.proposeProjectMemory).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('button', { name: '正在提议可复用偏好…' })).toBeDisabled();
+  });
+
+  it('does not confuse entering detail_review with having reviewable slide details', async () => {
+    const test = harness();
+    const first = test.mount();
+    expect(await screen.findByText(/逐页细化审核：未就绪/)).toHaveTextContent(
+      'detail_review 仅表示已进入该阶段，不代表细化内容已生成',
+    );
+    first.unmount();
+    test.saved.set('project-a', detailPipeline('project-a', 2, true));
+    test.mount();
+    expect(await screen.findByText('逐页细化审核：已就绪')).toBeVisible();
   });
 });

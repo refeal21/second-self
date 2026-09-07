@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { once } from 'node:events';
@@ -308,6 +309,11 @@ async function main(): Promise<void> {
       goal: '使用真实本地服务边界交付可编辑 PPTX',
     });
     record('create-project');
+    await adapter.saveProjectContext(project.id, {
+      taskBrief: '面向管理层，强调经营价值与下一步决策',
+      sourceInstructions: {}, outlineRequirements: '',
+    });
+    record('save-task-brief-before-attachments');
     const sourceFiles = [
       ['management-memo.pdf', 'application/pdf'],
       ['kpis.csv', 'text/csv'],
@@ -335,14 +341,42 @@ async function main(): Promise<void> {
       if (!attached) throw new Error(`Attached source metadata missing for ${fileName}`);
       return [canonical, attached.id];
     }));
+    const promptContext = {
+      taskBrief: '面向管理层，强调经营价值与下一步决策',
+      sourceInstructions: { [sourceMapping['source-style']!]: '只参考视觉风格，不采用其中数字' },
+      outlineRequirements: '五页，先结论再展开证据',
+    };
+    pipeline = await adapter.saveProjectContext(project.id, promptContext);
+    record('save-file-purpose-and-outline-requirements', pipeline);
+    await rust.call('harness.restart');
+    await worker.restart();
+    pipeline = await adapter.loadProjectPipeline(project.id);
+    assert.deepEqual(pipeline.promptContext, promptContext);
+    record('restore-prompt-context-from-sqlite-and-embedded-worker', pipeline);
     const analysis = remapSourceIds(goldenSourceAnalysis(), sourceMapping);
     const generatedOutline = remapSourceIds(goldenOutline(), sourceMapping);
     const generatedSpecs = remapSourceIds(goldenSlideSpecs(), sourceMapping);
-    const scripted = codexTransport([analysis, generatedOutline, generatedSpecs]);
+    const scripted = codexTransport([analysis, analysis, generatedOutline, generatedSpecs]);
     adapter = createTauriDesktopAdapter(scripted, (command, args) => rust.call(command, args), worker);
 
     pipeline = await adapter.analyzeProject(project.id);
     record('source-analysis', pipeline);
+    pipeline = await adapter.saveProjectContext(project.id, {
+      ...promptContext, taskBrief: `${promptContext.taskBrief}；补充新的参考材料后重新分析`,
+    });
+    record('reset-analysis-after-context-change', pipeline);
+    pipeline = await adapter.attachSource(project.id, {
+      fileName: 'supplement.txt', mediaType: 'text/plain',
+      contentsBase64: Buffer.from('补充说明：沿用正式材料中的可验证事实。').toString('base64'),
+    });
+    await rust.call('harness.restart');
+    await worker.restart();
+    pipeline = await adapter.loadProjectPipeline(project.id);
+    assert.equal(pipeline.sources.length, 5);
+    assert.equal(pipeline.project.workflowStatus, 'intake');
+    record('restore-after-reset-and-additional-attachment', pipeline);
+    pipeline = await adapter.analyzeProject(project.id);
+    record('reanalyze-after-additional-attachment', pipeline);
     pipeline = await adapter.generateOutline(project.id);
     const editedOutline = structuredClone(pipeline.outline!.value);
     editedOutline.slides[0]!.title = '用户编辑：2026 年经营复盘与增长计划';

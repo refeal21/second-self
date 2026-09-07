@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import {
   NativePptRpcRuntime,
   createNativePipeline,
+  parseNativePipelineAction,
   type NativePptPipeline,
 } from './native-pipeline.js';
 
@@ -144,6 +145,253 @@ const specs = [
 ];
 
 describe('packaged native PPT workflow runtime', () => {
+  it('persists prompt context and keeps source attachment revisions restorable', async () => {
+    const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
+    const pipeline = createNativePipeline({
+      id: 'project-context', name: '汇报', goal: '支持决策', createdAt: '2026-09-03T00:00:00.000Z',
+    });
+    const updated = await runtime.restore(pipeline).then(() => runtime.execute('project-context', {
+      kind: 'context.update', at: '2026-09-03T00:01:00.000Z',
+      context: { taskBrief: '做一份董事会汇报', sourceInstructions: {}, outlineRequirements: '先结论后证据' },
+    }));
+    expect(updated.pipeline.promptContext).toEqual({
+      taskBrief: '做一份董事会汇报', sourceInstructions: {}, outlineRequirements: '先结论后证据',
+    });
+    expect(updated.pipeline.tasks.at(-1)?.kind).toBe('prompt_context_update');
+
+    const noOp = await runtime.execute('project-context', {
+      kind: 'context.update', at: '2026-09-03T00:01:30.000Z', context: updated.pipeline.promptContext!,
+    });
+    expect(noOp.pipeline.tasks.at(-1)?.kind).toBe('prompt_context_update');
+    noOp.pipeline.sources.push({
+      id: 'source-later', fileName: 'later.csv', mediaType: 'text/csv',
+      relativePath: 'sources/source-later.bin', sha256: 'b'.repeat(64), byteLength: 4,
+    });
+    noOp.pipeline.revision += 1;
+    const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await expect(restarted.restore(noOp.pipeline)).resolves.toEqual(noOp.pipeline);
+    const analyzed = await restarted.execute('project-context', {
+      kind: 'analysis.commit', at: '2026-09-03T00:03:00.000Z', requestId: 'request-later',
+      output: {
+        findings: [{ id: 'finding-later', text: '后附件结论', sourceIds: ['source-later'] }],
+        dataPoints: [],
+        sourceMap: [{ sourceId: 'source-later', title: '后附件', locator: '第 1 行' }],
+      },
+    });
+    const restartedAgain = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await expect(restartedAgain.restore(analyzed.pipeline)).resolves.toEqual(analyzed.pipeline);
+  });
+
+  it('restores a complete early workflow after reset and later intake source attachments', async () => {
+    const initial = createNativePipeline({
+      id: 'project-reset-attachments', name: '追加材料', goal: '重新分析',
+      createdAt: '2026-09-03T00:00:00.000Z',
+    });
+    initial.sources.push({
+      id: 'source-one', fileName: 'one.csv', mediaType: 'text/csv',
+      relativePath: 'sources/source-one.bin', sha256: '1'.repeat(64), byteLength: 1,
+    });
+    initial.revision = 2;
+    const first = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await first.restore(initial);
+    await first.execute('project-reset-attachments', {
+      kind: 'analysis.commit', at: 'r3', requestId: 'request-first',
+      output: {
+        findings: [{ id: 'finding-one', text: '首次分析', sourceIds: ['source-one'] }],
+        dataPoints: [], sourceMap: [{ sourceId: 'source-one', title: '材料一', locator: '第 1 行' }],
+      },
+    });
+    const reset = await first.execute('project-reset-attachments', {
+      kind: 'context.update', at: 'r4',
+      context: { taskBrief: '重新分析新材料', sourceInstructions: {}, outlineRequirements: '' },
+    });
+    reset.pipeline.sources.push(
+      { id: 'source-two', fileName: 'two.csv', mediaType: 'text/csv', relativePath: 'sources/source-two.bin', sha256: '2'.repeat(64), byteLength: 2 },
+      { id: 'source-three', fileName: 'three.csv', mediaType: 'text/csv', relativePath: 'sources/source-three.bin', sha256: '3'.repeat(64), byteLength: 3 },
+    );
+    reset.pipeline.revision = 6;
+    const second = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await second.restore(reset.pipeline);
+    await second.execute('project-reset-attachments', {
+      kind: 'context.update', at: 'r7',
+      context: {
+        taskBrief: '重新分析新材料', outlineRequirements: '',
+        sourceInstructions: { 'source-two': '重点阅读', 'source-three': '只做交叉验证' },
+      },
+    });
+    const refreshedAnalysis = {
+      findings: [{ id: 'finding-refreshed', text: '追加后结论', sourceIds: ['source-one', 'source-two'] }],
+      dataPoints: [],
+      sourceMap: [
+        { sourceId: 'source-one', title: '材料一', locator: '第 1 行' },
+        { sourceId: 'source-two', title: '材料二', locator: '第 1 行' },
+      ],
+    };
+    await second.execute('project-reset-attachments', {
+      kind: 'analysis.commit', at: 'r8', requestId: 'request-refreshed', output: refreshedAnalysis,
+    });
+    const refreshedOutline = {
+      title: '追加材料复盘', slides: [{
+        id: 'slide-one', title: '新结论', purpose: '呈现追加后结论',
+        sourceIds: ['source-one', 'source-two'], findingIds: ['finding-refreshed'],
+      }],
+    };
+    await second.execute('project-reset-attachments', {
+      kind: 'outline.submit', at: 'r9', outline: refreshedOutline,
+    });
+    await second.execute('project-reset-attachments', { kind: 'outline.approve', at: 'r10' });
+    const detailed = await second.execute('project-reset-attachments', {
+      kind: 'details.submit', at: 'r11', specs: [{
+        id: 'slide-one', title: '新结论', body: ['追加后结论'], findingIds: ['finding-refreshed'],
+        tables: [], charts: [], shapes: [], sourceMap: refreshedAnalysis.sourceMap,
+        imageGenerationBrief: '无文字 16:9 背景',
+      }],
+    });
+    const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await expect(restarted.restore(detailed.pipeline)).resolves.toEqual(detailed.pipeline);
+  });
+
+  it('invalidates analysis and draft outline when analysis prompt inputs change', async () => {
+    const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await runtime.restore(intakePipeline());
+    await runtime.execute('project-native', {
+      kind: 'analysis.commit', at: '2026-09-03T02:01:00.000Z', requestId: 'request-analysis', output: analysis,
+    });
+    await runtime.execute('project-native', {
+      kind: 'outline.submit', at: '2026-09-03T02:02:00.000Z', outline,
+    });
+    const result = await runtime.execute('project-native', {
+      kind: 'context.update', at: '2026-09-03T02:03:00.000Z',
+      context: {
+        taskBrief: '重新聚焦海外增长', sourceInstructions: { 'source-kpis': '只使用已审计数据' },
+        outlineRequirements: '保留五页',
+      },
+    });
+    expect(result.pipeline).toMatchObject({
+      project: { workflowStatus: 'intake' }, analysis: null, outline: null, slideSpecs: null,
+      promptContext: { taskBrief: '重新聚焦海外增长' },
+    });
+    expect(result.pipeline.tasks.map(({ kind }) => kind)).toEqual([
+      'source_analysis', 'outline_generation', 'prompt_context_analysis_reset',
+    ]);
+    expect(result.writes).toEqual([]);
+    const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await expect(restarted.restore(result.pipeline)).resolves.toEqual(result.pipeline);
+  });
+
+  it('keeps analysis but drops a draft outline when only outline requirements change', async () => {
+    const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await runtime.restore(intakePipeline());
+    await runtime.execute('project-native', {
+      kind: 'analysis.commit', at: '2026-09-03T02:01:00.000Z', requestId: 'request-analysis', output: analysis,
+    });
+    await runtime.execute('project-native', {
+      kind: 'outline.submit', at: '2026-09-03T02:02:00.000Z', outline,
+    });
+    const result = await runtime.execute('project-native', {
+      kind: 'context.update', at: '2026-09-03T02:03:00.000Z',
+      context: { taskBrief: '', sourceInstructions: {}, outlineRequirements: '每页只有一个结论' },
+    });
+    expect(result.pipeline.project.workflowStatus).toBe('source_analysis');
+    expect(result.pipeline.analysis).not.toBeNull();
+    expect(result.pipeline.outline).toBeNull();
+    expect(result.pipeline.tasks.at(-1)?.kind).toBe('prompt_context_outline_reset');
+    expect(result.writes).toEqual([]);
+    const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await expect(restarted.restore(result.pipeline)).resolves.toEqual(result.pipeline);
+  });
+
+  it('rejects forged context keys, oversized UTF-8 values, unknown sources, and frozen stages', async () => {
+    expect(() => parseNativePipelineAction({
+      kind: 'context.update', at: 'now',
+      context: { taskBrief: '', sourceInstructions: {}, outlineRequirements: '', extra: true },
+    })).toThrow('missing or unknown fields');
+    expect(() => parseNativePipelineAction({
+      kind: 'context.update', at: 'now',
+      context: { taskBrief: '中'.repeat(7_000), sourceInstructions: {}, outlineRequirements: '' },
+    })).toThrow('20,000 bytes');
+
+    const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await runtime.restore(intakePipeline());
+    await expect(runtime.execute('project-native', {
+      kind: 'context.update', at: 'now',
+      context: { taskBrief: '', sourceInstructions: { 'source-missing': '不应接受' }, outlineRequirements: '' },
+    })).rejects.toThrow('unknown source');
+    await runtime.execute('project-native', {
+      kind: 'analysis.commit', at: 'a', requestId: 'request-analysis', output: analysis,
+    });
+    await runtime.execute('project-native', { kind: 'outline.submit', at: 'b', outline });
+    await runtime.execute('project-native', { kind: 'outline.approve', at: 'c' });
+    await expect(runtime.execute('project-native', {
+      kind: 'context.update', at: 'd',
+      context: { taskBrief: '', sourceInstructions: {}, outlineRequirements: '太晚' },
+    })).rejects.toThrow('before outline approval');
+  });
+
+  it('rejects a forged reset that erases a frozen outline and approvals', async () => {
+    const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await runtime.restore(intakePipeline());
+    await runtime.execute('project-native', {
+      kind: 'analysis.commit', at: 'a', requestId: 'request-analysis', output: analysis,
+    });
+    await runtime.execute('project-native', { kind: 'outline.submit', at: 'b', outline });
+    const approved = await runtime.execute('project-native', { kind: 'outline.approve', at: 'c' });
+    const forged = structuredClone(approved.pipeline);
+    forged.revision += 1;
+    forged.project.updatedAt = 'd';
+    forged.project.workflowStatus = 'intake';
+    forged.promptContext = { taskBrief: '伪造', sourceInstructions: {}, outlineRequirements: '' };
+    forged.analysis = null;
+    forged.outline = null;
+    forged.approvals = [];
+    forged.tasks.push({
+      id: `project-native-task-${forged.revision}-prompt_context_analysis_reset`,
+      kind: 'prompt_context_analysis_reset', status: 'completed', createdAt: 'd', updatedAt: 'd', error: null,
+    });
+    const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await expect(restarted.restore(forged)).rejects.toThrow('chronology');
+  });
+
+  it('rejects unexplained approval-sized revision gaps before a context reset', async () => {
+    const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await runtime.restore(intakePipeline());
+    await runtime.execute('project-native', {
+      kind: 'analysis.commit', at: 'a', requestId: 'request-analysis', output: analysis,
+    });
+    const draft = await runtime.execute('project-native', { kind: 'outline.submit', at: 'b', outline });
+    const forged = structuredClone(draft.pipeline);
+    forged.revision += 2;
+    forged.project.updatedAt = 'd';
+    forged.project.workflowStatus = 'intake';
+    forged.promptContext = { taskBrief: '伪造', sourceInstructions: {}, outlineRequirements: '' };
+    forged.analysis = null;
+    forged.outline = null;
+    forged.tasks.push({
+      id: `project-native-task-${forged.revision}-prompt_context_analysis_reset`,
+      kind: 'prompt_context_analysis_reset', status: 'completed', createdAt: 'd', updatedAt: 'd', error: null,
+    });
+    const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await expect(restarted.restore(forged)).rejects.toThrow('chronology');
+  });
+
+  it('retains strict legacy revision provenance when prompt context was never used', async () => {
+    const forgedIntake = intakePipeline();
+    forgedIntake.revision = 999;
+    await expect(new NativePptRpcRuntime({ imageGenAvailable: false }).restore(forgedIntake))
+      .rejects.toThrow('Intake revision provenance');
+
+    const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await runtime.restore(intakePipeline());
+    const analyzed = await runtime.execute('project-native', {
+      kind: 'analysis.commit', at: 'a', requestId: 'request-analysis', output: analysis,
+    });
+    const forgedAnalysis = structuredClone(analyzed.pipeline);
+    forgedAnalysis.revision = 4;
+    forgedAnalysis.tasks[0]!.id = 'project-native-task-4-source_analysis';
+    await expect(new NativePptRpcRuntime({ imageGenAvailable: false }).restore(forgedAnalysis))
+      .rejects.toThrow('Source attachment revision provenance');
+  });
+
   it('executes the real legal stages, blocks unavailable ImageGen, accepts replacements, and exports editable PPTX', async () => {
     const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
     await runtime.restore(intakePipeline());

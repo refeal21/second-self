@@ -52,9 +52,16 @@ export interface NativeVisualVersion {
   altText: string;
 }
 
+export interface NativePromptContext {
+  taskBrief: string;
+  sourceInstructions: Record<string, string>;
+  outlineRequirements: string;
+}
+
 export interface NativeTaskRecord {
   id: string;
-  kind: 'source_analysis' | 'outline_generation' | 'detail_generation' | 'visual_generation' | 'conversion' | 'qa';
+  kind: 'source_analysis' | 'outline_generation' | 'detail_generation' | 'visual_generation' | 'conversion' | 'qa'
+    | 'prompt_context_update' | 'prompt_context_analysis_reset' | 'prompt_context_outline_reset';
   status: 'queued' | 'running' | 'completed' | 'blocked' | 'failed';
   createdAt: string;
   updatedAt: string;
@@ -81,6 +88,7 @@ export interface NativePptPipeline {
     updatedAt: string;
   };
   preferenceSnapshot: NativePreferenceSnapshot[];
+  promptContext?: NativePromptContext;
   sources: NativeSourceAsset[];
   analysis: {
     requestId: string;
@@ -145,6 +153,7 @@ export type NativeQaPreparation =
     };
 
 export type NativePipelineAction =
+  | { kind: 'context.update'; at: string; context: NativePromptContext }
   | { kind: 'analysis.commit'; at: string; requestId: string; output: SourceAnalysis }
   | { kind: 'outline.submit'; at: string; outline: PptOutline }
   | { kind: 'outline.approve'; at: string }
@@ -162,6 +171,10 @@ export function parseNativePipelineAction(value: unknown): NativePipelineAction 
   const kind = requireStringValue(action.kind, 'action.kind');
   requireStringValue(action.at, 'action.at');
   switch (kind) {
+    case 'context.update':
+      requireExactKeys(action, ['kind', 'at', 'context'], kind);
+      validatePromptContextValue(action.context);
+      break;
     case 'analysis.commit':
       requireExactKeys(action, ['kind', 'at', 'requestId', 'output'], 'analysis.commit');
       requireIdentifier(requireStringValue(action.requestId, 'action.requestId'), 'request id');
@@ -303,7 +316,53 @@ export class NativePptRpcRuntime {
     const state = structuredClone(current);
     const writes: NativeArtifactWrite[] = [];
     let message: string;
+    let contextTaskKind: NativeTaskRecord['kind'] | null = null;
     switch (action.kind) {
+      case 'context.update': {
+        if (!['intake', 'source_analysis', 'outline_review'].includes(state.project.workflowStatus)
+          || (state.project.workflowStatus === 'outline_review' && state.outline?.version.status !== 'draft')) {
+          throw new Error('Prompt context can only be updated before outline approval');
+        }
+        const unknownSource = Object.keys(action.context.sourceInstructions)
+          .find((sourceId) => !state.sources.some(({ id }) => id === sourceId));
+        if (unknownSource) throw new Error(`Prompt context references unknown source: ${unknownSource}`);
+        const previous = state.promptContext ?? emptyPromptContext();
+        const analysisChanged = previous.taskBrief !== action.context.taskBrief
+          || JSON.stringify(canonicalJson(previous.sourceInstructions))
+            !== JSON.stringify(canonicalJson(action.context.sourceInstructions));
+        const outlineChanged = previous.outlineRequirements !== action.context.outlineRequirements;
+        state.promptContext = structuredClone(action.context);
+        if (analysisChanged && state.analysis !== null) {
+          state.analysis = null;
+          state.outline = null;
+          state.slideSpecs = null;
+          state.visuals = {};
+          state.currentSlideId = null;
+          state.approvals = [];
+          state.blockedCondition = null;
+          state.exportReceipt = null;
+          state.qaReport = null;
+          state.project.workflowStatus = 'intake';
+          contextTaskKind = 'prompt_context_analysis_reset';
+          message = '提示词上下文已更新；材料分析和大纲草稿已失效，等待重新生成。';
+        } else if (outlineChanged && state.outline !== null) {
+          state.outline = null;
+          state.slideSpecs = null;
+          state.visuals = {};
+          state.currentSlideId = null;
+          state.approvals = [];
+          state.blockedCondition = null;
+          state.exportReceipt = null;
+          state.qaReport = null;
+          state.project.workflowStatus = state.analysis ? 'source_analysis' : 'intake';
+          contextTaskKind = 'prompt_context_outline_reset';
+          message = '大纲要求已更新；大纲草稿已失效，等待重新生成。';
+        } else {
+          contextTaskKind = 'prompt_context_update';
+          message = '提示词上下文已保存。';
+        }
+        break;
+      }
       case 'analysis.commit': {
         const workflow = await replayPipeline(state, 'intake');
         const service = workflow.sourceAnalysis({
@@ -714,7 +773,7 @@ export class NativePptRpcRuntime {
       default:
         throw new Error(`Unknown native pipeline action: ${String((action as { kind?: unknown }).kind)}`);
     }
-    const taskKind = taskKindFor(action.kind);
+    const taskKind = contextTaskKind ?? taskKindFor(action.kind);
     if (taskKind) {
       state.tasks.push({
         id: `${projectId}-task-${state.revision + 1}-${taskKind}`,
@@ -1148,6 +1207,30 @@ function requireBase64Value(value: unknown, field: string): string {
   return encoded;
 }
 
+function emptyPromptContext(): NativePromptContext {
+  return { taskBrief: '', sourceInstructions: {}, outlineRequirements: '' };
+}
+
+function requireUtf8StringWithin(value: unknown, field: string, maximumBytes: number): string {
+  if (typeof value !== 'string') throw new Error(`${field} must be a string`);
+  if (Buffer.byteLength(value, 'utf8') > maximumBytes) {
+    throw new Error(`${field} must not exceed ${maximumBytes.toLocaleString('en-US')} bytes`);
+  }
+  return value;
+}
+
+function validatePromptContextValue(value: unknown): asserts value is NativePromptContext {
+  const context = requireRecordValue(value, 'prompt context');
+  requireExactKeys(context, ['taskBrief', 'sourceInstructions', 'outlineRequirements'], 'prompt context');
+  requireUtf8StringWithin(context.taskBrief, 'prompt context taskBrief', 20_000);
+  requireUtf8StringWithin(context.outlineRequirements, 'prompt context outlineRequirements', 20_000);
+  const instructions = requireRecordValue(context.sourceInstructions, 'prompt context sourceInstructions');
+  for (const [sourceId, instruction] of Object.entries(instructions)) {
+    requireIdentifier(sourceId, 'source id');
+    requireUtf8StringWithin(instruction, `prompt context sourceInstructions.${sourceId}`, 10_000);
+  }
+}
+
 function validateSourceAnalysisValue(value: unknown): asserts value is SourceAnalysis {
   const analysis = requireRecordValue(value, 'source analysis');
   requireExactKeys(analysis, ['findings', 'dataPoints', 'sourceMap'], 'source analysis');
@@ -1495,6 +1578,7 @@ function validatePipeline(value: NativePptPipeline): void {
     'schemaVersion', 'revision', 'project', 'preferenceSnapshot', 'sources', 'analysis',
     'outline', 'slideSpecs', 'visuals', 'currentSlideId', 'approvals', 'tasks',
     'blockedCondition', 'exportReceipt', 'qaReport',
+    ...(value.promptContext === undefined ? [] : ['promptContext']),
   ], 'pipeline');
   const project = requireRecordValue(value.project, 'project');
   requireExactKeys(project, ['id', 'name', 'goal', 'workflowStatus', 'createdAt', 'updatedAt'], 'project');
@@ -1533,6 +1617,14 @@ function validatePipeline(value: NativePptPipeline): void {
       throw new Error('Native source metadata is invalid');
     }
     ids.add(source.id);
+  }
+  if (value.promptContext !== undefined) {
+    validatePromptContextValue(value.promptContext);
+    const contextSourceIds = Object.keys(value.promptContext.sourceInstructions);
+    if (contextSourceIds.length > value.sources.length
+      || contextSourceIds.some((sourceId) => !ids.has(sourceId))) {
+      throw new Error('Prompt context references an unknown source');
+    }
   }
 
   if (value.analysis) {
@@ -1677,6 +1769,7 @@ function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
     const legalKinds: NativeTaskRecord['kind'][] = [
       'source_analysis', 'outline_generation', 'detail_generation',
       'visual_generation', 'conversion', 'qa',
+      'prompt_context_update', 'prompt_context_analysis_reset', 'prompt_context_outline_reset',
     ];
     if (typeof task.id !== 'string' || taskIds.has(task.id)
       || !legalKinds.includes(task.kind)
@@ -1716,33 +1809,71 @@ function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
   const visualTasks = byKind('visual_generation');
   const conversionTasks = byKind('conversion');
   const qaTasks = byKind('qa');
+  const contextTasks = tasks.filter(({ task }) => task.kind.startsWith('prompt_context_'));
+  const lastAnalysisReset = contextTasks
+    .filter(({ task }) => task.kind === 'prompt_context_analysis_reset').at(-1)?.revision ?? 0;
+  const lastOutlineReset = contextTasks
+    .filter(({ task }) => task.kind === 'prompt_context_outline_reset').at(-1)?.revision ?? 0;
+
+  if (contextTasks.length > 0) {
+    validateEarlyPromptTaskChronology(value, tasks);
+  }
 
   if (!value.analysis) {
-    if (tasks.length !== 0 || ![1, 1 + value.sources.length].includes(value.revision)) {
+    const invalidLegacyIntake = contextTasks.length === 0
+      && (tasks.length !== 0 || ![1, 1 + value.sources.length].includes(value.revision));
+    const invalidContextIntake = contextTasks.length > 0
+      && tasks.some(({ task, revision }) => !task.kind.startsWith('prompt_context_')
+        && revision > lastAnalysisReset);
+    if (invalidLegacyIntake || invalidContextIntake) {
       throw new Error('Intake revision provenance is invalid');
+    }
+    const finalTask = tasks.at(-1);
+    if (finalTask?.revision === value.revision
+      && finalTask.task.updatedAt !== value.project.updatedAt) {
+      throw new Error('Project update timestamp does not match its final task');
     }
     return;
   }
-  if (sourceTasks.length !== 1) {
+  const activeSourceTask = sourceTasks.at(-1);
+  if (!activeSourceTask || activeSourceTask.revision <= lastAnalysisReset
+    || sourceTasks.slice(0, -1).some(({ revision }) => revision > lastAnalysisReset)) {
     throw new Error('Source analysis task provenance is incomplete');
   }
-  const sourceRevision = sourceTasks[0]!.revision;
-  const rustSourceRevision = value.sources.length + 2;
-  if ((sourceRevision !== 2 && sourceRevision !== rustSourceRevision)
-    || sourceTasks[0]!.task.status !== 'completed') {
+  const sourceRevision = activeSourceTask.revision;
+  const invalidLegacySourceRevision = contextTasks.length === 0
+    && ![2, value.sources.length + 2].includes(sourceRevision);
+  if (invalidLegacySourceRevision || activeSourceTask.task.status !== 'completed') {
     throw new Error('Source attachment revision provenance is invalid');
   }
   let cursor = sourceRevision;
 
-  if ((value.outline === null && outlineTasks.length !== 0)
-    || (value.outline !== null && outlineTasks.length === 0)) {
+  const advancePastContextTasks = (): void => {
+    while (tasksByRevision.get(cursor + 1)?.kind.startsWith('prompt_context_')) cursor += 1;
+  };
+  advancePastContextTasks();
+
+  const activeOutlineBoundary = Math.max(sourceRevision, lastOutlineReset, lastAnalysisReset);
+  const activeOutlineTasks = outlineTasks.filter(({ revision }) => revision > activeOutlineBoundary);
+  if ((value.outline === null && activeOutlineTasks.length !== 0)
+    || (value.outline !== null && activeOutlineTasks.length === 0)
+    || outlineTasks.some(({ revision }) => revision > sourceRevision
+      && revision <= activeOutlineBoundary && revision > Math.max(lastAnalysisReset, lastOutlineReset))) {
     throw new Error('Outline task provenance is incomplete');
   }
-  for (const task of outlineTasks) {
+  if (lastOutlineReset > cursor) {
+    if (tasksByRevision.get(lastOutlineReset)?.kind !== 'prompt_context_outline_reset') {
+      throw new Error('Outline reset provenance is invalid');
+    }
+    cursor = lastOutlineReset;
+  }
+  advancePastContextTasks();
+  for (const task of activeOutlineTasks) {
     cursor += 1;
     if (task.revision !== cursor || task.task.status !== 'completed') {
       throw new Error('Outline task transition provenance is invalid');
     }
+    advancePastContextTasks();
   }
   if (value.outline?.version.status === 'frozen') cursor += 1;
 
@@ -1822,6 +1953,82 @@ function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
   if (finalTask?.revision === value.revision
     && finalTask.task.updatedAt !== value.project.updatedAt) {
     throw new Error('Project update timestamp does not match its final task');
+  }
+}
+
+function validateEarlyPromptTaskChronology(
+  value: NativePptPipeline,
+  tasks: ReadonlyArray<{ task: NativeTaskRecord; revision: number }>,
+): void {
+  const earlyKinds: readonly NativeTaskRecord['kind'][] = [
+    'source_analysis', 'outline_generation', 'prompt_context_update',
+    'prompt_context_analysis_reset', 'prompt_context_outline_reset',
+  ];
+  let stage: 'intake' | 'source_analysis' | 'outline_review' = 'intake';
+  let cursor = 1;
+  let inferredSourceAttachments = 0;
+  let firstLaterTask: { task: NativeTaskRecord; revision: number } | undefined;
+
+  for (const item of tasks) {
+    if (!earlyKinds.includes(item.task.kind)) {
+      firstLaterTask = item;
+      break;
+    }
+    const gap = item.revision - cursor - 1;
+    if (gap > 0) {
+      if (stage !== 'intake') {
+        throw new Error('Prompt context task chronology has an unexplained approval revision');
+      }
+      inferredSourceAttachments += gap;
+    }
+    switch (item.task.kind) {
+      case 'prompt_context_update':
+        break;
+      case 'source_analysis':
+        if (stage !== 'intake') throw new Error('Prompt context task chronology is invalid');
+        stage = 'source_analysis';
+        break;
+      case 'outline_generation':
+        if (stage === 'intake') throw new Error('Prompt context task chronology is invalid');
+        stage = 'outline_review';
+        break;
+      case 'prompt_context_analysis_reset':
+        if (stage === 'intake') throw new Error('Prompt context task chronology is invalid');
+        stage = 'intake';
+        break;
+      case 'prompt_context_outline_reset':
+        if (stage !== 'outline_review') throw new Error('Prompt context task chronology is invalid');
+        stage = 'source_analysis';
+        break;
+      default:
+        throw new Error('Prompt context task chronology crosses an approved checkpoint');
+    }
+    cursor = item.revision;
+  }
+
+  if (firstLaterTask) {
+    if (stage !== 'outline_review' || firstLaterTask.revision - cursor !== 2) {
+      throw new Error('Prompt context task chronology crosses an approved checkpoint');
+    }
+  } else {
+    const remaining = value.revision - cursor;
+    if (stage === 'intake') {
+      inferredSourceAttachments += remaining;
+    } else if (value.outline?.version.status === 'frozen') {
+      if (stage !== 'outline_review' || remaining !== 1) {
+        throw new Error('Prompt context task chronology has invalid outline approval provenance');
+      }
+    } else if (remaining !== 0) {
+      throw new Error('Prompt context task chronology has an unexplained approval revision');
+    }
+  }
+
+  if (![0, value.sources.length].includes(inferredSourceAttachments)) {
+    throw new Error('Prompt context task chronology has incomplete source attachment provenance');
+  }
+  if (['intake', 'source_analysis', 'outline_review'].includes(value.project.workflowStatus)
+    && stage !== value.project.workflowStatus) {
+    throw new Error('Prompt context task chronology does not match the current checkpoint');
   }
 }
 

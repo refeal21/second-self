@@ -7,8 +7,14 @@ import {
   type SyntheticEvent,
 } from 'react';
 import type { DesktopAdapter } from './desktop-adapter.js';
-import type { NativePptPipeline } from '../../worker/src/native-pipeline.js';
+import type { NativePptPipeline, NativePromptContext } from '../../worker/src/native-pipeline.js';
 import type { PptOutline, SlideSpec } from '../../worker/src/ppt-project.js';
+import {
+  buildPptPrompt,
+  getPromptContext,
+  promptContextError,
+  type PptPromptStage,
+} from './ppt-prompts.js';
 
 export function NativeWorkspacePage({
   adapter,
@@ -32,15 +38,22 @@ export function NativeWorkspacePage({
   const [visualFeedback, setVisualFeedback] = useState('');
   const [previewSrc, setPreviewSrc] = useState('');
   const [previewState, setPreviewState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [promptContext, setPromptContext] = useState<NativePromptContext>({
+    taskBrief: '', sourceInstructions: {}, outlineRequirements: '',
+  });
+  const [contextConfirmation, setContextConfirmation] = useState('');
+  const [promptContextExpanded, setPromptContextExpanded] = useState(false);
 
   const update = async (operation: () => Promise<NativePptPipeline>, success: string) => {
-    if (busy) return;
+    if (busy) return false;
     setBusy(true); setError(''); setNotice('');
     try {
       const next = await operation();
       setPipeline(next); setNotice(success);
+      return true;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+      return false;
     } finally { setBusy(false); }
   };
 
@@ -48,7 +61,10 @@ export function NativeWorkspacePage({
     let active = true;
     setBusy(true);
     void adapter.loadProjectPipeline(projectId).then((loaded) => {
-      if (active) setPipeline(loaded);
+      if (active) {
+        setPromptContext(normalizePromptContext(loaded, getPromptContext(loaded)));
+        setPipeline(loaded);
+      }
     }).catch((reason: unknown) => {
       if (active) setError(reason instanceof Error ? reason.message : String(reason));
     }).finally(() => { if (active) setBusy(false); });
@@ -59,6 +75,18 @@ export function NativeWorkspacePage({
     if (pipeline?.outline) setOutlineText(JSON.stringify(pipeline.outline.value, null, 2));
     if (pipeline?.slideSpecs) setDetailsText(JSON.stringify(pipeline.slideSpecs.value, null, 2));
   }, [pipeline?.outline?.version.id, pipeline?.slideSpecs?.version.id]);
+
+  const savedPromptContextKey = pipeline ? JSON.stringify(getPromptContext(pipeline)) : '';
+  useEffect(() => {
+    if (!pipeline) return;
+    setPromptContext(normalizePromptContext(pipeline, getPromptContext(pipeline)));
+    setContextConfirmation('');
+  }, [projectId, savedPromptContextKey]);
+
+  const workflowStatus = pipeline?.project.workflowStatus;
+  useEffect(() => {
+    setPromptContextExpanded(workflowStatus === 'intake');
+  }, [projectId, workflowStatus]);
 
   const currentSpec = useMemo(() => pipeline?.slideSpecs?.value.find(
     ({ id }) => id === pipeline.currentSlideId,
@@ -124,6 +152,39 @@ export function NativeWorkspacePage({
   const qaBlocked = status === 'blocked' && pipeline.blockedCondition?.resumeStage === 'qa';
   const canApproveCurrent = currentVisual?.version.status === 'draft' &&
     currentVisual.byteLength > 0 && previewState === 'ready';
+  const savedPromptContext = normalizePromptContext(pipeline, getPromptContext(pipeline));
+  const normalizedPromptContext = normalizePromptContext(pipeline, promptContext);
+  const promptContextDirty = JSON.stringify(normalizedPromptContext) !== JSON.stringify(savedPromptContext);
+  const contextValidationError = promptContextError(pipeline, normalizedPromptContext);
+  const contextEditable = status === 'intake' || status === 'source_analysis' ||
+    (status === 'outline_review' && pipeline.outline?.version.status !== 'frozen');
+  const promptStage = promptStageFor(status);
+  const showPromptPreview = status === 'intake' || status === 'source_analysis' ||
+    status === 'outline_review' || status === 'detail_review';
+
+  const savePromptContext = async (confirmed = false) => {
+    if (!promptContextDirty || contextValidationError || !contextEditable || busy) return;
+    const confirmation = promptInvalidationMessage(pipeline, savedPromptContext, normalizedPromptContext);
+    if (confirmation && !confirmed) {
+      setContextConfirmation(confirmation);
+      return;
+    }
+    setContextConfirmation('');
+    await update(
+      () => adapter.saveProjectContext(projectId, normalizedPromptContext),
+      '生成说明已保存；不会自动开始 AI 生成。',
+    );
+  };
+
+  const updatePromptContext = (next: NativePromptContext) => {
+    setPromptContext(next);
+    setContextConfirmation('');
+  };
+
+  const backToProjects = () => {
+    if (promptContextDirty && !window.confirm('生成说明尚未保存。返回 PPT 项目将丢弃这些修改，是否继续？')) return;
+    onBack();
+  };
 
   const validatePreview = (event: SyntheticEvent<HTMLImageElement>) => {
     const { naturalWidth: width, naturalHeight: height } = event.currentTarget;
@@ -142,7 +203,7 @@ export function NativeWorkspacePage({
     <main id="main-content" className="workspace-shell native-workspace">
       <header className="workspace-header">
         <div>
-          <button className="button button-secondary" onClick={onBack}>返回 PPT 项目</button>
+          <button className="button button-secondary" onClick={backToProjects}>返回 PPT 项目</button>
           <h1>{projectName}</h1><p className="project-goal">{projectGoal}</p>
         </div>
         <div><strong>{stageLabel(status)}</strong><p>检查点 r{pipeline.revision}</p></div>
@@ -157,24 +218,74 @@ export function NativeWorkspacePage({
           ))}</ol>
           <h3>项目材料</h3>
           <ul className="source-list">{pipeline.sources.map((source) => <li key={source.id}>{source.fileName}<small>{source.byteLength} bytes</small></li>)}</ul>
-          {status === 'intake' && <label className="button button-secondary">选择材料<input hidden type="file" multiple onChange={(event) => void attachFiles(event)} /></label>}
+          {status === 'intake' && <label className={`button button-secondary${busy || promptContextDirty ? ' is-disabled' : ''}`} aria-disabled={busy || promptContextDirty}>选择材料<input hidden type="file" multiple disabled={busy || promptContextDirty} onChange={(event) => void attachFiles(event)} /></label>}
         </aside>
 
         <section className="canvas-area" aria-label="PPT 阶段内容" tabIndex={0} aria-live="polite">
+          <details className="native-prompt-context" open={promptContextExpanded}
+            onToggle={(event) => setPromptContextExpanded(event.currentTarget.open)}>
+            <summary><strong>项目说明与提示词</strong><span>{status === 'intake' ? '填写并保存本次生成说明' : contextEditable ? '展开可编辑本次说明与大纲要求' : '展开查看已保存说明'}</span></summary>
+            <div className="native-prompt-context-body">
+              <div className="native-prompt-context-heading">
+                <p>先保存这里的说明，再继续分析、生成或人工审批。</p>
+                <button className="button button-secondary" disabled={busy || !contextEditable || !promptContextDirty || Boolean(contextValidationError)}
+                  onClick={() => void savePromptContext()}>保存说明</button>
+              </div>
+              <p className="native-carried-goal"><strong>项目目标（自动携带）</strong><span>{projectGoal}</span></p>
+              <label>本次任务说明
+                <span className="field-help">补充背景、受众和关键信息。</span>
+                <textarea aria-label="本次任务说明" rows={4} value={promptContext.taskBrief}
+                  readOnly={!contextEditable} disabled={busy}
+                  onChange={(event) => updatePromptContext({ ...promptContext, taskBrief: event.target.value })} />
+              </label>
+              {pipeline.sources.map((source) => <label key={source.id}>{source.fileName} 文件用途说明
+                <span className="field-help">说明该文件用于事实、风格或结构，以及需要排除的内容。</span>
+                <textarea aria-label={`${source.fileName} 文件用途说明`} rows={3}
+                  value={promptContext.sourceInstructions[source.id] ?? ''}
+                  readOnly={!contextEditable} disabled={busy}
+                  onChange={(event) => {
+                    const sourceInstructions = { ...promptContext.sourceInstructions };
+                    if (event.target.value) sourceInstructions[source.id] = event.target.value;
+                    else delete sourceInstructions[source.id];
+                    updatePromptContext({ ...promptContext, sourceInstructions });
+                  }} />
+              </label>)}
+              <label>本次大纲要求（可选）
+                <span className="field-help">例如页数、章节顺序、必须包含或避免的内容。</span>
+                <textarea aria-label="本次大纲要求（可选）" rows={4} value={promptContext.outlineRequirements}
+                  readOnly={!contextEditable} disabled={busy}
+                  onChange={(event) => updatePromptContext({ ...promptContext, outlineRequirements: event.target.value })} />
+              </label>
+              {contextValidationError && <p className="native-context-warning" role="alert">{contextValidationError}</p>}
+              {promptContextDirty && !contextValidationError && <p className="native-save-hint">请先保存说明，再继续生成或审批。</p>}
+              {contextConfirmation && <div className="native-context-confirmation" role="alert">
+                <p>{contextConfirmation}</p>
+                <div className="review-actions">
+                  <button className="button button-secondary" disabled={busy} onClick={() => setContextConfirmation('')}>取消保存</button>
+                  <button className="button button-primary" disabled={busy} onClick={() => void savePromptContext(true)}>确认保存并清除</button>
+                </div>
+              </div>}
+              {showPromptPreview && <details className="native-prompt-preview">
+                <summary>{promptPreviewLabel(promptStage)}</summary>
+                {promptContextDirty && <p>提示词预览只使用已保存的说明。</p>}
+                <pre data-testid="native-prompt-preview">{buildPptPrompt(pipeline, promptStage)}</pre>
+              </details>}
+            </div>
+          </details>
           {status === 'intake' && <StageCard title="1. 附加材料">
             <p>只会读取你主动选择的文件。附加后由 Codex 从项目 sources 目录进行可追溯分析。</p>
-            <button className="button button-primary" disabled={busy || pipeline.sources.length === 0} onClick={() => void update(() => adapter.analyzeProject(projectId), '材料分析已保存。')}>用 Codex 分析材料</button>
+            <button className="button button-primary" disabled={busy || promptContextDirty || pipeline.sources.length === 0} onClick={() => void update(() => adapter.analyzeProject(projectId), '材料分析已保存。')}>用 Codex 分析材料</button>
           </StageCard>}
           {status === 'source_analysis' && <StageCard title="2. 材料分析" actions={
-            <button className="button button-primary" disabled={busy} onClick={() => void update(() => adapter.generateOutline(projectId), '整份大纲已生成，等待你审核。')}>生成整份大纲</button>
+            <button className="button button-primary" disabled={busy || promptContextDirty} onClick={() => void update(() => adapter.generateOutline(projectId), '整份大纲已生成，等待你审核。')}>生成整份大纲</button>
           }>
             <pre>{JSON.stringify(pipeline.analysis?.output, null, 2)}</pre>
           </StageCard>}
           {status === 'outline_review' && <StageCard title="3. 审核整份大纲">
-            <textarea rows={22} value={outlineText} onChange={(event) => setOutlineText(event.target.value)} />
+            <textarea aria-label="整份大纲 JSON" rows={22} value={outlineText} onChange={(event) => setOutlineText(event.target.value)} />
             <div className="review-actions">
-              <button className="button button-secondary" disabled={busy || pipeline.outline?.version.status === 'frozen'} onClick={() => void update(() => adapter.saveOutline(projectId, parseJson<PptOutline>(outlineText)), '大纲修改已保存。')}>保存修改</button>
-              <button className="button button-primary" disabled={busy || pipeline.outline?.version.status !== 'draft'} onClick={() => void update(() => adapter.approveOutline(projectId), '大纲已批准并冻结。')}>批准整份大纲</button>
+              <button className="button button-secondary" disabled={busy || promptContextDirty || pipeline.outline?.version.status === 'frozen'} onClick={() => void update(() => adapter.saveOutline(projectId, parseJson<PptOutline>(outlineText)), '大纲修改已保存。')}>保存修改</button>
+              <button className="button button-primary" disabled={busy || promptContextDirty || pipeline.outline?.version.status !== 'draft'} onClick={() => void update(() => adapter.approveOutline(projectId), '大纲已批准并冻结。')}>批准整份大纲</button>
             </div>
           </StageCard>}
           {status === 'detail_review' && !pipeline.slideSpecs && <StageCard title="4. 生成全部页面细化">
@@ -182,7 +293,7 @@ export function NativeWorkspacePage({
             <button className="button button-primary" disabled={busy} onClick={() => void update(() => adapter.generateDetails(projectId), '全部页面细化已生成。')}>生成逐页细化</button>
           </StageCard>}
           {status === 'detail_review' && pipeline.slideSpecs && <StageCard title="4. 审核全部页面细化">
-            <textarea rows={24} value={detailsText} onChange={(event) => setDetailsText(event.target.value)} />
+            <textarea aria-label="逐页细化 JSON" rows={24} value={detailsText} onChange={(event) => setDetailsText(event.target.value)} />
             <div className="review-actions">
               <button className="button button-secondary" disabled={busy || pipeline.slideSpecs.version.status === 'frozen'} onClick={() => void update(() => adapter.saveDetails(projectId, parseJson<SlideSpec[]>(detailsText)), '逐页细化修改已保存。')}>保存修改</button>
               <button className="button button-primary" disabled={busy || pipeline.slideSpecs.version.status !== 'draft'} onClick={() => void update(() => adapter.approveDetails(projectId), '全部页面细化已批准并冻结。')}>批准全部细化</button>
@@ -281,6 +392,54 @@ function bytesToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
   }
   return btoa(binary);
+}
+
+function normalizePromptContext(
+  pipeline: NativePptPipeline,
+  context: NativePromptContext,
+): NativePromptContext {
+  const sourceInstructions: Record<string, string> = {};
+  for (const source of pipeline.sources) {
+    const instructions = context.sourceInstructions[source.id];
+    if (instructions) sourceInstructions[source.id] = instructions;
+  }
+  return {
+    taskBrief: context.taskBrief,
+    sourceInstructions,
+    outlineRequirements: context.outlineRequirements,
+  };
+}
+
+function promptInvalidationMessage(
+  pipeline: NativePptPipeline,
+  saved: NativePromptContext,
+  next: NativePromptContext,
+): string {
+  const analysisInputsChanged = saved.taskBrief !== next.taskBrief ||
+    JSON.stringify(saved.sourceInstructions) !== JSON.stringify(next.sourceInstructions);
+  const outlineRequirementsChanged = saved.outlineRequirements !== next.outlineRequirements;
+  const hasDraftOutline = pipeline.outline?.version.status === 'draft';
+  if (analysisInputsChanged && (pipeline.analysis || hasDraftOutline)) {
+    if (pipeline.analysis && hasDraftOutline) {
+      return '保存后将清除已有材料分析；当前未批准大纲将被清除，需重新生成；工作流返回材料阶段。此操作不会自动开始 AI 生成。';
+    }
+    if (pipeline.analysis) return '保存后将清除已有材料分析，并返回材料阶段。此操作不会自动开始 AI 生成。';
+    return '保存后当前未批准大纲将被清除，需重新生成；工作流返回材料阶段。此操作不会自动开始 AI 生成。';
+  }
+  if (!analysisInputsChanged && outlineRequirementsChanged && hasDraftOutline) {
+    return '保存后将保留材料分析；当前未批准大纲将被清除，需重新生成；工作流返回材料分析阶段。此操作不会自动开始 AI 生成。';
+  }
+  return '';
+}
+
+function promptStageFor(status: string): PptPromptStage {
+  if (status === 'intake') return 'analysis';
+  if (status === 'source_analysis' || status === 'outline_review') return 'outline';
+  return 'details';
+}
+
+function promptPreviewLabel(stage: PptPromptStage): string {
+  return ({ analysis: '查看材料分析提示词', outline: '查看大纲生成提示词', details: '查看逐页细化提示词' })[stage];
 }
 
 function stageLabel(stage: string): string {

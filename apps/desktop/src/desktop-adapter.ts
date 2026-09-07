@@ -9,9 +9,11 @@ import type {
   NativePipelineAction,
   NativePipelineResult,
   NativePptPipeline,
+  NativePromptContext,
 } from '../../worker/src/native-pipeline.js';
 import type { PptOutline, SlideSpec, SourceAnalysis } from '../../worker/src/ppt-project.js';
 import { TauriCodexTransport } from './codex-transport.js';
+import { buildPptPrompt, promptContextError } from './ppt-prompts.js';
 import {
   TauriWorkflowWorkerClient,
   type WorkflowWorkerGateway,
@@ -125,6 +127,7 @@ export interface DesktopAdapter {
   createProject(input: CreateProjectInput): Promise<ProjectSummary>;
   loadProjectPipeline(projectId: string): Promise<NativePptPipeline>;
   attachSource(projectId: string, input: SourceFileInput): Promise<NativePptPipeline>;
+  saveProjectContext(projectId: string, context: NativePromptContext): Promise<NativePptPipeline>;
   analyzeProject(projectId: string): Promise<NativePptPipeline>;
   generateOutline(projectId: string): Promise<NativePptPipeline>;
   saveOutline(projectId: string, outline: PptOutline): Promise<NativePptPipeline>;
@@ -295,6 +298,7 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
     },
     async loadProjectPipeline() { throw new Error('演示模式不使用本地持久化 PPT 管线。'); },
     async attachSource() { throw new Error('演示模式不会写入本地材料。'); },
+    async saveProjectContext() { throw new Error('演示模式不会保存项目说明。'); },
     async analyzeProject() { throw new Error('演示模式不会消耗 Codex 任务。'); },
     async generateOutline() { throw new Error('演示模式不会消耗 Codex 任务。'); },
     async saveOutline() { throw new Error('演示模式不会保存生产大纲。'); },
@@ -488,14 +492,21 @@ class TauriDesktopAdapter implements DesktopAdapter {
   }
   async analyzeProject(projectId: string): Promise<NativePptPipeline> {
     const pipeline = await this.loadProjectPipeline(projectId);
-    const output = await this.runStructured<SourceAnalysis>(projectId, [
-      '读取当前项目 sources 目录中的材料，只使用文件内可验证事实。',
-      '返回严格 JSON，结构必须符合 SourceAnalysis：{findings:[{id,text,sourceIds}],dataPoints:[{id,label,value,unit,sourceIds}],sourceMap:[{sourceId,title,locator,url?}]}。',
-      '不要使用 Markdown 代码块，不要联网，不要创造数据。',
-    ].join('\n'));
+    if (pipeline.project.workflowStatus !== 'intake' || pipeline.sources.length === 0) {
+      throw new Error('请先附加材料；重新分析前请保存本次说明并确认返回材料阶段。');
+    }
+    const output = await this.runStructured<SourceAnalysis>(projectId, buildPptPrompt(pipeline, 'analysis'));
     return this.applyPipeline(projectId, pipeline, {
       kind: 'analysis.commit', at: new Date().toISOString(),
       requestId: `analysis-${pipeline.revision + 1}`, output,
+    });
+  }
+  async saveProjectContext(projectId: string, context: NativePromptContext): Promise<NativePptPipeline> {
+    const pipeline = await this.loadProjectPipeline(projectId);
+    const error = promptContextError(pipeline, context);
+    if (error) throw new Error(error);
+    return this.applyPipeline(projectId, pipeline, {
+      kind: 'context.update', at: new Date().toISOString(), context,
     });
   }
   async saveOutline(projectId: string, outline: PptOutline): Promise<NativePptPipeline> {
@@ -503,12 +514,10 @@ class TauriDesktopAdapter implements DesktopAdapter {
   }
   async generateOutline(projectId: string): Promise<NativePptPipeline> {
     const pipeline = await this.loadProjectPipeline(projectId);
-    if (!pipeline.analysis) throw new Error('请先完成材料分析。');
-    const outline = await this.runStructured<PptOutline>(projectId, [
-      '依据 sources 中的分析产物生成一份完整 PPT 大纲。默认中文、16:9、商务汇报。',
-      '只返回严格 JSON：{title,slides:[{id,title,purpose,sourceIds,findingIds,dataPointIds}]}。',
-      '每个 findingIds/dataPointIds 必须来自已保存的材料分析，不要 Markdown，不要联网。',
-    ].join('\n'));
+    if (!pipeline.analysis || pipeline.project.workflowStatus !== 'source_analysis') {
+      throw new Error('请先完成材料分析；已有大纲请先审核，或修改说明后重新生成。');
+    }
+    const outline = await this.runStructured<PptOutline>(projectId, buildPptPrompt(pipeline, 'outline'));
     return this.applyPipeline(projectId, pipeline, { kind: 'outline.submit', at: new Date().toISOString(), outline });
   }
   async approveOutline(projectId: string): Promise<NativePptPipeline> {
@@ -519,12 +528,10 @@ class TauriDesktopAdapter implements DesktopAdapter {
   }
   async generateDetails(projectId: string): Promise<NativePptPipeline> {
     const pipeline = await this.loadProjectPipeline(projectId);
-    if (pipeline.outline?.version.status !== 'frozen') throw new Error('请先批准整份大纲。');
-    const specs = await this.runStructured<readonly SlideSpec[]>(projectId, [
-      '依据已批准的 outline 和 source analysis 生成全部页面细化。',
-      '只返回严格 JSON 数组，每页：{id,title,body,findingIds,dataPointIds,tables,charts,shapes,sourceMap,imageGenerationBrief}。',
-      '文案和数据必须有 sourceMap，不要 Markdown，不要联网。',
-    ].join('\n'));
+    if (pipeline.outline?.version.status !== 'frozen' || pipeline.project.workflowStatus !== 'detail_review') {
+      throw new Error('请先批准整份大纲，并在逐页细化阶段生成内容。');
+    }
+    const specs = await this.runStructured<readonly SlideSpec[]>(projectId, buildPptPrompt(pipeline, 'details'));
     return this.applyPipeline(projectId, pipeline, { kind: 'details.submit', at: new Date().toISOString(), specs });
   }
   async approveDetails(projectId: string): Promise<NativePptPipeline> {

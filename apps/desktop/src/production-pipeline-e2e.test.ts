@@ -6,6 +6,7 @@ import {
   type NativeAppServerTransport,
   type NativeJsonRpcMessage,
 } from './desktop-adapter.js';
+import { buildPptPrompt } from './ppt-prompts.js';
 import type { WorkflowWorkerGateway, WorkflowWorkerHealth } from './workflow-worker-client.js';
 import {
   createNativePipeline,
@@ -21,6 +22,7 @@ import {
 } from '../../worker/src/golden-project.js';
 
 class ScriptedPptAppServer implements NativeAppServerTransport {
+  readonly prompts: string[] = [];
   private line: ((line: string) => void) | null = null;
   private turn = 0;
   async start(): Promise<void> {}
@@ -33,7 +35,11 @@ class ScriptedPptAppServer implements NativeAppServerTransport {
       requiresOpenaiAuth: false,
     };
     if (message.method === 'thread/start') result = { thread: { id: `thread-${this.turn + 1}` } };
-    if (message.method === 'turn/start') result = { turn: { id: `turn-${++this.turn}` } };
+    if (message.method === 'turn/start') {
+      const params = message.params as { input: Array<{ text?: string }> };
+      this.prompts.push(params.input.map(({ text }) => text ?? '').join('\n'));
+      result = { turn: { id: `turn-${++this.turn}` } };
+    }
     queueMicrotask(() => this.line?.(JSON.stringify({ id: message.id, result })));
     if (message.method === 'turn/start') {
       const output = [goldenSourceAnalysis(), goldenOutline(), goldenSlideSpecs()][this.turn - 1];
@@ -114,6 +120,67 @@ function nativePersistenceHarness() {
 }
 
 describe('production-equivalent UI adapter → App Server → Worker → Rust persistence flow', () => {
+  it('persists the three instructions and sends the same preview through analysis, outline and approved details after restart', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    const adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    const context = {
+      taskBrief: '向董事会解释建设背景，突出运营价值',
+      sourceInstructions: { 'source-style': '只参考视觉风格，不采用其中数字', 'source-kpis': '这是本季度正式数据' },
+      outlineRequirements: '控制五页，先讲价值，再讲建设路径',
+    };
+    const saved = await adapter.saveProjectContext('project-e2e', context);
+    expect(saved.promptContext).toEqual(context);
+    expect(server.prompts).toHaveLength(0);
+    const restarted = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    const restored = await restarted.loadProjectPipeline('project-e2e');
+    const preview = buildPptPrompt(restored, 'analysis');
+    await restarted.analyzeProject('project-e2e');
+    expect(server.prompts[0]).toBe(preview);
+    expect(server.prompts[0]).toContain('向董事会解释建设背景');
+    expect(server.prompts[0]).toContain('只参考视觉风格，不采用其中数字');
+    expect(server.prompts[0]).not.toContain('控制五页');
+    await restarted.generateOutline('project-e2e');
+    expect(server.prompts[1]).toContain('控制五页');
+    await restarted.approveOutline('project-e2e');
+    await restarted.generateDetails('project-e2e');
+    expect(server.prompts[2]).toContain('向董事会解释建设背景');
+    expect(server.prompts[2]).toContain('控制五页');
+    expect(server.prompts[2]).toContain('只参考视觉风格，不采用其中数字');
+    await expect(restarted.saveProjectContext('project-e2e', { ...context, taskBrief: '更改已批准的方向' })).rejects.toThrow();
+    expect(native.state.pipeline.promptContext).toEqual(context);
+    expect(server.prompts).toHaveLength(3);
+  });
+
+  it('rejects a generation call at the wrong stage before spending a Codex turn', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    const adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    await adapter.analyzeProject('project-e2e');
+    await adapter.generateOutline('project-e2e');
+    await adapter.approveOutline('project-e2e');
+    await expect(adapter.generateOutline('project-e2e')).rejects.toThrow();
+    await expect(adapter.analyzeProject('project-e2e')).rejects.toThrow();
+    expect(server.prompts).toHaveLength(2);
+  });
+
+  it('sends the saved project goal and exact source inventory even for a legacy project without extra instructions', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    const adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    await adapter.analyzeProject('project-e2e');
+    expect(server.prompts[0]).toContain('管理层决策');
+    expect(server.prompts[0]).toContain('source-report');
+    expect(server.prompts[0]).toContain('sources/management-memo.pdf');
+    expect(server.prompts[0]).toContain('style-reference.pptx');
+    await adapter.generateOutline('project-e2e');
+    expect(server.prompts[1]).toContain(native.state.pipeline.analysis!.artifactRelativePath);
+    await adapter.approveOutline('project-e2e');
+    await adapter.generateDetails('project-e2e');
+    expect(server.prompts[2]).toContain('管理层决策');
+    expect(server.prompts[2]).toContain('slide-cover');
+  });
+
   it('runs all legal content and visual stages, survives a Worker restart, and commits an editable deck', async () => {
     const native = nativePersistenceHarness();
     const adapter = createTauriDesktopAdapter(new ScriptedPptAppServer(), native.invoke, new DirectWorker());

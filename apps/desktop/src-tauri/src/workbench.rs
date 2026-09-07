@@ -672,6 +672,13 @@ impl WorkbenchService {
         if current_revision != input.expected_revision {
             return Err("stale pipeline revision".into());
         }
+        validate_prompt_context_commit(
+            &current.pipeline,
+            &input.pipeline,
+            &input.project_id,
+            input.expected_revision,
+            !input.writes.is_empty(),
+        )?;
         let mut artifacts = Vec::with_capacity(input.writes.len());
         for (index, write) in input.writes.iter().enumerate() {
             let bytes = decode_base64(&write.contents_base64)?;
@@ -1147,6 +1154,175 @@ fn validate_worker_relative_path(value: &str) -> Result<(), String> {
         .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
         return Err("Worker artifact path is outside the project artifact directories".into());
+    }
+    Ok(())
+}
+
+fn validate_prompt_context_commit(
+    current: &Value,
+    next: &Value,
+    project_id: &str,
+    expected_revision: i64,
+    has_writes: bool,
+) -> Result<(), String> {
+    let next_context = next.get("promptContext");
+    if let Some(context) = next_context {
+        validate_prompt_context_value(context, next)?;
+    }
+    if current.get("promptContext").is_some() && next_context.is_none() {
+        return Err("Prompt context cannot be removed".into());
+    }
+
+    let next_tasks = next
+        .get("tasks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Prompt context transition tasks are invalid".to_string())?;
+    let current_task_count = current
+        .get("tasks")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .ok_or_else(|| "Persisted pipeline tasks are invalid".to_string())?;
+    let appended_context_task = next_tasks.get(current_task_count).is_some_and(|task| {
+        task.get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.starts_with("prompt_context_"))
+    });
+    let context_field_changed = current.get("promptContext") != next_context;
+    if !context_field_changed && !appended_context_task {
+        return Ok(());
+    }
+    if has_writes {
+        return Err("Prompt context transition cannot include artifact writes".into());
+    }
+    let current_stage = current
+        .pointer("/project/workflowStatus")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Persisted pipeline workflow status is invalid".to_string())?;
+    if !matches!(
+        current_stage,
+        "intake" | "source_analysis" | "outline_review"
+    ) || (current_stage == "outline_review"
+        && current
+            .pointer("/outline/version/status")
+            .and_then(Value::as_str)
+            != Some("draft"))
+    {
+        return Err("Prompt context can only be updated before outline approval".into());
+    }
+    let context = next_context
+        .ok_or_else(|| "Prompt context transition must persist its context".to_string())?;
+    let previous = current.get("promptContext").cloned().unwrap_or_else(|| {
+        serde_json::json!({"taskBrief": "", "sourceInstructions": {}, "outlineRequirements": ""})
+    });
+    let analysis_changed = previous.get("taskBrief") != context.get("taskBrief")
+        || previous.get("sourceInstructions") != context.get("sourceInstructions");
+    let outline_changed = previous.get("outlineRequirements") != context.get("outlineRequirements");
+    let analysis_exists = current
+        .get("analysis")
+        .is_some_and(|value| !value.is_null());
+    let outline_exists = current.get("outline").is_some_and(|value| !value.is_null());
+    let task_kind = if analysis_changed && analysis_exists {
+        "prompt_context_analysis_reset"
+    } else if outline_changed && outline_exists {
+        "prompt_context_outline_reset"
+    } else {
+        "prompt_context_update"
+    };
+    let updated_at = next
+        .pointer("/project/updatedAt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Prompt context transition timestamp is invalid".to_string())?;
+    let mut expected = current.clone();
+    expected["revision"] = (expected_revision + 1).into();
+    expected["project"]["updatedAt"] = updated_at.into();
+    expected["promptContext"] = context.clone();
+    if task_kind == "prompt_context_analysis_reset" {
+        expected["analysis"] = Value::Null;
+        expected["outline"] = Value::Null;
+        clear_prompt_dependent_state(&mut expected);
+        expected["project"]["workflowStatus"] = "intake".into();
+    } else if task_kind == "prompt_context_outline_reset" {
+        expected["outline"] = Value::Null;
+        clear_prompt_dependent_state(&mut expected);
+        expected["project"]["workflowStatus"] = if analysis_exists {
+            "source_analysis".into()
+        } else {
+            "intake".into()
+        };
+    }
+    expected["tasks"]
+        .as_array_mut()
+        .ok_or_else(|| "Persisted pipeline tasks are invalid".to_string())?
+        .push(serde_json::json!({
+            "id": format!("{project_id}-task-{}-{task_kind}", expected_revision + 1),
+            "kind": task_kind,
+            "status": "completed",
+            "createdAt": updated_at,
+            "updatedAt": updated_at,
+            "error": null
+        }));
+    if expected != *next {
+        return Err("Pipeline does not match the conservative prompt context transition".into());
+    }
+    Ok(())
+}
+
+fn clear_prompt_dependent_state(pipeline: &mut Value) {
+    pipeline["slideSpecs"] = Value::Null;
+    pipeline["visuals"] = serde_json::json!({});
+    pipeline["currentSlideId"] = Value::Null;
+    pipeline["approvals"] = serde_json::json!([]);
+    pipeline["blockedCondition"] = Value::Null;
+    pipeline["exportReceipt"] = Value::Null;
+    pipeline["qaReport"] = Value::Null;
+}
+
+fn validate_prompt_context_value(context: &Value, pipeline: &Value) -> Result<(), String> {
+    let object = context
+        .as_object()
+        .ok_or_else(|| "Prompt context must be an object".to_string())?;
+    if object.len() != 3
+        || !object.contains_key("taskBrief")
+        || !object.contains_key("sourceInstructions")
+        || !object.contains_key("outlineRequirements")
+    {
+        return Err("Prompt context contains missing or unknown fields".into());
+    }
+    let task_brief = object
+        .get("taskBrief")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Prompt context taskBrief must be a string".to_string())?;
+    let outline = object
+        .get("outlineRequirements")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Prompt context outlineRequirements must be a string".to_string())?;
+    if task_brief.len() > 20_000 || outline.len() > 20_000 {
+        return Err("Prompt context exceeds its 20,000 byte limit".into());
+    }
+    let instructions = object
+        .get("sourceInstructions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Prompt context sourceInstructions must be an object".to_string())?;
+    let source_ids = pipeline
+        .get("sources")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Pipeline sources are invalid".to_string())?;
+    if instructions.len() > source_ids.len() {
+        return Err("Prompt context has too many source instructions".into());
+    }
+    for (source_id, instruction) in instructions {
+        let instruction = instruction
+            .as_str()
+            .ok_or_else(|| "Prompt context source instruction must be a string".to_string())?;
+        if instruction.len() > 10_000 {
+            return Err("Prompt context source instruction exceeds its 10,000 byte limit".into());
+        }
+        if !source_ids
+            .iter()
+            .any(|source| source.get("id").and_then(Value::as_str) == Some(source_id))
+        {
+            return Err("Prompt context references an unknown source".into());
+        }
     }
     Ok(())
 }

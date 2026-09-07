@@ -209,3 +209,131 @@ fn rust_owns_source_and_worker_write_intents_and_restores_the_complete_pipeline(
     );
     std::fs::remove_dir_all(root).expect("temporary root removed");
 }
+
+#[test]
+fn rust_accepts_only_the_conservative_prompt_context_transition_shape() {
+    let root = temporary_root("prompt-context");
+    std::fs::create_dir_all(&root).expect("root created");
+    let workspace = root.join("workspace");
+    let service =
+        WorkbenchService::open(root.join("state.sqlite3"), &workspace).expect("workbench opens");
+    let project = service
+        .create_project(CreateProjectInput {
+            name: "经营复盘".into(),
+            goal: "管理层决策".into(),
+        })
+        .expect("project created");
+    let current = service.load_pipeline(&project.id).expect("pipeline loads");
+
+    let mut valid = current.clone();
+    valid["revision"] = 2.into();
+    valid["project"]["updatedAt"] = "2026-09-03T01:00:00Z".into();
+    valid["promptContext"] = serde_json::json!({
+        "taskBrief": "做一份董事会汇报",
+        "sourceInstructions": {},
+        "outlineRequirements": "先结论后证据"
+    });
+    valid["tasks"] = serde_json::json!([{
+        "id": format!("{}-task-2-prompt_context_update", project.id),
+        "kind": "prompt_context_update", "status": "completed",
+        "createdAt": "2026-09-03T01:00:00Z", "updatedAt": "2026-09-03T01:00:00Z",
+        "error": null
+    }]);
+    service
+        .commit_pipeline(PipelineCommitInput {
+            project_id: project.id.clone(),
+            expected_revision: 1,
+            pipeline: valid.clone(),
+            writes: vec![],
+        })
+        .expect("valid context transition commits");
+
+    let mut forged = valid.clone();
+    forged["revision"] = 3.into();
+    forged["project"]["goal"] = "伪造的目标".into();
+    forged["project"]["updatedAt"] = "2026-09-03T01:01:00Z".into();
+    forged["promptContext"]["taskBrief"] = "新任务".into();
+    forged["tasks"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": format!("{}-task-3-prompt_context_update", project.id),
+            "kind": "prompt_context_update", "status": "completed",
+            "createdAt": "2026-09-03T01:01:00Z", "updatedAt": "2026-09-03T01:01:00Z",
+            "error": null
+        }));
+    let artifact_path = workspace.join(&project.id).join("outline/forged.json");
+    let error = service
+        .commit_pipeline(PipelineCommitInput {
+            project_id: project.id.clone(),
+            expected_revision: 2,
+            pipeline: forged,
+            writes: vec![ArtifactWriteInput {
+                relative_path: "outline/forged.json".into(),
+                contents_base64: "e30K".into(),
+                sha256: "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356".into(),
+                byte_length: 3,
+                kind: "outline".into(),
+                version_id: "forged".into(),
+                slide_id: None,
+                metadata: None,
+            }],
+        })
+        .expect_err("context update cannot smuggle immutable changes");
+    assert!(error.contains("Prompt context transition"));
+    assert!(
+        !artifact_path.exists(),
+        "rejected writes happen before no artifact IO"
+    );
+
+    std::fs::remove_dir_all(root).expect("temporary root removed");
+}
+
+#[test]
+fn rust_rejects_prompt_context_updates_after_the_outline_is_frozen() {
+    let root = temporary_root("frozen-prompt-context");
+    std::fs::create_dir_all(&root).expect("root created");
+    let service = WorkbenchService::open(root.join("state.sqlite3"), root.join("workspace"))
+        .expect("workbench opens");
+    let project = service
+        .create_project(CreateProjectInput {
+            name: "经营复盘".into(),
+            goal: "管理层决策".into(),
+        })
+        .expect("project created");
+    let mut frozen = service.load_pipeline(&project.id).expect("pipeline loads");
+    frozen["revision"] = 2.into();
+    frozen["project"]["workflowStatus"] = "detail_review".into();
+    frozen["project"]["updatedAt"] = "one".into();
+    service
+        .commit_pipeline(PipelineCommitInput {
+            project_id: project.id.clone(),
+            expected_revision: 1,
+            pipeline: frozen.clone(),
+            writes: vec![],
+        })
+        .expect("legacy checkpoint fixture commits");
+
+    let mut next = frozen;
+    next["revision"] = 3.into();
+    next["project"]["updatedAt"] = "two".into();
+    next["promptContext"] = serde_json::json!({
+        "taskBrief": "太晚", "sourceInstructions": {}, "outlineRequirements": ""
+    });
+    next["tasks"] = serde_json::json!([{
+        "id": format!("{}-task-3-prompt_context_update", project.id),
+        "kind": "prompt_context_update", "status": "completed",
+        "createdAt": "two", "updatedAt": "two", "error": null
+    }]);
+    let error = service
+        .commit_pipeline(PipelineCommitInput {
+            project_id: project.id.clone(),
+            expected_revision: 2,
+            pipeline: next,
+            writes: vec![],
+        })
+        .expect_err("frozen context cannot change");
+    assert!(error.contains("before outline approval"));
+
+    std::fs::remove_dir_all(root).expect("temporary root removed");
+}

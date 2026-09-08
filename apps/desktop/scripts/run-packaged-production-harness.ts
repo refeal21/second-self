@@ -384,6 +384,12 @@ async function main(): Promise<void> {
     pipeline = await adapter.saveOutline(project.id, editedOutline);
     pipeline = await adapter.approveOutline(project.id);
     record('outline-edit-save-approve', pipeline);
+    // The scripted detail response must use the explicitly approved edited title.
+    // This adjusts synthetic generation only; production validation stays strict.
+    generatedSpecs[0]!.title = pipeline.outline!.value.slides[0]!.title;
+    assert.deepEqual(generatedSpecs.map(({ id, title }) => ({ id, title })),
+      pipeline.outline!.value.slides.map(({ id, title }) => ({ id, title })),
+      'Scripted generated details must match the approved outline IDs and titles');
     pipeline = await adapter.generateDetails(project.id);
     assert.equal(pipeline.schemaVersion, 1);
 

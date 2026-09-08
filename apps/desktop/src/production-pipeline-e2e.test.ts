@@ -8,6 +8,7 @@ import {
 } from './desktop-adapter.js';
 import { buildPptPrompt } from './ppt-prompts.js';
 import { inspectPptxOoxml } from '../../worker/src/libreoffice-qa.js';
+import { normalizeGeneratedSlideSpecs } from '../../worker/src/slide-spec-contract.js';
 import type { WorkflowWorkerGateway, WorkflowWorkerHealth } from './workflow-worker-client.js';
 import {
   createNativePipeline,
@@ -134,6 +135,29 @@ function nativePersistenceHarness() {
 }
 
 describe('production-equivalent UI adapter → App Server → Worker → Rust persistence flow', () => {
+  it('generates reviewable details whose scripted title follows the explicitly approved outline edit', async () => {
+    const native = nativePersistenceHarness();
+    const generatedSpecs = structuredClone(goldenSlideSpecs());
+    const server = new ScriptedPptAppServer([goldenSourceAnalysis(), goldenOutline(), generatedSpecs]);
+    const adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    await adapter.analyzeProject('project-e2e');
+    const generated = await adapter.generateOutline('project-e2e');
+    const editedOutline = structuredClone(generated.outline!.value);
+    editedOutline.slides[0]!.title = '用户编辑：2026 年经营复盘与增长计划';
+    await adapter.saveOutline('project-e2e', editedOutline);
+    const approved = await adapter.approveOutline('project-e2e');
+    expect(() => normalizeGeneratedSlideSpecs(generatedSpecs, approved.outline!.value, approved.analysis!.output))
+      .toThrow(/标题与已批准大纲不一致/);
+    generatedSpecs[0]!.title = approved.outline!.value.slides[0]!.title;
+    const details = await adapter.generateDetails('project-e2e');
+    expect(details.slideSpecs!.value.map(({ id, title }) => ({ id, title })))
+      .toEqual(approved.outline!.value.slides.map(({ id, title }) => ({ id, title })));
+    expect(details.slideSpecs!.value[0]!.title).toBe('用户编辑：2026 年经营复盘与增长计划');
+    expect(details.slideSpecs!.version.status).toBe('draft');
+    expect(details.approvals).toEqual(approved.approvals);
+    expect(server.prompts).toHaveLength(3);
+  });
+
   it('retains a failed content draft for explicit retry and refuses its stale baseline after saving', async () => {
     const native = nativePersistenceHarness();
     const server = new ScriptedPptAppServer();

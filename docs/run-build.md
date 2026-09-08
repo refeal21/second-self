@@ -73,6 +73,14 @@ pnpm --filter @digital-twin/desktop tauri build --bundles app
 
 `apps/desktop/src-tauri/target/release/bundle/macos/Digital Twin Workbench.app`
 
+如果该路径的旧应用还在运行，不要原地重新打包。使用独立的、已忽略提交的构建目录（`CARGO_TARGET_DIR` 须为绝对路径）：
+
+```bash
+CARGO_TARGET_DIR="$PWD/artifacts/build/detail-editor-target" pnpm --filter @digital-twin/desktop tauri build --bundles app
+```
+
+新包位于 `artifacts/build/detail-editor-target/release/bundle/macos/Digital Twin Workbench.app`。等旧版任务保存完成后正常退出旧应用，再打开新包；构建不会自动安装到“应用程序”，也不会迁移正在执行的任务。
+
 检查包内容：
 
 ```bash
@@ -98,6 +106,12 @@ pnpm smoke:packaged-worker
 
 该命令直接执行 `.app/Contents/MacOS/digital-twin-worker`，走完材料分析结果提交、整份大纲/细化批准、五页顺序视觉批准、进程重启恢复、PPTX 导出和 `deck.qa`，并要求最终状态为 `completed`。它不会调用付费 API；QA 输入来自本地 Golden 产物。
 
+使用独立构建目录时，指定实际 bundle 内的 Worker：
+
+```bash
+DIGITAL_TWIN_PACKAGED_WORKER="$PWD/artifacts/build/detail-editor-target/release/bundle/macos/Digital Twin Workbench.app/Contents/MacOS/digital-twin-worker" pnpm smoke:packaged-worker
+```
+
 ## 打包生产边界验收
 
 先生成 Golden 产物并构建最新 `.app`，然后运行：
@@ -109,7 +123,19 @@ pnpm harness:production
 
 第一条命令以 `acceptance-harness` Cargo feature 编译 `production-harness` 和原生 RSS sampler；这些测试二进制不会进入最终 `.app`。第二条命令使用生产 `createTauriDesktopAdapter`，通过与 Tauri commands 共用的 Rust Workbench service delegates 执行：项目创建与附件、SQLite 提交和重启、打包 SEA 恢复、两次整份编辑/审批、五页 ImageGen 明确阻塞与用户替换、顺序视觉审批、Rust fd 边界导出，以及真实 LibreOffice/pdftoppm QA。Rust harness 的 PATH 被清空，证明 Finder/受限环境仍能发现经过验证的原生工具，而不是偶然继承开发 shell。
 
-为保持确定性且不花费模型回合，只有 Codex 的结构化生成响应由本地脚本固定；adapter、Worker、Rust、SQLite、文件写入和 QA 都使用生产实现。结果写入：
+为保持确定性且不花费模型回合，只有 Codex 的结构化生成响应由本地脚本固定；adapter、Worker、Rust、SQLite、文件写入和 QA 都使用生产实现。
+
+当前 harness 还验证细化内容保存、结构候选保存/重启、单独确认新大纲、再次编辑保存与单独批准细化；包含真实 SQLite CAS 冲突、已提交但响应丢失的原操作核对，以及旧审批和版本历史不变的断言。独立构建目录必须同时覆盖三个二进制，避免误测旧包：
+
+```bash
+CARGO_TARGET_DIR="$PWD/artifacts/build/detail-editor-target" pnpm build:production-harness
+DIGITAL_TWIN_PACKAGED_WORKER="$PWD/artifacts/build/detail-editor-target/release/bundle/macos/Digital Twin Workbench.app/Contents/MacOS/digital-twin-worker" \
+DIGITAL_TWIN_PRODUCTION_HARNESS="$PWD/artifacts/build/detail-editor-target/release/production-harness" \
+DIGITAL_TWIN_RSS_SAMPLER="$PWD/artifacts/build/detail-editor-target/release/process-rss-sampler" \
+pnpm harness:production
+```
+
+结果写入：
 
 ```text
 artifacts/qa/production-harness/result.json

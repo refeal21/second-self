@@ -384,6 +384,22 @@ describe('native PPT QA workspace', () => {
     expect(await screen.findByText(/5\. 逐页视觉/)).toBeInTheDocument();
   });
 
+  it('treats a reopened zero-byte placeholder as waiting for a new visual candidate', async () => {
+    const initial = visualPipeline();
+    initial.visuals['slide-cover']![0] = {
+      ...initial.visuals['slide-cover']![0]!,
+      relativePath: '', sha256: '', byteLength: 0,
+    };
+    const adapter = { ...createDemoDesktopAdapter(), mode: 'tauri' as const,
+      loadProjectPipeline: vi.fn(async () => initial) } satisfies DesktopAdapter;
+    render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
+      projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
+
+    expect(await screen.findByText(/当前阶段正在等待生成视觉候选/)).toBeVisible();
+    expect(screen.getByRole('button', { name: '生成当前页' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: '按意见重新生成' })).not.toBeInTheDocument();
+  });
+
   it('runs the production QA action and renders the real readable report path', async () => {
     const user = userEvent.setup();
     const initial = qaPipeline('qa');

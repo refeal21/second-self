@@ -236,10 +236,11 @@ export function NativeWorkspacePage({
 
   const status = pipeline.project.workflowStatus;
   const visualBlocked = status === 'blocked' && pipeline.blockedCondition?.resumeStage === 'visual_review';
-  const visualGenerationRunning = generation?.status === 'running' && generation.kind === 'visual';
+  const visualGeneration = generationMatchesPipeline(generation, pipeline) ? generation : null;
+  const visualGenerationRunning = visualGeneration?.status === 'running' && visualGeneration.kind === 'visual';
   const qaBlocked = status === 'blocked' && pipeline.blockedCondition?.resumeStage === 'qa';
-  const canApproveCurrent = currentVisual?.version.status === 'draft' &&
-    currentVisual.byteLength > 0 && previewState === 'ready';
+  const hasInspectableVisual = Boolean(currentVisual?.relativePath.trim() && currentVisual.byteLength > 0);
+  const canApproveCurrent = hasInspectableVisual && currentVisual?.version.status === 'draft' && previewState === 'ready';
   const savedPromptContext = normalizePromptContext(pipeline, getPromptContext(pipeline));
   const normalizedPromptContext = normalizePromptContext(pipeline, promptContext);
   const outlineValidationError = outlineDraft ? outlineDraftError(outlineDraft) : '尚无可审核的大纲。';
@@ -426,7 +427,7 @@ export function NativeWorkspacePage({
               busy={busy || editUncertain} promptContextDirty={promptContextDirty} run={update} onReload={applyPipeline} />
           </details>}
           {(status === 'visual_review' || visualBlocked) && <StageCard title={`5. 逐页视觉·${currentSpec?.title ?? pipeline.currentSlideId}`}>
-            {!currentVisual && !visualGenerationRunning && <p className="native-outline-save-state">
+            {!hasInspectableVisual && !visualGenerationRunning && <p className="native-outline-save-state">
               当前阶段正在等待生成视觉候选。批准前必须检查完整的 PNG；仅有提示词或任务完成状态不能批准。
             </p>}
             {currentSpec?.imageGenerationBrief && <details className="native-prompt-preview native-visual-prompt">
@@ -454,14 +455,14 @@ export function NativeWorkspacePage({
                 placeholder="例如：减少装饰，突出数据；不要在图中生成标题文字。" />
             </label>
             <div className="review-actions">
-              {!currentVisual && <button className="button button-secondary" disabled={busy} onClick={() => void update(
+              {!hasInspectableVisual && <button className="button button-secondary" disabled={busy} onClick={() => void update(
                 () => adapter.requestVisual(projectId, pipeline.currentSlideId!),
                 '视觉候选已生成并保存，请检查完整 PNG。',
-              )}>{visualActionLabel(generation, false)}</button>}
-              {currentVisual && <button className="button button-secondary" disabled={busy || !visualFeedback.trim()} onClick={() => void update(
+              )}>{visualActionLabel(visualGeneration, false)}</button>}
+              {hasInspectableVisual && <button className="button button-secondary" disabled={busy || !visualFeedback.trim()} onClick={() => void update(
                 () => adapter.requestVisual(projectId, pipeline.currentSlideId!, visualFeedback),
                 '视觉候选已生成并保存，请重新检查完整 PNG。',
-              )}>{visualActionLabel(generation, true)}</button>}
+              )}>{visualActionLabel(visualGeneration, true)}</button>}
               <label className={`button button-secondary${busy ? ' is-disabled' : ''}`} aria-disabled={busy}>上传替换 PNG<input hidden type="file" accept="image/png" disabled={busy} onChange={(event) => void replaceVisual(event)} /></label>
               <button className="button button-primary" disabled={busy || !canApproveCurrent} onClick={() => void update(() => adapter.approveVisual(projectId, pipeline.currentSlideId!), '当前页已批准，检查点已保存。')}>批准当前页</button>
             </div>
@@ -636,12 +637,18 @@ function generationMatchesPipeline(
 ): boolean {
   if (!generation || !pipeline) return Boolean(generation);
   if (generation.kind === 'memory') return true;
+  if (generation.kind === 'visual') {
+    const atVisualStage = pipeline.project.workflowStatus === 'visual_review' ||
+      (pipeline.project.workflowStatus === 'blocked' &&
+        pipeline.blockedCondition?.resumeStage === 'visual_review');
+    if (!atVisualStage) return false;
+    if (!generation.visualContext) return generation.status === 'running';
+    return pipeline.currentSlideId === generation.visualContext.slideId &&
+      pipeline.revision === generation.visualContext.baseRevision;
+  }
   const expected = pipeline.project.workflowStatus === 'intake' ? 'analysis'
     : pipeline.project.workflowStatus === 'source_analysis' ? 'outline'
       : pipeline.project.workflowStatus === 'detail_review' && !pipeline.slideSpecs ? 'details'
-        : pipeline.project.workflowStatus === 'visual_review' ||
-          (pipeline.project.workflowStatus === 'blocked' && pipeline.blockedCondition?.resumeStage === 'visual_review')
-          ? 'visual'
-          : null;
+        : null;
   return generation.kind === expected;
 }

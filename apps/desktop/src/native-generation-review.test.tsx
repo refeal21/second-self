@@ -58,15 +58,30 @@ function visualPipeline(projectId: string, revision = 1, candidate = false, bloc
   return pipeline;
 }
 
+function nextSlidePipeline(projectId: string, revision: number): NativePptPipeline {
+  const pipeline = visualPipeline(projectId, revision, true);
+  pipeline.slideSpecs!.value = [...pipeline.slideSpecs!.value, {
+    id: 'slide-2', title: '结论', body: ['下一步'], tables: [], charts: [], shapes: [], sourceMap: [],
+    imageGenerationBrief: '生成第 2 页完整 16:9 图片。',
+  }];
+  pipeline.visuals['slide-1']![0]!.version.status = 'frozen';
+  pipeline.visuals['slide-1']![0]!.version.frozenAt = '2026-09-07T00:01:00.000Z';
+  pipeline.currentSlideId = 'slide-2';
+  return pipeline;
+}
+
 function visualHarness({ candidate = false, blocked = false } = {}) {
   const projectId = 'project-visual';
   const saved = new Map([[projectId, visualPipeline(projectId, 1, candidate, blocked)]]);
   const registry = new ProjectGenerationRegistry();
   const attempts: ReturnType<typeof deferred<NativePptPipeline>>[] = [];
-  const requestVisual = vi.fn(() => {
+  const requestVisual = vi.fn((_id: string, slideId: string) => {
     const job = deferred<NativePptPipeline>();
     attempts.push(job);
-    const pending = registry.run(projectId, 'visual', () => job.promise);
+    const pending = registry.run(projectId, 'visual', () => job.promise, slideId);
+    registry.updateVisualContext(projectId, {
+      slideId, baseRevision: saved.get(projectId)!.revision,
+    });
     registry.updateProgress(projectId, '正在等待 ImageGen 返回 PNG');
     return pending;
   });
@@ -84,7 +99,7 @@ function visualHarness({ candidate = false, blocked = false } = {}) {
     saved.set(projectId, next);
     attempts[attempt]!.resolve(structuredClone(next));
   };
-  return { adapter, attempts, mount, finish, registry };
+  return { adapter, attempts, mount, finish, registry, saved };
 }
 
 function harness(projectIds = ['project-a']) {
@@ -177,6 +192,38 @@ describe('native generation lifecycle review', () => {
     test.mount();
     expect(await screen.findByRole('img', { name: '第 1 页视觉候选' })).toBeVisible();
     expect(screen.getByRole('alert')).toHaveTextContent('新候选生成失败');
+  });
+
+  it('does not replay a failed visual generation after a manual PNG replacement advances the checkpoint', async () => {
+    const test = visualHarness();
+    const first = test.mount();
+    fireEvent.click(await screen.findByRole('button', { name: '生成当前页' }));
+    first.unmount();
+    test.attempts[0]!.reject(new Error('旧视觉生成失败'));
+    await waitFor(() => expect(test.registry.get('project-visual')?.status).toBe('failed'));
+    test.saved.set('project-visual', visualPipeline('project-visual', 2, true));
+
+    test.mount();
+    expect(await screen.findByRole('img', { name: '第 1 页视觉候选' })).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重试按意见重新生成' })).not.toBeInTheDocument();
+  });
+
+  it('does not replay a prior-slide visual failure after approval advances to the next slide', async () => {
+    const test = visualHarness({ candidate: true });
+    const first = test.mount();
+    await screen.findByRole('img', { name: '第 1 页视觉候选' });
+    fireEvent.change(screen.getByRole('textbox', { name: '修改意见' }), { target: { value: '减少装饰' } });
+    fireEvent.click(screen.getByRole('button', { name: '按意见重新生成' }));
+    first.unmount();
+    test.attempts[0]!.reject(new Error('第 1 页旧失败'));
+    await waitFor(() => expect(test.registry.get('project-visual')?.status).toBe('failed'));
+    test.saved.set('project-visual', nextSlidePipeline('project-visual', 2));
+
+    test.mount();
+    expect(await screen.findByRole('heading', { name: '5. 逐页视觉·结论' })).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '生成当前页' })).toBeEnabled();
   });
 
   it('keeps the idle visual explanation and long technical prompt behind disclosure', async () => {

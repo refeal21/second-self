@@ -51,11 +51,11 @@ export function detailDocumentError(value: DetailDocument): string | null {
   if (value.outline.slides.length === 0 || value.specs.length === 0) return '细化至少需要 1 页。';
   if (value.outline.slides.length !== value.specs.length) return '大纲与细化页数不一致。';
 
-  const ids = new Set<string>();
+  const pageIds = new Set<string>();
   for (const [index, outlineSlide] of value.outline.slides.entries()) {
     const page = index + 1;
     const spec = value.specs[index]!;
-    const pageIdError = addId(ids, outlineSlide.id, `第 ${page} 页 ID`);
+    const pageIdError = addId(pageIds, outlineSlide.id, `第 ${page} 页 ID`);
     if (pageIdError) return pageIdError;
     if (spec.id !== outlineSlide.id) return `第 ${page} 页 ID 与大纲不一致。`;
     if (!outlineSlide.title.trim() || !spec.title.trim()) return `第 ${page} 页标题不能为空。`;
@@ -67,9 +67,10 @@ export function detailDocumentError(value: DetailDocument): string | null {
       return `第 ${page} 页图片提示词不能为空。`;
     }
 
+    const nestedIds = new Set<string>();
     for (const [tableIndex, table] of spec.tables.entries()) {
       const tableName = `第 ${page} 页表格 ${tableIndex + 1}`;
-      const idError = addId(ids, table.id, `${tableName} ID`);
+      const idError = addId(nestedIds, table.id, `${tableName} ID`);
       if (idError) return idError;
       if (table.headers.length === 0) return `${tableName} 至少需要 1 列。`;
       for (const [rowIndex, row] of table.rows.entries()) {
@@ -81,7 +82,7 @@ export function detailDocumentError(value: DetailDocument): string | null {
 
     for (const [chartIndex, chart] of spec.charts.entries()) {
       const chartName = `第 ${page} 页图表 ${chartIndex + 1}`;
-      const idError = addId(ids, chart.id, `${chartName} ID`);
+      const idError = addId(nestedIds, chart.id, `${chartName} ID`);
       if (idError) return idError;
       if (!['bar', 'line', 'pie'].includes(chart.type)) return `${chartName} 类型不受支持。`;
       if (chart.categories.length === 0) return `${chartName} 至少需要 1 个分类。`;
@@ -102,7 +103,7 @@ export function detailDocumentError(value: DetailDocument): string | null {
 
     for (const [shapeIndex, shape] of spec.shapes.entries()) {
       const shapeName = `第 ${page} 页形状 ${shapeIndex + 1}`;
-      const idError = addId(ids, shape.id, `${shapeName} ID`);
+      const idError = addId(nestedIds, shape.id, `${shapeName} ID`);
       if (idError) return idError;
       if (!['rect', 'ellipse', 'line'].includes(shape.type)) return `${shapeName} 类型不受支持。`;
       for (const [field, label] of [

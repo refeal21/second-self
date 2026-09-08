@@ -106,6 +106,34 @@ describe('detailDocumentError', () => {
       { ...specs[0]!, shapes: [{ ...specs[0]!.shapes[0]!, x: -1 }] }, specs[1]!,
     ]))).toContain('第 1 页形状 1 横坐标');
   });
+
+  it('scopes table, chart and shape identity uniqueness to each page', () => {
+    const secondPageWithReusedNestedIds: SlideSpec = {
+      ...specs[1]!,
+      tables: structuredClone(specs[0]!.tables),
+      charts: structuredClone(specs[0]!.charts),
+      shapes: structuredClone(specs[0]!.shapes),
+    };
+    const compatible = documentWith([specs[0]!, secondPageWithReusedNestedIds]);
+
+    expect(detailDocumentError(compatible)).toBeNull();
+    expect(compatible.specs[1]!.tables[0]!.id).toBe('table-kpi');
+    expect(compatible.specs[1]!.charts[0]!.id).toBe('chart-kpi');
+    expect(compatible.specs[1]!.shapes[0]!.id).toBe('shape-note');
+
+    expect(detailDocumentError(documentWith([{
+      ...specs[0]!,
+      tables: [specs[0]!.tables[0]!, { ...specs[0]!.tables[0]! }],
+    }, specs[1]!]))).toContain('第 1 页表格 2 ID 重复');
+    expect(detailDocumentError(documentWith([{
+      ...specs[0]!,
+      charts: [{ ...specs[0]!.charts[0]!, id: 'table-kpi' }],
+    }, specs[1]!]))).toContain('第 1 页图表 1 ID 重复');
+    expect(detailDocumentError(documentWith([{
+      ...specs[0]!,
+      shapes: [{ ...specs[0]!.shapes[0]!, id: 'chart-kpi' }],
+    }, specs[1]!]))).toContain('第 1 页形状 1 ID 重复');
+  });
 });
 
 describe('outline change detection', () => {

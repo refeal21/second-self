@@ -246,12 +246,15 @@ impl Database {
             return Ok(false);
         };
         let mut pipeline: serde_json::Value = json_column(encoded, 0)?;
+        let preserve_workflow_time = pipeline["schemaVersion"] == 2;
         let project = pipeline
             .get_mut("project")
             .and_then(serde_json::Value::as_object_mut)
             .ok_or_else(|| invalid_parameter("pipeline project object is invalid"))?;
         project.insert("name".into(), name.into());
-        project.insert("updatedAt".into(), updated_at.into());
+        if !preserve_workflow_time {
+            project.insert("updatedAt".into(), updated_at.into());
+        }
         let encoded = serde_json::to_string(&pipeline)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         transaction.execute(
@@ -363,6 +366,23 @@ impl Database {
         pipeline: &serde_json::Value,
         artifacts: &[PersistedArtifact],
     ) -> Result<bool> {
+        self.replace_pipeline_with_artifacts(
+            project_id,
+            expected_revision,
+            pipeline,
+            artifacts,
+            || Ok(()),
+        )
+    }
+
+    pub fn replace_pipeline_with_artifacts(
+        &self,
+        project_id: &str,
+        expected_revision: i64,
+        pipeline: &serde_json::Value,
+        artifacts: &[PersistedArtifact],
+        commit_artifacts: impl FnOnce() -> std::result::Result<(), String>,
+    ) -> Result<bool> {
         let revision = json_i64(pipeline, "/revision")?;
         if revision != expected_revision + 1 {
             return Err(invalid_parameter(
@@ -429,6 +449,9 @@ impl Database {
             ],
         )?;
         for table in ["versions", "approvals", "tasks"] {
+            if table == "versions" && pipeline["schemaVersion"] == 2 {
+                continue;
+            }
             transaction.execute(
                 &format!("DELETE FROM {table} WHERE project_id = ?1"),
                 params![project_id],
@@ -440,6 +463,18 @@ impl Database {
         }
         if let Some(version) = pipeline.pointer("/slideSpecs/version") {
             versions.push(version);
+        }
+        if let Some(history) = pipeline
+            .get("revisionHistory")
+            .and_then(serde_json::Value::as_array)
+        {
+            for entry in history {
+                for pointer in ["/baseOutline/version", "/baseSlideSpecs/version"] {
+                    if let Some(version) = entry.pointer(pointer) {
+                        versions.push(version);
+                    }
+                }
+            }
         }
         if let Some(visuals) = pipeline
             .pointer("/visuals")
@@ -453,14 +488,49 @@ impl Database {
                 }
             }
         }
+        let mut version_ids = std::collections::HashSet::new();
+        versions.retain(|version| version_ids.insert(version.get("id").cloned()));
         for (ordinal, version) in versions.into_iter().enumerate() {
+            let mut row_sequence = ordinal as i64 + 1;
+            if pipeline["schemaVersion"] == 2 {
+                let existing: Option<(String, String, Option<String>)> = transaction.query_row(
+                    "SELECT status, created_at, frozen_at FROM versions WHERE id = ?1 AND project_id = ?2",
+                    params![json_str(version, "/id")?, project_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).optional()?;
+                let status = json_str(version, "/status")?;
+                let created_at = json_str(version, "/createdAt")?;
+                let frozen_at = version.get("frozenAt").and_then(serde_json::Value::as_str);
+                if let Some((old_status, old_created_at, old_frozen_at)) = existing {
+                    if old_created_at != created_at
+                        || (old_status == "frozen"
+                            && (status != "frozen" || old_frozen_at.as_deref() != frozen_at))
+                    {
+                        return Err(invalid_parameter(
+                            "historical version metadata is immutable",
+                        ));
+                    }
+                    if old_status == "draft" && status == "frozen" {
+                        transaction.execute(
+                            "UPDATE versions SET status = 'frozen', frozen_at = ?2 WHERE id = ?1",
+                            params![json_str(version, "/id")?, frozen_at],
+                        )?;
+                    }
+                    continue;
+                }
+                row_sequence = transaction.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM versions WHERE project_id = ?1",
+                    [project_id],
+                    |row| row.get(0),
+                )?;
+            }
             transaction.execute(
                 "INSERT INTO versions (id, project_id, sequence, status, created_at, frozen_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     json_str(version, "/id")?,
                     project_id,
-                    ordinal as i64 + 1,
+                    row_sequence,
                     json_str(version, "/status")?,
                     json_str(version, "/createdAt")?,
                     version.get("frozenAt").and_then(serde_json::Value::as_str)
@@ -532,6 +602,7 @@ impl Database {
                 pipeline_json
             ],
         )?;
+        commit_artifacts().map_err(|error| invalid_parameter(&error))?;
         transaction.commit()?;
         Ok(true)
     }

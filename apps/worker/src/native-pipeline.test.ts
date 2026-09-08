@@ -445,6 +445,7 @@ describe('packaged native PPT workflow runtime', () => {
       kind: 'details.submit',
       at: '2026-09-03T02:04:30.000Z',
       specs: editedSpecs,
+      expectedRevision: result.pipeline.revision,
     });
     expect(result.pipeline.slideSpecs?.value[0]?.body).toEqual(['用户修改后的管理层汇报']);
     expect(result.pipeline.slideSpecs?.version).toMatchObject({ sequence: 1, status: 'draft' });

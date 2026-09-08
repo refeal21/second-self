@@ -20,16 +20,19 @@ use crate::{
         Database, NewMemoryProposal, NewProject, PersistedArtifact, PersistenceCounts,
         ProjectMutation, StoredProject,
     },
-    paths::{atomic_write_workspace_file, create_workspace_project_tree},
+    paths::{
+        atomic_write_workspace_file, create_workspace_project_tree, write_new_workspace_artifact,
+    },
 };
 
-const ARTIFACT_DIRECTORIES: [&str; 6] = [
+const ARTIFACT_DIRECTORIES: [&str; 7] = [
     "sources",
     "outline",
     "slide-specs",
     "visuals",
     "exports",
     "qa",
+    "history",
 ];
 
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -672,6 +675,13 @@ impl WorkbenchService {
         if current_revision != input.expected_revision {
             return Err("stale pipeline revision".into());
         }
+        validate_revision_commit(
+            &current.pipeline,
+            &input.pipeline,
+            &input.project_id,
+            input.expected_revision,
+        )?;
+        validate_revision_artifacts(&current.pipeline, &input.pipeline, &input.writes)?;
         validate_prompt_context_commit(
             &current.pipeline,
             &input.pipeline,
@@ -680,6 +690,8 @@ impl WorkbenchService {
             !input.writes.is_empty(),
         )?;
         let mut artifacts = Vec::with_capacity(input.writes.len());
+        let mut validated_writes = Vec::with_capacity(input.writes.len());
+        let mut write_paths = std::collections::HashSet::new();
         for (index, write) in input.writes.iter().enumerate() {
             let bytes = decode_base64(&write.contents_base64)?;
             if bytes.len() != write.byte_length || sha256(&bytes) != write.sha256 {
@@ -688,13 +700,16 @@ impl WorkbenchService {
                 );
             }
             validate_worker_relative_path(&write.relative_path)?;
-            atomic_write_workspace_file(
-                &workspace,
-                Path::new(&input.project_id)
-                    .join(&write.relative_path)
-                    .as_path(),
-                &bytes,
-            )?;
+            if !write_paths.insert(write.relative_path.clone()) {
+                return Err("Duplicate artifact write path".into());
+            }
+            if frozen_artifact_paths(&current.pipeline).contains(&write.relative_path) {
+                return Err("Frozen or historical artifacts are immutable".into());
+            }
+            validated_writes.push((
+                Path::new(&input.project_id).join(&write.relative_path),
+                bytes,
+            ));
             artifacts.push(PersistedArtifact {
                 id: format!(
                     "{}-artifact-{}-{}",
@@ -713,16 +728,31 @@ impl WorkbenchService {
                     .into(),
             });
         }
+        let mut new_artifacts = Vec::new();
         if !database
-            .replace_pipeline(
+            .replace_pipeline_with_artifacts(
                 &input.project_id,
                 input.expected_revision,
                 &input.pipeline,
                 &artifacts,
+                || {
+                    for (path, bytes) in &validated_writes {
+                        if input.pipeline["schemaVersion"] == 2 {
+                            new_artifacts
+                                .push(write_new_workspace_artifact(&workspace, path, bytes)?);
+                        } else {
+                            atomic_write_workspace_file(&workspace, path, bytes)?;
+                        }
+                    }
+                    Ok(())
+                },
             )
             .map_err(database_error)?
         {
             return Err("Unknown project".into());
+        }
+        for artifact in new_artifacts {
+            artifact.commit();
         }
         Ok(input.pipeline)
     }
@@ -1007,8 +1037,15 @@ impl WorkbenchService {
     }
 
     fn persist_mutation(&self, id: &str, mutation: &ProjectMutation) -> Result<(), String> {
-        let changed = self
-            .database()?
+        let database = self.database()?;
+        if database
+            .get_project(id)
+            .map_err(database_error)?
+            .is_some_and(|project| project.pipeline["schemaVersion"] == 2)
+        {
+            return Err("Versioned projects require a validated native pipeline action".into());
+        }
+        let changed = database
             .mutate_project(id, mutation)
             .map_err(database_error)?;
         if changed {
@@ -1131,6 +1168,332 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn frozen_artifact_paths(pipeline: &Value) -> std::collections::HashSet<String> {
+    let mut paths = std::collections::HashSet::new();
+    for (field, directory, stem) in [
+        ("outline", "outline", "outline"),
+        ("slideSpecs", "slide-specs", "slide-specs"),
+    ] {
+        let mut snapshots = vec![&pipeline[field]];
+        if let Some(history) = pipeline["revisionHistory"].as_array() {
+            let historical_field = if field == "outline" {
+                "baseOutline"
+            } else {
+                "baseSlideSpecs"
+            };
+            snapshots.extend(history.iter().map(|entry| &entry[historical_field]));
+        }
+        for snapshot in snapshots {
+            if snapshot["version"]["status"] == "frozen" {
+                if let Some(sequence) = snapshot["version"]["sequence"].as_i64() {
+                    paths.insert(format!("{directory}/{stem}-v{sequence}.json"));
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn validate_revision_artifacts(
+    current: &Value,
+    next: &Value,
+    writes: &[ArtifactWriteInput],
+) -> Result<(), String> {
+    if next["schemaVersion"] != 2 {
+        return Ok(());
+    }
+    let events = next["revisionEvents"]
+        .as_array()
+        .ok_or("Missing revision events")?;
+    let previous_count = current["revisionEvents"].as_array().map_or(0, Vec::len);
+    if events.len() == previous_count {
+        return Ok(());
+    }
+    let event = events.last().ok_or("Missing revision event")?;
+    let kind = event["kind"]
+        .as_str()
+        .ok_or("Missing revision event kind")?;
+    let mut expected: Vec<(String, &str, String, Value)> = Vec::new();
+    if current["schemaVersion"] == 1 {
+        let revision = current["revision"]
+            .as_i64()
+            .ok_or("Missing origin revision")?;
+        expected.push((
+            format!("history/checkpoint-v1-r{revision}.json"),
+            "pipeline-origin",
+            format!("checkpoint-r{revision}"),
+            current.clone(),
+        ));
+    }
+    if kind == "outline.revision.approve" {
+        let sequence = next["outline"]["version"]["sequence"]
+            .as_i64()
+            .ok_or("Missing outline sequence")?;
+        expected.push((
+            format!("outline/outline-v{sequence}.json"),
+            "outline",
+            next["outline"]["version"]["id"]
+                .as_str()
+                .ok_or("Missing outline id")?
+                .into(),
+            next["outline"]["value"].clone(),
+        ));
+    }
+    if kind == "outline.revision.approve" || kind == "details.submit" {
+        let sequence = next["slideSpecs"]["version"]["sequence"]
+            .as_i64()
+            .ok_or("Missing detail sequence")?;
+        expected.push((format!("slide-specs/slide-specs-v{sequence}.json"), "slide-specs", next["slideSpecs"]["version"]["id"].as_str().ok_or("Missing detail id")?.into(),
+            serde_json::json!({"outlineVersionId": next["outline"]["version"]["id"], "specs": next["slideSpecs"]["value"]})));
+    }
+    if kind == "outline.revision.approve" || kind == "outline.revision.cancel" {
+        let id = event["revisionId"].as_str().ok_or("Missing revision id")?;
+        expected.push((
+            format!("history/{id}.json"),
+            "outline-revision-history",
+            id.into(),
+            next["revisionHistory"]
+                .as_array()
+                .and_then(|history| history.last())
+                .ok_or("Missing revision history")?
+                .clone(),
+        ));
+    }
+    if writes.len() != expected.len() {
+        return Err("Revision commit must include its exact artifact set".into());
+    }
+    for (path, kind, version_id, value) in expected {
+        let write = writes
+            .iter()
+            .find(|write| write.relative_path == path)
+            .ok_or("Missing revision artifact")?;
+        let contents: Value = serde_json::from_slice(&decode_base64(&write.contents_base64)?)
+            .map_err(|_| "Revision artifact must be valid JSON")?;
+        if write.kind != kind
+            || write.version_id != version_id
+            || contents != value
+            || write.slide_id.is_some()
+            || write.metadata.is_some()
+        {
+            return Err("Revision artifact does not match its checkpoint".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_revision_commit(
+    current: &Value,
+    next: &Value,
+    project_id: &str,
+    expected_revision: i64,
+) -> Result<(), String> {
+    if next["revision"].as_i64() != Some(expected_revision + 1)
+        || next["project"]["id"] != project_id
+    {
+        return Err("Pipeline revision must advance once for the same project".into());
+    }
+    let old_schema = current["schemaVersion"].as_i64();
+    let new_schema = next["schemaVersion"].as_i64();
+    if !matches!(old_schema, Some(1 | 2))
+        || !matches!(new_schema, Some(1 | 2))
+        || (old_schema == Some(2) && new_schema != Some(2))
+    {
+        return Err("Unsupported pipeline schema or downgrade".into());
+    }
+    if new_schema == Some(1) {
+        for field in ["outline", "slideSpecs"] {
+            if current[field]["version"]["status"] == "frozen" && next[field] != current[field] {
+                return Err("Frozen versions are immutable".into());
+            }
+        }
+        return Ok(());
+    }
+    let old_events = current["revisionEvents"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let events = next["revisionEvents"]
+        .as_array()
+        .ok_or("Missing revision events")?;
+    let old_history = current["revisionHistory"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let history = next["revisionHistory"]
+        .as_array()
+        .ok_or("Missing revision history")?;
+    if !events.starts_with(&old_events)
+        || !history.starts_with(&old_history)
+        || events.len() > old_events.len() + 1
+    {
+        return Err("Prior revision events and history are immutable".into());
+    }
+    if old_schema == Some(1) {
+        if next["revisionOrigin"] != *current
+            || events.len() != 1
+            || events[0]["kind"] != "outline.revision.save"
+        {
+            return Err("First revision must preserve the exact v1 origin".into());
+        }
+    } else if next["revisionOrigin"] != current["revisionOrigin"] {
+        return Err("Revision origin is immutable".into());
+    }
+    if next["revisionOrigin"]["schemaVersion"] != 1 {
+        return Err("Revision origin must be v1".into());
+    }
+    for field in ["sources", "analysis", "preferenceSnapshot", "promptContext"] {
+        if current[field] != next[field] {
+            return Err(format!("Revision must preserve {field}"));
+        }
+    }
+    let old_approvals = current["approvals"].as_array().ok_or("Missing approvals")?;
+    let approvals = next["approvals"].as_array().ok_or("Missing approvals")?;
+    let old_tasks = current["tasks"].as_array().ok_or("Missing tasks")?;
+    let tasks = next["tasks"].as_array().ok_or("Missing tasks")?;
+    if !approvals.starts_with(old_approvals) || !tasks.starts_with(old_tasks) {
+        return Err("Historical approval and task evidence is immutable".into());
+    }
+    if events.len() == old_events.len() {
+        if !current["outlineRevisionDraft"].is_null() {
+            return Err("Pending revision blocks downstream actions".into());
+        }
+        if next["outline"] != current["outline"]
+            || next["revisionHistory"] != current["revisionHistory"]
+            || next["outlineRevisionDraft"] != current["outlineRevisionDraft"]
+        {
+            return Err("Unjournaled structure mutation".into());
+        }
+        if current["slideSpecs"]["version"]["status"] == "frozen"
+            && current["slideSpecs"] != next["slideSpecs"]
+        {
+            return Err("Frozen details are immutable".into());
+        }
+        if current["slideSpecs"]["version"]["status"] == "draft" {
+            let mut frozen = current["slideSpecs"].clone();
+            frozen["version"]["status"] = "frozen".into();
+            frozen["version"]["frozenAt"] = next["project"]["updatedAt"].clone();
+            if next["slideSpecs"] != frozen || next["project"]["workflowStatus"] != "visual_review"
+            {
+                return Err("Unjournaled details mutation".into());
+            }
+        }
+        return Ok(());
+    }
+    if current["project"]["workflowStatus"] != "detail_review"
+        || next["project"]["workflowStatus"] != "detail_review"
+        || current["outline"]["version"]["status"] != "frozen"
+        || current["slideSpecs"]["version"]["status"] != "draft"
+    {
+        return Err("Revision edits require unfrozen detail review".into());
+    }
+    for field in [
+        "visuals",
+        "currentSlideId",
+        "blockedCondition",
+        "exportReceipt",
+        "qaReport",
+    ] {
+        if current[field] != next[field] {
+            return Err("Revision edits cannot change downstream artifacts".into());
+        }
+    }
+    let event = events.last().unwrap();
+    if event["expectedRevision"].as_i64() != Some(expected_revision)
+        || event["at"] != next["project"]["updatedAt"]
+    {
+        return Err("Revision event baseline or time does not match the commit".into());
+    }
+    let kind = event["kind"].as_str().ok_or("Missing revision kind")?;
+    let mut expected = current.clone();
+    if old_schema == Some(1) {
+        expected["outlineRevisionDraft"] = Value::Null;
+        expected["revisionHistory"] = serde_json::json!([]);
+    }
+    let pending = current["outlineRevisionDraft"].clone();
+    if kind == "details.submit" {
+        if !pending.is_null() {
+            return Err("Pending revision blocks details save".into());
+        }
+        expected["slideSpecs"]["value"] = event["specs"].clone();
+        expected["slideSpecs"]["version"] = revision_version(
+            project_id,
+            "slide-specs",
+            current["slideSpecs"]["version"]["sequence"]
+                .as_i64()
+                .ok_or("Missing detail sequence")?
+                + 1,
+            &event["at"],
+            false,
+        );
+    } else {
+        let id = event["revisionId"].as_str().ok_or("Missing revision id")?;
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            || event["baseOutlineVersionId"] != current["outline"]["version"]["id"]
+            || old_history.iter().any(|entry| entry["id"] == id)
+            || (!pending.is_null() && pending["id"] != id)
+        {
+            return Err("Stale or reused revision identity".into());
+        }
+        match kind {
+            "outline.revision.save" => {
+                expected["outlineRevisionDraft"] = serde_json::json!({"id": id, "baseOutlineVersionId": event["baseOutlineVersionId"],
+                    "outline": event["outline"], "specs": event["specs"], "createdAt": if pending.is_null() { &event["at"] } else { &pending["createdAt"] }, "updatedAt": event["at"]});
+            }
+            "outline.revision.approve" | "outline.revision.cancel" => {
+                if pending.is_null() {
+                    return Err("No pending revision to decide".into());
+                }
+                let confirmed = kind == "outline.revision.approve";
+                if confirmed {
+                    expected["outline"] = serde_json::json!({"version": revision_version(project_id, "outline", current["outline"]["version"]["sequence"].as_i64().ok_or("Missing outline sequence")? + 1, &event["at"], true), "value": pending["outline"]});
+                    expected["slideSpecs"] = serde_json::json!({"version": revision_version(project_id, "slide-specs", current["slideSpecs"]["version"]["sequence"].as_i64().ok_or("Missing detail sequence")? + 1, &event["at"], false), "value": pending["specs"]});
+                    let proof = serde_json::json!({"id": format!("{project_id}-outline_review-{}", old_approvals.len() + 1), "projectId": project_id,
+                        "versionId": expected["outline"]["version"]["id"], "stage": "outline_review", "status": "approved", "decidedAt": event["at"]});
+                    expected["approvals"].as_array_mut().unwrap().push(proof);
+                }
+                let entry = serde_json::json!({"id": id, "status": if confirmed { "confirmed" } else { "cancelled" },
+                    "baseOutline": current["outline"], "baseSlideSpecs": current["slideSpecs"], "draft": pending, "decidedAt": event["at"],
+                    "newOutlineVersionId": if confirmed { expected["outline"]["version"]["id"].clone() } else { Value::Null }});
+                expected["revisionHistory"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(entry);
+                expected["outlineRevisionDraft"] = Value::Null;
+            }
+            _ => return Err("Unknown revision event kind".into()),
+        }
+    }
+    for field in [
+        "outline",
+        "slideSpecs",
+        "outlineRevisionDraft",
+        "revisionHistory",
+        "approvals",
+    ] {
+        if expected[field] != next[field] {
+            return Err(format!("Revision event does not justify {field}"));
+        }
+    }
+    if kind != "details.submit" && tasks != old_tasks {
+        return Err("Structure edits cannot create generation tasks".into());
+    }
+    Ok(())
+}
+
+fn revision_version(
+    project_id: &str,
+    kind: &str,
+    sequence: i64,
+    at: &Value,
+    frozen: bool,
+) -> Value {
+    serde_json::json!({"id": format!("{project_id}-{kind}-v{sequence}"), "projectId": project_id, "sequence": sequence,
+        "status": if frozen { "frozen" } else { "draft" }, "createdAt": at, "frozenAt": if frozen { at.clone() } else { Value::Null }})
 }
 
 fn validate_worker_relative_path(value: &str) -> Result<(), String> {

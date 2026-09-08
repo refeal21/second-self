@@ -44,6 +44,7 @@ import type { QaRunner } from './libreoffice-qa.js';
 import { PptxGenJsExporter, type PptxExporter } from './pptx-exporter.js';
 import type { WorkspaceArtifactAccess } from './workspace-artifacts.js';
 import { PNG } from 'pngjs';
+import { validateNativePipelineCheckpoint, type NativePptPipeline } from './native-pipeline.js';
 import {
   OutlineGenerationService,
   SlideSpecGenerationService,
@@ -478,6 +479,28 @@ export class PptProjectService {
     );
     this.#transition(state, 'detail_review');
     return frozen;
+  }
+
+  /** Native replay accepts only a complete checkpoint whose provenance passes native validation. */
+  async restoreVersionedStructure(projectId: string, checkpoint: NativePptPipeline): Promise<void> {
+    validateNativePipelineCheckpoint(checkpoint);
+    const state = this.#requireStage(projectId, 'source_analysis');
+    if (checkpoint.schemaVersion !== 2 || checkpoint.project.id !== projectId
+      || !checkpoint.outline || !checkpoint.slideSpecs
+      || JSON.stringify(checkpoint.analysis?.output) !== JSON.stringify(state.sourceAnalysis)
+      || checkpoint.sources.map(({ id }) => id).join('|') !== state.sources.map(({ id }) => id).join('|')) {
+      throw new Error('Versioned replay checkpoint does not match project analysis');
+    }
+    await this.#artifacts.write(projectId, `outline/outline-v${checkpoint.outline.version.sequence}.json`, JSON.stringify(checkpoint.outline.value, null, 2));
+    await this.#artifacts.write(projectId, `slide-specs/slide-specs-v${checkpoint.slideSpecs.version.sequence}.json`, JSON.stringify({
+      outlineVersionId: checkpoint.outline.version.id, specs: checkpoint.slideSpecs.value,
+    }, null, 2));
+    state.outline = structuredClone(checkpoint.outline);
+    state.slideSpecs = structuredClone(checkpoint.slideSpecs);
+    state.approvals = structuredClone(checkpoint.approvals.filter(({ stage }) => stage !== 'visual_review'));
+    this.#transition(state, 'outline_review');
+    this.#transition(state, 'detail_review');
+    if (state.slideSpecs.version.status === 'frozen') this.#transition(state, 'visual_review');
   }
 
   async submitSlideSpecs(

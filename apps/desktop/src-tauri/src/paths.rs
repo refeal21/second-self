@@ -91,7 +91,7 @@ where
         .map_err(|_| "Workspace root does not exist".to_string())?;
 
     #[cfg(unix)]
-    write_at_workspace_fd(&workspace, &components, contents, parent_opened)?;
+    write_at_workspace_fd(&workspace, &components, contents, parent_opened, false)?;
 
     #[cfg(not(unix))]
     {
@@ -116,6 +116,76 @@ where
     }
 
     Ok(workspace.join(candidate))
+}
+
+/// An exclusively created artifact, removed on rollback through its held parent fd.
+/// Exact existing bytes can be reused after a crash, but are never replaced or rolled back.
+pub struct NewWorkspaceArtifact {
+    #[cfg(unix)]
+    directory: std::os::fd::OwnedFd,
+    #[cfg(unix)]
+    name: std::ffi::CString,
+    #[cfg(unix)]
+    identity: (u64, u64),
+    committed: bool,
+}
+
+impl NewWorkspaceArtifact {
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for NewWorkspaceArtifact {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the descriptor is held live and the name is nul-terminated.
+            let result = unsafe {
+                libc::fstatat(
+                    self.directory.as_raw_fd(),
+                    self.name.as_ptr(),
+                    metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == 0 {
+                // SAFETY: successful fstatat initialized the metadata.
+                let metadata = unsafe { metadata.assume_init() };
+                if (metadata.st_dev as u64, metadata.st_ino as u64) == self.identity {
+                    // SAFETY: remove only the inode this operation created, relative to its held parent.
+                    unsafe {
+                        libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn write_new_workspace_artifact(
+    workspace_root: &Path,
+    candidate: &Path,
+    contents: &[u8],
+) -> Result<NewWorkspaceArtifact, String> {
+    let components = strict_relative_components(candidate)?;
+    let workspace = fs::canonicalize(workspace_root)
+        .map_err(|_| "Workspace root does not exist".to_string())?;
+    #[cfg(unix)]
+    {
+        write_at_workspace_fd(&workspace, &components, contents, || {}, true)?
+            .ok_or_else(|| "Missing new artifact ownership".into())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (components, workspace, contents);
+        Err("Revision artifact transactions require fd-relative filesystem support".into())
+    }
 }
 
 /// Creates a project and its fixed artifact directories while walking only
@@ -174,7 +244,8 @@ fn write_at_workspace_fd(
     components: &[std::ffi::OsString],
     contents: &[u8],
     parent_opened: impl FnOnce(),
-) -> Result<(), String> {
+    exclusive: bool,
+) -> Result<Option<NewWorkspaceArtifact>, String> {
     use std::{
         ffi::CString,
         io::Write,
@@ -288,20 +359,84 @@ fn write_at_workspace_fd(
         temporary_file
             .sync_all()
             .map_err(|error| format!("Artifact sync failed: {error}"))?;
+        let mut owned = if exclusive {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = temporary_file
+                .metadata()
+                .map_err(|error| format!("Artifact identity read failed: {error}"))?;
+            Some(NewWorkspaceArtifact {
+                directory: directory.try_clone().map_err(|error| error.to_string())?,
+                name: target_name.clone(),
+                identity: (metadata.dev(), metadata.ino()),
+                committed: false,
+            })
+        } else {
+            None
+        };
         // SAFETY: both names are valid and relative to the held directory fd.
         let committed = unsafe {
-            libc::renameat(
-                directory.as_raw_fd(),
-                temporary_name.as_ptr(),
-                directory.as_raw_fd(),
-                target_name.as_ptr(),
-            )
+            if exclusive {
+                libc::linkat(
+                    directory.as_raw_fd(),
+                    temporary_name.as_ptr(),
+                    directory.as_raw_fd(),
+                    target_name.as_ptr(),
+                    0,
+                )
+            } else {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    temporary_name.as_ptr(),
+                    directory.as_raw_fd(),
+                    target_name.as_ptr(),
+                )
+            }
         };
         if committed != 0 {
-            return Err(format!(
-                "Artifact commit failed: {}",
-                std::io::Error::last_os_error()
-            ));
+            let error = std::io::Error::last_os_error();
+            if exclusive && error.kind() == ErrorKind::AlreadyExists {
+                use std::io::Read;
+                // SAFETY: read the existing final file through the held directory, rejecting
+                // symlinks and avoiding a blocking open if an unexpected FIFO is present.
+                let fd = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        target_name.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                    )
+                };
+                if fd >= 0 {
+                    // SAFETY: fd is freshly opened and uniquely owned by File.
+                    let existing = unsafe { fs::File::from_raw_fd(fd) };
+                    let metadata = existing.metadata().map_err(|error| error.to_string())?;
+                    if metadata.is_file() && metadata.len() == contents.len() as u64 {
+                        let mut actual = Vec::with_capacity(contents.len());
+                        existing
+                            .take(contents.len() as u64 + 1)
+                            .read_to_end(&mut actual)
+                            .map_err(|error| error.to_string())?;
+                        if actual == contents {
+                            // This operation did not create the existing file; never delete it.
+                            owned
+                                .as_mut()
+                                .expect("exclusive artifact ownership")
+                                .committed = true;
+                            // SAFETY: remove only the uniquely named temporary file we created.
+                            unsafe {
+                                libc::unlinkat(directory.as_raw_fd(), temporary_name.as_ptr(), 0);
+                            }
+                            return Ok(owned);
+                        }
+                    }
+                }
+            }
+            return Err(format!("Artifact commit failed: {}", error));
+        }
+        if exclusive {
+            // SAFETY: remove only our unique temporary hardlink; final name retains the contents.
+            unsafe {
+                libc::unlinkat(directory.as_raw_fd(), temporary_name.as_ptr(), 0);
+            }
         }
         // SAFETY: fsync accepts this live directory descriptor.
         if unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
@@ -310,7 +445,7 @@ fn write_at_workspace_fd(
                 std::io::Error::last_os_error()
             ));
         }
-        Ok(())
+        Ok(owned)
     })();
     if result.is_err() {
         // SAFETY: best-effort removal of our uniquely named temporary file.

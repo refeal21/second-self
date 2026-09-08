@@ -83,7 +83,7 @@ describe('worker sidecar process integration', () => {
     ).toMatchObject({ result: { status: 'ready' } });
   });
 
-  it('restores and finishes the five-page production pipeline through newline JSON-RPC', async () => {
+  it.each([1, 2])('restores and finishes the five-page v%i pipeline through newline JSON-RPC', async (schemaVersion) => {
     let requestId = 10;
     const call = async <T>(worker: ReturnType<typeof startWorker>, method: string, params: unknown): Promise<T> => {
       const response = await worker.request(JSON.stringify({ jsonrpc: '2.0', id: requestId++, method, params }));
@@ -91,7 +91,7 @@ describe('worker sidecar process integration', () => {
       return response.result as T;
     };
     const createdAt = '2026-09-03T03:00:00.000Z';
-    const first = startWorker();
+    let first = startWorker();
     const created = await call<NativePipelineResult>(first, 'ppt.project.create', {
       id: 'project-sidecar-golden', name: '五页经营复盘', goal: '管理层决策', createdAt,
       preferenceSnapshot: [],
@@ -115,7 +115,24 @@ describe('worker sidecar process integration', () => {
     result = await execute(first, { kind: 'details.submit', at: createdAt, specs: goldenSlideSpecs() });
     const editedSpecs = goldenSlideSpecs().map((spec) => structuredClone(spec));
     editedSpecs[0] = { ...editedSpecs[0]!, body: ['用户编辑｜管理层汇报｜2026 年 9 月'] };
-    result = await execute(first, { kind: 'details.submit', at: createdAt, specs: editedSpecs });
+    result = await execute(first, { kind: 'details.submit', at: createdAt, specs: editedSpecs, expectedRevision: result.pipeline.revision });
+    if (schemaVersion === 2) {
+      const revisedOutline = { ...editedOutline, slides: editedOutline.slides.map((page, index) => ({ ...page,
+        title: editedSpecs[index]!.title, purpose: index === 0 ? '用户明确修订的页面目的' : page.purpose })) };
+      const oldApproval = structuredClone(result.pipeline.approvals[0]);
+      const baseOutlineVersionId = result.pipeline.outline!.version.id;
+      result = await execute(first, { kind: 'outline.revision.save', at: createdAt, expectedRevision: result.pipeline.revision,
+        revisionId: 'sidecar-revision-one', baseOutlineVersionId, outline: revisedOutline, specs: editedSpecs });
+      first.child.kill('SIGKILL');
+      await once(first.child, 'exit');
+      first = startWorker();
+      const restoredPending = await call<NativePptPipeline>(first, 'ppt.project.restore', { pipeline: result.pipeline });
+      expect(restoredPending).toEqual(result.pipeline);
+      result = await execute(first, { kind: 'outline.revision.approve', at: createdAt, expectedRevision: result.pipeline.revision,
+        revisionId: 'sidecar-revision-one', baseOutlineVersionId });
+      expect(result.pipeline.approvals[0]).toEqual(oldApproval);
+      expect(result.pipeline.slideSpecs!.version.status).toBe('draft');
+    }
     result = await execute(first, { kind: 'details.approve', at: createdAt });
     expect(result.pipeline.currentSlideId).toBe('slide-cover');
 
@@ -158,7 +175,8 @@ describe('worker sidecar process integration', () => {
     expect(result.pipeline.project.workflowStatus).toBe('completed');
     expect(result.pipeline.qaReport).toMatchObject({ status: 'passed', actualPageCount: 5 });
     expect(new Set(result.pipeline.qaReport!.comparisons.map(({ approvedVisualPath }) => approvedVisualPath)).size).toBe(5);
-    expect(result.pipeline).toMatchObject({ revision: 29 });
+    expect(result.pipeline).toMatchObject({ schemaVersion, revision: schemaVersion === 2 ? 31 : 29 });
+    expect(result.pipeline.exportReceipt!.specVersionId).toBe(`project-sidecar-golden-slide-specs-v${schemaVersion}`);
     expect(result.pipeline.tasks).toHaveLength(12);
 
     const legitimateCompleted = structuredClone(result.pipeline);
@@ -194,7 +212,7 @@ describe('worker sidecar process integration', () => {
     const exactFinalApprovalForgery = structuredClone(legitimateCompleted);
     exactFinalApprovalForgery.tasks.find(({ id }) => id === visualTasks.at(-1)!.id)!.id =
       exactFinalApprovalForgery.tasks.find(({ id }) => id === visualTasks.at(-1)!.id)!.id
-        .replace('-task-25-', '-task-27-');
+        .replace(/-task-(\d+)-/, (_match, revision: string) => `-task-${Number(revision) + 2}-`);
     const approvalSlotPermutation = structuredClone(legitimateCompleted);
     for (const task of approvalSlotPermutation.tasks.filter(({ kind }) => kind === 'visual_generation')) {
       task.id = task.id.replace(/-task-(\d+)-/, (_match, revision: string) =>

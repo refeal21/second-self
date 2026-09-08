@@ -193,6 +193,7 @@ describe('LibreOffice presentation QA', () => {
     expect(result.slideEvidence).toEqual([{
       imageCount: 1,
       textValues: ['可编辑标题'],
+      textBlocks: [],
       tableCount: 1,
       chartCount: 1,
       shapeCount: 1,

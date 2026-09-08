@@ -3,6 +3,12 @@ import { basename } from 'node:path';
 import type { Approval, Version, WorkflowStatus } from '@digital-twin/core';
 import { PNG } from 'pngjs';
 import {
+  applyRevisionEvent, requireRevisionBaseline, validateRevisionProvenance,
+  type NativeOutlineRevisionAction, type NativeOutlineRevisionDraft,
+  type NativeOutlineRevisionHistory, type NativeRevisionEvent,
+} from './outline-revisions.js';
+export type { NativeOutlineRevisionDraft, NativeOutlineRevisionHistory, NativeOutlineRevisionAction, NativeRevisionEvent } from './outline-revisions.js';
+import {
   createIsolatedPptWorkflow,
   type ApprovedVisualAsset,
   type PptOutline,
@@ -77,7 +83,11 @@ export interface NativeExportReceipt {
 }
 
 export interface NativePptPipeline {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
+  outlineRevisionDraft?: NativeOutlineRevisionDraft | null;
+  revisionHistory?: NativeOutlineRevisionHistory[];
+  revisionOrigin?: NativePptPipeline;
+  revisionEvents?: NativeRevisionEvent[];
   revision: number;
   project: {
     id: string;
@@ -153,12 +163,13 @@ export type NativeQaPreparation =
     };
 
 export type NativePipelineAction =
+  | NativeOutlineRevisionAction
   | { kind: 'context.update'; at: string; context: NativePromptContext }
   | { kind: 'analysis.commit'; at: string; requestId: string; output: SourceAnalysis }
   | { kind: 'outline.submit'; at: string; outline: PptOutline }
   | { kind: 'outline.approve'; at: string }
-  | { kind: 'details.submit'; at: string; specs: readonly SlideSpec[] }
-  | { kind: 'details.approve'; at: string }
+  | { kind: 'details.submit'; at: string; specs: readonly SlideSpec[]; expectedRevision?: number }
+  | { kind: 'details.approve'; at: string; expectedRevision?: number }
   | { kind: 'visual.generate'; at: string; slideId: string; feedback?: string }
   | { kind: 'visual.replace'; at: string; slideId: string; imageBase64: string; altText: string }
   | { kind: 'visual.approve'; at: string; slideId: string }
@@ -170,6 +181,9 @@ export function parseNativePipelineAction(value: unknown): NativePipelineAction 
   const action = requireRecordValue(value, 'action');
   const kind = requireStringValue(action.kind, 'action.kind');
   requireStringValue(action.at, 'action.at');
+  if (action.expectedRevision !== undefined && (!Number.isSafeInteger(action.expectedRevision) || Number(action.expectedRevision) < 1)) {
+    throw new Error('Expected revision must be a positive integer');
+  }
   switch (kind) {
     case 'context.update':
       requireExactKeys(action, ['kind', 'at', 'context'], kind);
@@ -185,12 +199,27 @@ export function parseNativePipelineAction(value: unknown): NativePipelineAction 
       validateOutlineValue(action.outline);
       break;
     case 'outline.approve':
-    case 'details.approve':
       requireExactKeys(action, ['kind', 'at'], kind);
       break;
+    case 'details.approve':
+      requireExactKeys(action, ['kind', 'at', ...(action.expectedRevision === undefined ? [] : ['expectedRevision'])], kind);
+      break;
     case 'details.submit':
-      requireExactKeys(action, ['kind', 'at', 'specs'], 'details.submit');
+      requireExactKeys(action, ['kind', 'at', 'specs', ...(action.expectedRevision === undefined ? [] : ['expectedRevision'])], 'details.submit');
       validateSlideSpecsValue(action.specs);
+      break;
+    case 'outline.revision.save':
+    case 'outline.revision.approve':
+    case 'outline.revision.cancel':
+      requireExactKeys(action, ['kind', 'at', 'expectedRevision', 'revisionId', 'baseOutlineVersionId',
+        ...(kind === 'outline.revision.save' ? ['outline', 'specs'] : [])], kind);
+      if (action.expectedRevision === undefined) throw new Error('Revision action requires expected revision');
+      requireIdentifier(requireStringValue(action.revisionId, 'revisionId'), 'revision id');
+      requireIdentifier(requireStringValue(action.baseOutlineVersionId, 'baseOutlineVersionId'), 'base outline version id');
+      if (kind === 'outline.revision.save') {
+        validateOutlineValue(action.outline);
+        validateSlideSpecsValue(action.specs);
+      }
       break;
     case 'visual.generate':
       requireExactKeys(
@@ -312,12 +341,46 @@ export class NativePptRpcRuntime {
     projectId: string,
     action: NativePipelineAction,
   ): Promise<NativePipelineResult> {
+    action = parseNativePipelineAction(action);
     const current = this.#require(projectId);
+    if (current.schemaVersion === 2 && (!Number.isFinite(Date.parse(action.at)) || Date.parse(action.at) < Date.parse(current.project.updatedAt))) {
+      throw new Error('Action timestamp must follow the saved checkpoint');
+    }
+    if ('expectedRevision' in action && action.expectedRevision !== undefined) requireRevisionBaseline(current, action.expectedRevision);
+    if (current.outlineRevisionDraft && !action.kind.startsWith('outline.revision.')) {
+      throw new Error('Pending outline revision must be confirmed or cancelled before other actions');
+    }
     const state = structuredClone(current);
     const writes: NativeArtifactWrite[] = [];
     let message: string;
     let contextTaskKind: NativeTaskRecord['kind'] | null = null;
     switch (action.kind) {
+      case 'outline.revision.save':
+      case 'outline.revision.approve':
+      case 'outline.revision.cancel': {
+        if (state.schemaVersion === 1) {
+          if (action.kind !== 'outline.revision.save') throw new Error('No outline revision is pending');
+          state.revisionOrigin = structuredClone(current);
+          state.schemaVersion = 2;
+          state.revisionHistory = [];
+          state.revisionEvents = [];
+          state.outlineRevisionDraft = null;
+          writes.push(createWrite(`history/checkpoint-v1-r${current.revision}.json`, jsonBytes(current), 'pipeline-origin', `checkpoint-r${current.revision}`));
+        }
+        applyRevisionEvent(state, action, validateRevisionDocument);
+        state.revisionEvents!.push(structuredClone(action));
+        if (action.kind === 'outline.revision.approve') {
+          writes.push(createWrite(`outline/outline-v${state.outline!.version.sequence}.json`, jsonBytes(state.outline!.value), 'outline', state.outline!.version.id));
+          writes.push(createWrite(`slide-specs/slide-specs-v${state.slideSpecs!.version.sequence}.json`,
+            jsonBytes({ outlineVersionId: state.outline!.version.id, specs: state.slideSpecs!.value }), 'slide-specs', state.slideSpecs!.version.id));
+        }
+        if (action.kind !== 'outline.revision.save') {
+          writes.push(createWrite(`history/${action.revisionId}.json`, jsonBytes(state.revisionHistory!.at(-1)), 'outline-revision-history', action.revisionId));
+        }
+        message = action.kind === 'outline.revision.save' ? '大纲结构修订已保存，等待明确确认。'
+          : action.kind === 'outline.revision.approve' ? '大纲结构变更已确认，全部页面细化仍待审核。' : '结构修订已放弃，原内容已保留。';
+        break;
+      }
       case 'context.update': {
         if (!['intake', 'source_analysis', 'outline_review'].includes(state.project.workflowStatus)
           || (state.project.workflowStatus === 'outline_review' && state.outline?.version.status !== 'draft')) {
@@ -424,6 +487,21 @@ export class NativePptRpcRuntime {
         break;
       }
       case 'details.submit': {
+        if (state.slideSpecs) requireRevisionBaseline(state, action.expectedRevision);
+        if (state.schemaVersion === 1 && state.slideSpecs && action.specs.some((spec) => {
+          const previous = state.slideSpecs!.value.find(({ id }) => id === spec.id);
+          const approved = state.outline!.value.slides.find(({ id }) => id === spec.id);
+          return previous && spec.title !== previous.title && spec.title !== approved?.title;
+        })) throw new Error('Changed page titles require an outline revision');
+        if (state.schemaVersion === 2) {
+          const event = { ...action, expectedRevision: action.expectedRevision! };
+          applyRevisionEvent(state, event, validateRevisionDocument);
+          state.revisionEvents!.push(structuredClone(event));
+          writes.push(createWrite(`slide-specs/slide-specs-v${state.slideSpecs!.version.sequence}.json`,
+            jsonBytes({ outlineVersionId: state.outline!.version.id, specs: state.slideSpecs!.value }), 'slide-specs', state.slideSpecs!.version.id));
+          message = '全部页面细化修改已保存，等待整体审批。';
+          break;
+        }
         const workflow = await replayPipeline(state, 'detail_review');
         const service = new (await import('./structure-generation.js')).SlideSpecGenerationService(
           workflow.projects,
@@ -604,7 +682,7 @@ export class NativePptRpcRuntime {
           state.project.workflowStatus = 'qa';
           state.blockedCondition = null;
         }
-        await replayPipeline(state, 'qa');
+        await replayPipeline(current, 'qa');
         const receipt = state.exportReceipt;
         if (!receipt || !state.slideSpecs) {
           throw new Error('QA requires a committed export receipt and approved slide specs');
@@ -689,9 +767,10 @@ export class NativePptRpcRuntime {
         const editableEvidenceIssues = specs.flatMap((spec, index) => {
           const evidence = inspection.slideEvidence?.[index];
           if (!evidence) return [`Missing OOXML object evidence for page ${index + 1}`];
-          const titleOccurrences = evidence.textValues.filter((value) => value === spec.title).length;
-          const missingBody = spec.body.filter((text) =>
-            !evidence.textValues.some((value) => value === text || value.includes(text)));
+          const textBlocks = evidence.textBlocks ?? evidence.textValues;
+          const titleOccurrences = textBlocks.filter((value) => value === spec.title).length;
+          const missingBody = spec.body.filter((text) => !textBlocks.some((value) =>
+            value === text || value.startsWith(`${text}\n`) || value.endsWith(`\n${text}`) || value.includes(`\n${text}\n`)));
           const minimumShapes = 1 + (spec.body.length > 0 ? 1 : 0) + spec.shapes.length;
           return [
             ...(evidence.imageCount > 0 ? [] : [
@@ -787,6 +866,7 @@ export class NativePptRpcRuntime {
     state.revision += 1;
     state.project.updatedAt = action.at;
     validatePipeline(state);
+    requireRevisionBaseline(this.#require(projectId), current.revision);
     this.#projects.set(projectId, structuredClone(state));
     return { pipeline: structuredClone(state), writes, message };
   }
@@ -1073,7 +1153,10 @@ async function replayPipeline(
     });
     await service.execute(state.analysis.requestId);
   }
-  if (state.outline) {
+  if (state.schemaVersion === 2) {
+    // The native validator has authenticated the full origin/event history before hydration.
+    await workflow.projects.restoreVersionedStructure(state.project.id, state);
+  } else if (state.outline) {
     await workflow.projects.submitOutline(state.project.id, state.outline.value);
     if (state.outline.version.status === 'frozen') {
       workflow.projects.approveOutline(
@@ -1082,7 +1165,7 @@ async function replayPipeline(
       );
     }
   }
-  if (state.slideSpecs) {
+  if (state.schemaVersion === 1 && state.slideSpecs) {
     await workflow.projects.submitSlideSpecs(state.project.id, state.slideSpecs.value);
     if (state.slideSpecs.version.status === 'frozen') {
       workflow.projects.approveSlideSpecs(
@@ -1466,6 +1549,23 @@ function validateSlideSpecReferences(specs: readonly SlideSpec[], analysis: Sour
   }
 }
 
+function validateRevisionDocument(outline: PptOutline, specs: readonly SlideSpec[], state: NativePptPipeline, preserveExistingTitles = false): void {
+  validateOutlineValue(outline);
+  validateSlideSpecsValue(specs);
+  if (!state.analysis) throw new Error('Revision requires source analysis');
+  validateOutlineReferences(outline, state.analysis.output);
+  validateSlideSpecReferences(specs, state.analysis.output);
+  if (!outline.title.trim() || outline.slides.some((page) => !page.title.trim() || !page.purpose.trim())
+    || specs.some((spec) => !spec.imageGenerationBrief.trim() || !spec.body.some((paragraph) => paragraph.trim().length > 0))) {
+    throw new Error('Revision pages require completed titles, purposes, body text and image briefs');
+  }
+  if (outline.slides.length !== specs.length || outline.slides.some((page, index) => page.id !== specs[index]?.id
+    || (page.title !== specs[index]?.title && !(preserveExistingTitles
+      && state.slideSpecs?.value.find(({ id }) => id === page.id)?.title === specs[index]?.title)))) {
+    throw new Error('Revision details must match outline page identifiers, titles and order');
+  }
+}
+
 function validateCheckpointShape(value: NativePptPipeline, specIds: ReadonlySet<string>): void {
   let effective = value.project.workflowStatus;
   if (value.project.workflowStatus === 'blocked') {
@@ -1570,8 +1670,12 @@ async function validateRestoredPipeline(value: NativePptPipeline): Promise<void>
   await replayPipeline(value, expected);
 }
 
+export function validateNativePipelineCheckpoint(value: NativePptPipeline): void {
+  validatePipeline(value);
+}
+
 function validatePipeline(value: NativePptPipeline): void {
-  if (!isRecordValue(value) || value.schemaVersion !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 1) {
+  if (!isRecordValue(value) || ![1, 2].includes(value.schemaVersion) || !Number.isSafeInteger(value.revision) || value.revision < 1) {
     throw new Error('Native PPT pipeline schema is invalid');
   }
   requireExactKeys(value, [
@@ -1579,7 +1683,10 @@ function validatePipeline(value: NativePptPipeline): void {
     'outline', 'slideSpecs', 'visuals', 'currentSlideId', 'approvals', 'tasks',
     'blockedCondition', 'exportReceipt', 'qaReport',
     ...(value.promptContext === undefined ? [] : ['promptContext']),
+    ...(value.schemaVersion === 2 ? ['outlineRevisionDraft', 'revisionHistory', 'revisionOrigin', 'revisionEvents'] : []),
   ], 'pipeline');
+  const revisionReplay = value.schemaVersion === 2
+    ? validateRevisionProvenance(value, validatePipeline, parseNativePipelineAction, validateRevisionDocument) : null;
   const project = requireRecordValue(value.project, 'project');
   requireExactKeys(project, ['id', 'name', 'goal', 'workflowStatus', 'createdAt', 'updatedAt'], 'project');
   requireIdentifier(value.project.id, 'project id');
@@ -1647,7 +1754,8 @@ function validatePipeline(value: NativePptPipeline): void {
   if (value.outline) {
     const outline = requireRecordValue(value.outline, 'outline version');
     requireExactKeys(outline, ['version', 'value'], 'outline version');
-    validateVersionValue(value.outline.version, value.project.id, `${value.project.id}-outline-v1`, 1);
+    const sequence = value.schemaVersion === 2 ? value.outline.version.sequence : 1;
+    validateVersionValue(value.outline.version, value.project.id, `${value.project.id}-outline-v${sequence}`, sequence);
     validateOutlineValue(value.outline.value);
     if (!value.analysis) throw new Error('Outline requires validated source analysis');
     validateOutlineReferences(value.outline.value, value.analysis.output);
@@ -1656,7 +1764,8 @@ function validatePipeline(value: NativePptPipeline): void {
   if (value.slideSpecs) {
     const details = requireRecordValue(value.slideSpecs, 'slide-spec version');
     requireExactKeys(details, ['version', 'value'], 'slide-spec version');
-    validateVersionValue(value.slideSpecs.version, value.project.id, `${value.project.id}-slide-specs-v1`, 1);
+    const sequence = value.schemaVersion === 2 ? value.slideSpecs.version.sequence : 1;
+    validateVersionValue(value.slideSpecs.version, value.project.id, `${value.project.id}-slide-specs-v${sequence}`, sequence);
     validateSlideSpecsValue(value.slideSpecs.value);
     if (!value.outline || value.outline.version.status !== 'frozen' || !value.analysis) {
       throw new Error('Slide specs require a frozen outline and source analysis');
@@ -1716,7 +1825,9 @@ function validatePipeline(value: NativePptPipeline): void {
   if (draftVisualCount > 1) throw new Error('Only one visual draft may be active');
 
   const expectedApprovals = new Map<string, { id: string; decidedAt: string }>();
-  if (value.outline?.version.status === 'frozen') {
+  if (revisionReplay) {
+    for (const approval of revisionReplay.approvals) expectedApprovals.set(`outline_review|${approval.versionId}|`, { id: approval.id, decidedAt: approval.decidedAt! });
+  } else if (value.outline?.version.status === 'frozen') {
     expectedApprovals.set(`outline_review|${value.outline.version.id}|`, {
       id: `${value.project.id}-outline_review-1`,
       decidedAt: value.outline.version.frozenAt!,
@@ -1724,7 +1835,7 @@ function validatePipeline(value: NativePptPipeline): void {
   }
   if (value.slideSpecs?.version.status === 'frozen') {
     expectedApprovals.set(`detail_review|${value.slideSpecs.version.id}|`, {
-      id: `${value.project.id}-detail_review-2`,
+      id: `${value.project.id}-detail_review-${(revisionReplay?.approvals.length ?? 1) + 1}`,
       decidedAt: value.slideSpecs.version.frozenAt!,
     });
   }
@@ -1881,12 +1992,18 @@ function validateTaskAndRevisionProvenance(value: NativePptPipeline): void {
     || (value.slideSpecs !== null && detailTasks.length === 0)) {
     throw new Error('Detail task provenance is incomplete');
   }
+  const revisionEvents = value.schemaVersion === 2 ? value.revisionEvents! : [];
+  const advanceRevisionActions = (): void => {
+    while (revisionEvents.some((event) => event.kind !== 'details.submit' && event.expectedRevision === cursor)) cursor += 1;
+  };
   for (const task of detailTasks) {
+    advanceRevisionActions();
     cursor += 1;
     if (task.revision !== cursor || task.task.status !== 'completed') {
       throw new Error('Detail task transition provenance is invalid');
     }
   }
+  advanceRevisionActions();
   if (value.slideSpecs?.version.status === 'frozen') cursor += 1;
 
   if (visualTasks.length > 0 && value.slideSpecs?.version.status !== 'frozen') {

@@ -669,6 +669,7 @@ export interface PptxOoxmlInspection {
   slideEvidence?: readonly {
     imageCount: number;
     textValues: readonly string[];
+    textBlocks?: readonly string[];
     tableCount: number;
     chartCount: number;
     shapeCount: number;
@@ -707,6 +708,10 @@ export async function inspectPptxOoxml(contents: Uint8Array): Promise<PptxOoxmlI
       imageCount: [...xml.matchAll(/<p:pic(?:\s|\/?>)/g)].length,
       textValues: [...xml.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)]
         .map((match) => unescapeXml(match[1] ?? '')),
+      textBlocks: [...xml.matchAll(/<(?:p|a):txBody(?:\s[^>]*)?>([\s\S]*?)<\/(?:p|a):txBody>/g)]
+        .map((block) => [...block[1]!.matchAll(/<a:p(?:\s[^>]*)?>([\s\S]*?)<\/a:p>/g)]
+          .map((paragraph) => [...paragraph[1]!.matchAll(/<a:t>([\s\S]*?)<\/a:t>|<a:br(?:\s[^>]*)?\s*\/>/g)]
+            .map((token) => token[1] === undefined ? '\n' : unescapeXml(token[1])).join('')).join('\n')),
       tableCount: [...xml.matchAll(/<a:tbl(?:\s|\/?>)/g)].length,
       chartCount: [...xml.matchAll(/<c:chart(?:\s|\/>)/g)].length,
       shapeCount: [...xml.matchAll(/<p:sp(?:\s|\/?>)/g)].length,

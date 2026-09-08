@@ -1118,6 +1118,9 @@ async function replaceVisual(
   if (reuseReopenedDraft) {
     history[history.length - 1] = candidate;
   } else {
+    if (existing?.version.status === 'draft') {
+      existing.version = { ...existing.version, status: 'superseded' };
+    }
     history.push(candidate);
   }
   return { message: '视觉候选已保存，等待当前页审批。' };
@@ -1190,7 +1193,7 @@ async function replayPipeline(
       const history = state.visuals[spec.id] ?? [];
       if (history.length === 0) break;
       for (const [index, visual] of history.entries()) {
-        if (index > 0) {
+        if (index > 0 && history[index - 1]?.version.status !== 'superseded') {
           workflow.projects.reopenApprovedSlide(
             state.project.id, spec.id, visual.version.createdAt,
           );
@@ -1502,12 +1505,18 @@ function validateQaPreparationValue(value: unknown): asserts value is NativeQaPr
   if (Object.values(fonts).some((available) => typeof available !== 'boolean')) throw new Error('QA font availability is invalid');
 }
 
-function validateVersionValue(value: unknown, projectId: string, expectedId: string, sequence: number): void {
+function validateVersionValue(
+  value: unknown,
+  projectId: string,
+  expectedId: string,
+  sequence: number,
+  allowedStatuses: readonly Version['status'][] = ['draft', 'frozen'],
+): void {
   const version = requireRecordValue(value, 'version');
   requireExactKeys(version, ['id', 'projectId', 'sequence', 'status', 'createdAt', 'frozenAt'], 'version');
   if (version.id !== expectedId || version.projectId !== projectId || version.sequence !== sequence
-    || !['draft', 'frozen'].includes(String(version.status)) || typeof version.createdAt !== 'string'
-    || (version.status === 'draft' && version.frozenAt !== null)
+    || !allowedStatuses.includes(version.status as Version['status']) || typeof version.createdAt !== 'string'
+    || (version.status !== 'frozen' && version.frozenAt !== null)
     || (version.status === 'frozen' && typeof version.frozenAt !== 'string')) {
     throw new Error('Version provenance is invalid');
   }
@@ -1793,7 +1802,13 @@ function validatePipeline(value: NativePptPipeline): void {
       ], 'visual version');
       if (visual.slideId !== slideId) throw new Error('Visual slide identifier is inconsistent');
       const sequence = index + 1;
-      validateVersionValue(visual.version, value.project.id, `${value.project.id}-visual-${slideId}-v${sequence}`, sequence);
+      validateVersionValue(
+        visual.version,
+        value.project.id,
+        `${value.project.id}-visual-${slideId}-v${sequence}`,
+        sequence,
+        ['draft', 'frozen', 'superseded'],
+      );
       if (!['full_slide_reference', 'text_free_background', 'complex_visual'].includes(visual.usage)
         || typeof visual.textFree !== 'boolean' || typeof visual.altText !== 'string') {
         throw new Error('Visual metadata is invalid');
@@ -1811,7 +1826,7 @@ function validatePipeline(value: NativePptPipeline): void {
             decidedAt: visual.version.frozenAt!,
           },
         );
-      } else {
+      } else if (visual.version.status === 'draft') {
         draftVisualCount += 1;
         if (index !== historyValue.length - 1) throw new Error('Only the current visual version may remain draft');
         const placeholder = visual.relativePath === '' && visual.sha256 === '' && visual.byteLength === 0;
@@ -1819,6 +1834,13 @@ function validatePipeline(value: NativePptPipeline): void {
           && /^[a-f0-9]{64}$/.test(visual.sha256)
           && Number.isSafeInteger(visual.byteLength) && visual.byteLength > 0;
         if (!placeholder && !candidate) throw new Error('Draft visual artifact provenance is invalid');
+      } else {
+        if (index === historyValue.length - 1
+          || visual.relativePath !== `visuals/${slideId}-v${sequence}.png`
+          || !/^[a-f0-9]{64}$/.test(visual.sha256)
+          || !Number.isSafeInteger(visual.byteLength) || visual.byteLength <= 0) {
+          throw new Error('Superseded visual artifact provenance is invalid');
+        }
       }
     });
   }
@@ -2151,6 +2173,7 @@ function validateEarlyPromptTaskChronology(
 
 type VisualReplayEvent =
   | { kind: 'candidate'; slideIndex: number; versionIndex: number }
+  | { kind: 'replace'; slideIndex: number; versionIndex: number }
   | { kind: 'approve'; slideIndex: number; versionIndex: number }
   | { kind: 'reopen'; slideIndex: number; versionIndex: number };
 
@@ -2189,8 +2212,14 @@ function replayVisualActionTimeline(
     const history = value.visuals[slideId] ?? [];
     return history.flatMap((visual, versionIndex): VisualReplayEvent[] => {
       const result: VisualReplayEvent[] = [];
-      if (versionIndex > 0) result.push({ kind: 'reopen', slideIndex, versionIndex });
-      if (visual.relativePath !== '') result.push({ kind: 'candidate', slideIndex, versionIndex });
+      const replacesUnapprovedCandidate = versionIndex > 0
+        && history[versionIndex - 1]?.version.status === 'superseded';
+      if (replacesUnapprovedCandidate) {
+        result.push({ kind: 'replace', slideIndex, versionIndex });
+      } else {
+        if (versionIndex > 0) result.push({ kind: 'reopen', slideIndex, versionIndex });
+        if (visual.relativePath !== '') result.push({ kind: 'candidate', slideIndex, versionIndex });
+      }
       if (visual.version.status === 'frozen') result.push({ kind: 'approve', slideIndex, versionIndex });
       return result;
     });
@@ -2230,9 +2259,10 @@ function replayVisualActionTimeline(
       }
       if (task.status !== 'completed') continue;
       const event = nextVisualReplayEvent(events, state, state.currentSlideIndex);
-      if (event?.kind !== 'candidate') continue;
+      if (event?.kind !== 'candidate' && event?.kind !== 'replace') continue;
       const visual = value.visuals[slideIds[event.slideIndex]!]![event.versionIndex]!;
-      if (event.versionIndex === 0 && task.createdAt !== visual.version.createdAt) continue;
+      if ((event.versionIndex === 0 || event.kind === 'replace')
+        && task.createdAt !== visual.version.createdAt) continue;
       const next = applyVisualReplayEvent(events, state, event);
       if (next !== null) pending.push({ ...next, revision: state.revision + 1 });
       continue;
@@ -2269,7 +2299,9 @@ function availableVisualReplayEvents(
 ): VisualReplayEvent[] {
   const available: VisualReplayEvent[] = [];
   const current = nextVisualReplayEvent(events, state, state.currentSlideIndex);
-  if (current?.kind === 'candidate' || current?.kind === 'approve') available.push(current);
+  if (current?.kind === 'candidate' || current?.kind === 'replace' || current?.kind === 'approve') {
+    available.push(current);
+  }
   if (state.stage !== 'blocked') {
     for (let slideIndex = 0; slideIndex < events.length; slideIndex += 1) {
       const event = nextVisualReplayEvent(events, state, slideIndex);
@@ -2301,6 +2333,13 @@ function applyVisualReplayEvent(
       next.versionIndexes[event.slideIndex] = 0;
     } else if (event.versionIndex !== next.versionIndexes[event.slideIndex]) return null;
     next.stage = 'visual_review';
+    next.versionStates[event.slideIndex] = 'candidate';
+  } else if (event.kind === 'replace') {
+    if (event.slideIndex !== next.currentSlideIndex || next.stage === 'conversion'
+      || currentState !== 'candidate'
+      || event.versionIndex !== next.versionIndexes[event.slideIndex]! + 1) return null;
+    next.stage = 'visual_review';
+    next.versionIndexes[event.slideIndex] = event.versionIndex;
     next.versionStates[event.slideIndex] = 'candidate';
   } else {
     if (event.slideIndex !== next.currentSlideIndex || next.stage !== 'visual_review'

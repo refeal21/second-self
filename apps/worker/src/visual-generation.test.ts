@@ -328,7 +328,11 @@ describe('slide visual generation and approval', () => {
     });
     expect(
       projects.getProjectSnapshot('project-1').visuals['slide-1'],
-    ).toHaveLength(2);
+    ).toMatchObject([
+      { version: { sequence: 1, status: 'superseded', frozenAt: null } },
+      { version: { sequence: 2, status: 'draft', frozenAt: null } },
+    ]);
+    expect(projects.getProjectSnapshot('project-1').approvals).toHaveLength(2);
   });
 });
 

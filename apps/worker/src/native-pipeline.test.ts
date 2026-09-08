@@ -144,6 +144,36 @@ const specs = [
   },
 ];
 
+async function runtimeAtVisualReview(): Promise<NativePptRpcRuntime> {
+  const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
+  await runtime.restore(intakePipeline());
+  await runtime.execute('project-native', {
+    kind: 'analysis.commit',
+    at: '2026-09-03T02:01:00.000Z',
+    requestId: 'request-analysis',
+    output: analysis,
+  });
+  await runtime.execute('project-native', {
+    kind: 'outline.submit',
+    at: '2026-09-03T02:02:00.000Z',
+    outline,
+  });
+  await runtime.execute('project-native', {
+    kind: 'outline.approve',
+    at: '2026-09-03T02:03:00.000Z',
+  });
+  await runtime.execute('project-native', {
+    kind: 'details.submit',
+    at: '2026-09-03T02:04:00.000Z',
+    specs,
+  });
+  await runtime.execute('project-native', {
+    kind: 'details.approve',
+    at: '2026-09-03T02:05:00.000Z',
+  });
+  return runtime;
+}
+
 describe('packaged native PPT workflow runtime', () => {
   it('persists prompt context and keeps source attachment revisions restorable', async () => {
     const runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
@@ -612,6 +642,70 @@ describe('packaged native PPT workflow runtime', () => {
 
     const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
     await expect(restarted.restore(result.pipeline)).resolves.toEqual(result.pipeline);
+  });
+
+  it('supersedes an unapproved visual candidate when replacing it again', async () => {
+    const runtime = await runtimeAtVisualReview();
+    const imageBase64 = (await readFile(pngPath)).toString('base64');
+    const first = await runtime.execute('project-native', {
+      kind: 'visual.replace',
+      at: '2026-09-03T02:06:00.000Z',
+      slideId: 'slide-cover',
+      imageBase64,
+      altText: '第一版真实封面候选',
+    });
+    const frozenSpecs = structuredClone(first.pipeline.slideSpecs);
+    const approvals = structuredClone(first.pipeline.approvals);
+
+    const second = await runtime.execute('project-native', {
+      kind: 'visual.replace',
+      at: '2026-09-03T02:07:00.000Z',
+      slideId: 'slide-cover',
+      imageBase64,
+      altText: '第二版真实封面候选',
+    });
+
+    expect(second.pipeline.visuals['slide-cover']).toMatchObject([
+      {
+        version: { sequence: 1, status: 'superseded', frozenAt: null },
+        relativePath: 'visuals/slide-cover-v1.png',
+        altText: '第一版真实封面候选',
+      },
+      {
+        version: { sequence: 2, status: 'draft', frozenAt: null },
+        relativePath: 'visuals/slide-cover-v2.png',
+        altText: '第二版真实封面候选',
+      },
+    ]);
+    expect(second.pipeline.approvals).toEqual(approvals);
+    expect(second.pipeline.slideSpecs).toEqual(frozenSpecs);
+    expect(second.writes).toMatchObject([
+      { relativePath: 'visuals/slide-cover-v2.png', kind: 'approved-visual-candidate' },
+    ]);
+
+    const restarted = new NativePptRpcRuntime({ imageGenAvailable: false });
+    await expect(restarted.restore(second.pipeline)).resolves.toEqual(second.pipeline);
+
+    const latestSuperseded = structuredClone(second.pipeline);
+    latestSuperseded.visuals['slide-cover']![1]!.version.status = 'superseded';
+    await expect(new NativePptRpcRuntime({ imageGenAvailable: false }).restore(latestSuperseded))
+      .rejects.toThrow('Superseded visual artifact provenance');
+
+    const missingHistoricalArtifact = structuredClone(second.pipeline);
+    Object.assign(missingHistoricalArtifact.visuals['slide-cover']![0]!, {
+      relativePath: '', sha256: '', byteLength: 0,
+    });
+    await expect(new NativePptRpcRuntime({ imageGenAvailable: false }).restore(missingHistoricalArtifact))
+      .rejects.toThrow('Superseded visual artifact provenance');
+  });
+
+  it('does not allow superseded status outside visual history', async () => {
+    const runtime = await runtimeAtVisualReview();
+    const forged = runtime.snapshot('project-native');
+    forged.slideSpecs!.version.status = 'superseded';
+
+    await expect(new NativePptRpcRuntime({ imageGenAvailable: false }).restore(forged))
+      .rejects.toThrow('Version provenance is invalid');
   });
 
   it('restores an authoritative full snapshot into a fresh Worker process', async () => {

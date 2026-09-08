@@ -124,6 +124,39 @@ describe('native outline revisions', () => {
     expect(rejected.pipeline.project.workflowStatus).toBe('blocked');
   });
 
+  it('restores repeated unapproved visual replacements after a v2 structure revision', async () => {
+    const runtime = await setup();
+    await runtime.execute(projectId, revisionSave(runtime));
+    await runtime.execute(projectId, parseNativePipelineAction({
+      kind: 'outline.revision.approve', at: at(6), expectedRevision: 6,
+      revisionId: 'revision-one', baseOutlineVersionId: `${projectId}-outline-v1`,
+    }));
+    await runtime.execute(projectId, parseNativePipelineAction({
+      kind: 'details.approve', at: at(7), expectedRevision: 7,
+    }));
+    const first = await runtime.execute(projectId, {
+      kind: 'visual.replace', at: at(8), slideId: 'page-b',
+      imageBase64, altText: '第一版候选',
+    });
+    const replaced = await runtime.execute(projectId, {
+      kind: 'visual.replace', at: at(9), slideId: 'page-b',
+      imageBase64, altText: '第二版候选',
+    });
+
+    expect(replaced.pipeline).toMatchObject({
+      schemaVersion: 2,
+      visuals: {
+        'page-b': [
+          { version: { sequence: 1, status: 'superseded' }, altText: '第一版候选' },
+          { version: { sequence: 2, status: 'draft' }, altText: '第二版候选' },
+        ],
+      },
+    });
+    expect(replaced.pipeline.approvals).toEqual(first.pipeline.approvals);
+    await expect(new NativePptRpcRuntime({ imageGenAvailable: false }).restore(replaced.pipeline))
+      .resolves.toEqual(replaced.pipeline);
+  });
+
   it('requires the editor baseline for edits to existing details', async () => {
     const runtime = await setup();
     await expect(runtime.execute(projectId, { kind: 'details.submit', at: at(5), specs })).rejects.toThrow(/revision|baseline/i);

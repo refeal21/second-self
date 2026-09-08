@@ -1100,6 +1100,9 @@ export class PptProjectService {
       altText: generated.altText,
     };
     if (target !== current) {
+      if (current?.version.status === 'draft') {
+        current.version = { ...current.version, status: 'superseded' };
+      }
       (state.visuals[slideId] ??= []).push(target);
     }
     return structuredClone(target);

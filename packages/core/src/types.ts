@@ -11,7 +11,7 @@ export const pptWorkflowStages = [
 
 export type PptWorkflowStage = (typeof pptWorkflowStages)[number];
 export type WorkflowStatus = PptWorkflowStage | 'blocked';
-export type VersionStatus = 'draft' | 'frozen';
+export type VersionStatus = 'draft' | 'frozen' | 'superseded';
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 export type MemoryProposalStatus = 'proposed' | 'approved' | 'rejected';
 

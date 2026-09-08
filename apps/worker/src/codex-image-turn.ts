@@ -47,12 +47,13 @@ export class CodexImageTurnRunner {
     const onMessage = (message: JsonRpcMessage) => {
       const params = record(message.params);
       if (!params || typeof params.threadId !== 'string') return;
-      if (threadId !== null && params.threadId !== threadId) return;
+      if (threadId === null || params.threadId !== threadId) return;
       if (turnId === null) {
-        if (buffered.length < MAX_BUFFERED_THREAD_EVENTS) buffered.push(message);
+        if (isPendingTurnMessage(message)
+          && buffered.length < MAX_BUFFERED_THREAD_EVENTS) buffered.push(message);
         return;
       }
-      if (threadId !== null) inspectTurnMessage(message, threadId, turnId, images, settleEvents!, report);
+      inspectTurnMessage(message, threadId, turnId, images, settleEvents!, report);
     };
     const onExit = () => {
       settleEvents?.({ error: new Error('Codex App Server 在原生 ImageGen 生成期间退出，项目未更改。(exited)') });
@@ -118,6 +119,18 @@ export class CodexImageTurnRunner {
 }
 
 interface TurnOutcome { error?: Error }
+
+function isPendingTurnMessage(message: JsonRpcMessage): boolean {
+  const params = record(message.params);
+  if (!params) return false;
+  if (message.method === 'item/started' || message.method === 'item/completed') {
+    return typeof params.turnId === 'string'
+      && record(params.item)?.type === 'imageGeneration';
+  }
+  if (message.method === 'error') return typeof params.turnId === 'string';
+  if (message.method === 'turn/completed') return typeof record(params.turn)?.id === 'string';
+  return false;
+}
 
 function inspectTurnMessage(
   message: JsonRpcMessage,

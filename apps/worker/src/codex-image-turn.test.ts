@@ -17,6 +17,7 @@ class ImageTurnTransport implements AppServerTransport {
   private lines = new Set<(line: string) => void>();
   private exits = new Set<(detail: AppServerExit) => void>();
   private turnStartHook: ((requestId: string | number) => void) | null = null;
+  private capabilityReadHook: (() => void) | null = null;
 
   async start(): Promise<void> {}
   async send(line: string): Promise<void> {
@@ -26,6 +27,9 @@ class ImageTurnTransport implements AppServerTransport {
     if (request.method === 'turn/start' && this.turnStartHook) {
       this.turnStartHook(request.id);
       return;
+    }
+    if (request.method === 'modelProvider/capabilities/read') {
+      this.capabilityReadHook?.();
     }
     const result = request.method === 'initialize' ? {}
       : request.method === 'modelProvider/capabilities/read'
@@ -53,6 +57,9 @@ class ImageTurnTransport implements AppServerTransport {
   }
   beforeTurnStartResponse(hook: (requestId: string | number) => void): void {
     this.turnStartHook = hook;
+  }
+  duringCapabilityRead(hook: () => void): void {
+    this.capabilityReadHook = hook;
   }
   respondToTurnStart(requestId: string | number): void {
     this.emit({ id: requestId, result: { turn: { id: 'turn-image' } } });
@@ -138,6 +145,31 @@ describe('Codex native image turn', () => {
   it('buffers matching notifications emitted before the turn/start response', async () => {
     const { transport, runner } = setup();
     transport.beforeTurnStartResponse((requestId) => {
+      transport.image();
+      transport.complete();
+      transport.respondToTurnStart(requestId);
+    });
+
+    await expect(runner.generate({ cwd: '/project', prompt: 'native ImageGen only' }))
+      .resolves.toEqual({ imageBase64: IMAGE_BASE64 });
+    expect(transport.operationListenerCount).toBe(0);
+  });
+
+  it('does not let unrelated startup notifications evict an early matching image result', async () => {
+    const { transport, runner } = setup({ timeoutMs: 50 });
+    transport.duringCapabilityRead(() => {
+      for (let index = 0; index < 101; index += 1) {
+        transport.emit({ method: 'item/agentMessage/delta', params: {
+          threadId: `other-thread-${index}`, turnId: `other-turn-${index}`, delta: 'noise',
+        } });
+      }
+    });
+    transport.beforeTurnStartResponse((requestId) => {
+      for (let index = 0; index < 101; index += 1) {
+        transport.emit({ method: 'item/agentMessage/delta', params: {
+          threadId: 'thread-image', turnId: 'turn-image', delta: `own-thread-noise-${index}`,
+        } });
+      }
       transport.image();
       transport.complete();
       transport.respondToTurnStart(requestId);

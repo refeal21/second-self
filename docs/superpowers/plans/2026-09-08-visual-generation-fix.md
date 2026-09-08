@@ -43,11 +43,11 @@ interface CodexImageTurnResult { imageBase64: string }
 // updateProgress(projectId, message): void for the current running operation.
 ```
 
-- [ ] Write failing tests through real client+transport double: capability false/malformed, real image item retained until turn completed, other thread/turn ignored, notifications before turn/start response, quota error, turn failure after image, no image, multiple images, exit, timeout and cleanup. Derive PNG fixture independently, assert no candidate on each failure.
-- [ ] Run `pnpm --filter @digital-twin/worker test` and focused desktop tests; record expected RED.
-- [ ] Add capability method and a dedicated ephemeral image thread (read-only sandbox, no execution approvals automatically granted). Generate using native ImageGen only; no shell/API substitutes. Match thread and turn, handle early events, bounded total timeout with best-effort turn interruption; reject unsupported/malformed output, oversized base64, error terminal, absent/multiple images. Use conservative metadata `full_slide_reference`, `textFree: false`; exact decode/dimension validation remains Worker-owned.
-- [ ] Wrap `requestVisual` in `generations.run(projectId, 'visual', ...)` before the first await. Enforce edit lock, current slide and frozen spec before any model request. Supply authoritative approved-spec prompt and feedback, run image turn, report saving progress, apply `visual.replace` against the captured original revision. On commit uncertainty re-read exact proposed checkpoint before reporting success; never retry model generation automatically. Legacy `regenerateSlide` must route through this path. Remove environment-only claims of provider availability in the standalone Worker; retain its explicit capability-unavailable fallback for callers without a runner.
-- [ ] Run all Worker and desktop tests, typecheck and lint once; commit only owned files. Report precise RED/GREEN commands and remaining risks.
+- [x] Write failing tests through real client+transport double: capability false/malformed, real image item retained until turn completed, other thread/turn ignored, notifications before turn/start response, quota error, turn failure after image, no image, multiple images, exit, timeout and cleanup. Derive PNG fixture independently, assert no candidate on each failure.
+- [x] Run `pnpm --filter @digital-twin/worker test` and focused desktop tests; record expected RED.
+- [x] Add capability method and a dedicated ephemeral image thread (read-only sandbox, no execution approvals automatically granted). Generate using native ImageGen only; no shell/API substitutes. Match thread and turn, handle early events, bounded total timeout with best-effort turn interruption; reject unsupported/malformed output, oversized base64, error terminal, absent/multiple images. Use conservative metadata `full_slide_reference`, `textFree: false`; exact decode/dimension validation remains Worker-owned.
+- [x] Wrap `requestVisual` in `generations.run(projectId, 'visual', ...)` before the first await. Enforce edit lock, current slide and frozen spec before any model request. Supply authoritative approved-spec prompt and feedback, run image turn, report saving progress, apply `visual.replace` against the captured original revision. On commit uncertainty re-read exact proposed checkpoint before reporting success; never retry model generation automatically. Legacy `regenerateSlide` must route through this path. Remove environment-only claims of provider availability in the standalone Worker; retain its explicit capability-unavailable fallback for callers without a runner.
+- [x] Run all Worker and desktop tests, typecheck and lint once; commit only owned files. Report precise RED/GREEN commands and remaining risks.
 
 ### Task 2: Visual generation interaction feedback
 
@@ -55,17 +55,26 @@ interface CodexImageTurnResult { imageBase64: string }
 
 **Consumes:** `ProjectGeneration.kind = visual`, optional `progress`, existing `getProjectGeneration`/`subscribeProjectGeneration` and `requestVisual` methods. Do not edit registry or adapter (Task 1 owns them).
 
-- [ ] Write a rendered React regression test using real registry plus delayed external operation. Click Generate, unmount/remount, assert disabled generating button and retained progress; finish and assert candidate display/read. Failure after navigation must be visible on return with explicit retry. No second invocation on navigation or duplicate click.
-- [ ] Run focused test and record expected RED.
-- [ ] Include visual stage in generation labels and stage matching (including blocked visual recovery). Show running progress and elapsed time derived from startedAt, with no invented percentage. Add visible idle text explaining current stage is waiting for generation and approval requires a PNG. Preserve previous candidate on retry failure, disable approval/replacement/regeneration during active work. Label success only after candidate persistence. Keep long prompt/technical JSON in an expandable section so status and actions remain accessible.
-- [ ] Run focused tests, desktop suite and typecheck after Task 1 integration; commit owned files and report RED/GREEN.
+- [x] Write a rendered React regression test using real registry plus delayed external operation. Click Generate, unmount/remount, assert disabled generating button and retained progress; finish and assert candidate display/read. Failure after navigation must be visible on return with explicit retry. No second invocation on navigation or duplicate click.
+- [x] Run focused test and record expected RED.
+- [x] Include visual stage in generation labels and stage matching (including blocked visual recovery). Show running progress and elapsed time derived from startedAt, with no invented percentage. Add visible idle text explaining current stage is waiting for generation and approval requires a PNG. Preserve previous candidate on retry failure, disable approval/replacement/regeneration during active work. Label success only after candidate persistence. Keep long prompt/technical JSON in an expandable section so status and actions remain accessible.
+- [x] Run focused tests, desktop suite and typecheck after Task 1 integration; commit owned files and report RED/GREEN.
 
 ### Task 3: Verification and delivery
 
 **Files:** A scoped acceptance report under `docs/`; generated bundles and QA evidence under ignored `artifacts/`.
 
-- [ ] Review Task 1 and Task 2 diffs for spec and code quality, then full branch review after corrections.
-- [ ] Run `pnpm test`, `pnpm typecheck`, `pnpm lint`, `cargo fmt --check --manifest-path apps/desktop/src-tauri/Cargo.toml`.
-- [ ] In a temporary synthetic workspace, run the production image runner against installed Codex using existing ChatGPT authentication; never read/copy tokens, never run on customer data. Validate actual PNG payload, then feed it through production Worker and verify candidate remains unapproved. Bound run duration; report real capability/network/quota blocks without invented success.
-- [ ] Run browser interaction QA at wide and narrow sizes using existing Playwright fallback (Browser plugin unavailable). Verify route return, running/error/idle states and manual approval only. Do not touch the running customer app.
-- [ ] Build new `.app` with a separate Cargo target directory; never overwrite or quit the existing running bundle. Record evidence, exact bundle path, real-generation outcome and any remaining limitation. Push tested source under the user's standing repository authorization only after review.
+- [x] Review Task 1 and Task 2 diffs for spec and code quality, then full branch review after corrections.
+- [x] Run `pnpm test`, `pnpm typecheck`, `pnpm lint`, `cargo fmt --check --manifest-path apps/desktop/src-tauri/Cargo.toml`.
+- [x] In a temporary synthetic workspace, run the production image runner against installed Codex using existing ChatGPT authentication; never read/copy tokens, never run on customer data. Validate actual PNG payload, then feed it through production Worker and verify candidate remains unapproved. Bound run duration; report real capability/network/quota blocks without invented success.
+- [x] Run browser interaction QA at wide and narrow sizes using existing Playwright fallback (Browser plugin unavailable). Verify route return, running/error/idle states and manual approval only. Do not touch the running customer app.
+- [x] Build new `.app` with a separate Cargo target directory; never overwrite or quit the existing running bundle. Record evidence, exact bundle path, real-generation outcome and any remaining limitation. Push tested source under the user's standing repository authorization only after review.
+
+### Integration follow-up: repeated unapproved visual candidates
+
+Final packaged replay exposed an existing transition defect: appending a second draft violates the strict one-current-draft invariant. This blocks the requested regenerate workflow even after native generation succeeds.
+
+- [x] Add failing Worker and Rust persistence regressions before changing the transition.
+- [x] Retain old unapproved visual artifacts as `superseded`, with no approval or frozen timestamp; only the latest visual may remain draft. Never overwrite an immutable file or fabricate a frozen approval. Keep outline/detail status validation restricted to draft/frozen.
+- [x] Verify strict v1/v2 restore, immutable frozen history, generated replacement and manual replacement, and real packaged Worker/Rust restart readback using the already-generated synthetic PNG (no additional model call).
+- [x] Include this bounded shared-type/Worker/Rust change in the final branch review and rebuild before delivery.

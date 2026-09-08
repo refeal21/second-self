@@ -35,6 +35,58 @@ function detailPipeline(projectId: string, revision = 1, completed = false): Nat
   return pipeline;
 }
 
+function visualPipeline(projectId: string, revision = 1, candidate = false, blocked = false): NativePptPipeline {
+  const pipeline = createNativePipeline({ id: projectId, name: `项目 ${projectId}`, goal: '管理层决策',
+    createdAt: '2026-09-07T00:00:00.000Z' });
+  pipeline.revision = revision;
+  pipeline.project.workflowStatus = blocked ? 'blocked' : 'visual_review';
+  if (blocked) pipeline.blockedCondition = { kind: 'capability_unavailable',
+    capability: 'image_gen.imagegen', recoverable: true, resumeStage: 'visual_review',
+    slideId: 'slide-1', message: 'ImageGen 需要重新连接。' };
+  pipeline.slideSpecs = { version: { id: `${projectId}-details-v1`, projectId,
+    sequence: 1, status: 'frozen', createdAt: pipeline.project.createdAt,
+    frozenAt: pipeline.project.createdAt }, value: [{
+      id: 'slide-1', title: '封面', body: ['经营复盘'], tables: [], charts: [], shapes: [], sourceMap: [],
+      imageGenerationBrief: '生成一张完整 16:9 封面图片，不要在图中生成文字。'.repeat(12),
+    }] };
+  pipeline.currentSlideId = 'slide-1';
+  if (candidate) pipeline.visuals['slide-1'] = [{ slideId: 'slide-1', version: {
+    id: `${projectId}-visual-slide-1-v1`, projectId, sequence: 1, status: 'draft',
+    createdAt: pipeline.project.createdAt, frozenAt: null,
+  }, relativePath: 'visuals/slide-1-v1.png', sha256: 'b'.repeat(64), byteLength: 1024,
+  usage: 'full_slide_reference', textFree: false, altText: '第 1 页视觉候选' }];
+  return pipeline;
+}
+
+function visualHarness({ candidate = false, blocked = false } = {}) {
+  const projectId = 'project-visual';
+  const saved = new Map([[projectId, visualPipeline(projectId, 1, candidate, blocked)]]);
+  const registry = new ProjectGenerationRegistry();
+  const attempts: ReturnType<typeof deferred<NativePptPipeline>>[] = [];
+  const requestVisual = vi.fn(() => {
+    const job = deferred<NativePptPipeline>();
+    attempts.push(job);
+    const pending = registry.run(projectId, 'visual', () => job.promise);
+    registry.updateProgress(projectId, '正在等待 ImageGen 返回 PNG');
+    return pending;
+  });
+  const adapter = { ...createDemoDesktopAdapter(), mode: 'tauri' as const,
+    loadProjectPipeline: vi.fn(async () => structuredClone(saved.get(projectId)!)),
+    readProjectVisual: vi.fn(async () => 'data:image/png;base64,valid-preview'),
+    getProjectGeneration: (id: string) => registry.get(id),
+    subscribeProjectGeneration: (id: string, listener: Parameters<ProjectGenerationRegistry['subscribe']>[1]) =>
+      registry.subscribe(id, listener), requestVisual,
+  } as DesktopAdapter;
+  const mount = () => render(<NativeWorkspacePage adapter={adapter} projectId={projectId}
+    projectName="经营复盘" projectGoal="管理层决策" onBack={() => {}} />);
+  const finish = (attempt = 0) => {
+    const next = visualPipeline(projectId, 2 + attempt, true);
+    saved.set(projectId, next);
+    attempts[attempt]!.resolve(structuredClone(next));
+  };
+  return { adapter, attempts, mount, finish, registry };
+}
+
 function harness(projectIds = ['project-a']) {
   const saved = new Map(projectIds.map((id) => [id, detailPipeline(id)]));
   const registry = new ProjectGenerationRegistry();
@@ -67,6 +119,76 @@ function harness(projectIds = ['project-a']) {
 }
 
 describe('native generation lifecycle review', () => {
+  it('keeps visual generation visible and single-flight across navigation, then reads the persisted candidate', async () => {
+    const test = visualHarness();
+    const first = test.mount();
+    fireEvent.click(await screen.findByRole('button', { name: '生成当前页' }));
+    expect(screen.getByRole('button', { name: '正在生成当前页…' })).toBeDisabled();
+    expect(screen.getByRole('status')).toHaveTextContent('正在等待 ImageGen 返回 PNG');
+    expect(screen.getByRole('status')).toHaveTextContent('已用时');
+    expect(screen.getByRole('status')).not.toHaveTextContent('%');
+    fireEvent.click(screen.getByRole('button', { name: '正在生成当前页…' }));
+    const startedAt = test.registry.get('project-visual')!.startedAt;
+    first.unmount();
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse(startedAt) + 65_000);
+
+    test.mount();
+    expect(await screen.findByRole('button', { name: '正在生成当前页…' })).toBeDisabled();
+    expect(screen.getByRole('status')).toHaveTextContent('正在等待 ImageGen 返回 PNG');
+    expect(screen.getByRole('status')).toHaveTextContent('已用时 1 分 5 秒');
+    expect(test.adapter.requestVisual).toHaveBeenCalledOnce();
+    test.finish();
+
+    expect(await screen.findByRole('img', { name: '第 1 页视觉候选' })).toBeVisible();
+    expect(test.adapter.readProjectVisual).toHaveBeenCalledWith('project-visual', 'visuals/slide-1-v1.png');
+    expect(screen.getByRole('status')).toHaveTextContent('视觉候选已生成并保存');
+  });
+
+  it('replays a visual failure after navigation and retries only on an explicit click', async () => {
+    const test = visualHarness({ blocked: true });
+    const first = test.mount();
+    fireEvent.click(await screen.findByRole('button', { name: '生成当前页' }));
+    first.unmount();
+    test.attempts[0]!.reject(new Error('ImageGen 暂时不可用'));
+    await waitFor(() => expect(test.registry.get('project-visual')?.status).toBe('failed'));
+
+    test.mount();
+    expect(await screen.findByRole('alert')).toHaveTextContent('ImageGen 暂时不可用');
+    expect(test.adapter.requestVisual).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole('button', { name: '重试生成当前页' }));
+    expect(test.adapter.requestVisual).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('button', { name: '正在生成当前页…' })).toBeDisabled();
+  });
+
+  it('keeps the previous PNG visible when a replacement generation fails', async () => {
+    const test = visualHarness({ candidate: true });
+    const first = test.mount();
+    await screen.findByRole('img', { name: '第 1 页视觉候选' });
+    fireEvent.change(screen.getByRole('textbox', { name: '修改意见' }), { target: { value: '减少装饰' } });
+    fireEvent.click(screen.getByRole('button', { name: '按意见重新生成' }));
+    expect(screen.getByRole('button', { name: '正在生成当前页…' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '批准当前页' })).toBeDisabled();
+    expect(screen.getByText('上传替换 PNG').closest('label')).toHaveAttribute('aria-disabled', 'true');
+    expect(screen.getByRole('textbox', { name: '修改意见' })).toBeDisabled();
+    first.unmount();
+    test.attempts[0]!.reject(new Error('新候选生成失败'));
+    await waitFor(() => expect(test.registry.get('project-visual')?.status).toBe('failed'));
+
+    test.mount();
+    expect(await screen.findByRole('img', { name: '第 1 页视觉候选' })).toBeVisible();
+    expect(screen.getByRole('alert')).toHaveTextContent('新候选生成失败');
+  });
+
+  it('keeps the idle visual explanation and long technical prompt behind disclosure', async () => {
+    const test = visualHarness();
+    test.mount();
+    expect(await screen.findByText(/当前阶段正在等待生成视觉候选/)).toBeVisible();
+    expect(screen.getByText(/批准前必须检查完整的 PNG/)).toBeVisible();
+    const disclosure = screen.getByText('查看完整技术提示词').closest('details');
+    expect(disclosure).not.toHaveAttribute('open');
+    expect(screen.getByRole('button', { name: '生成当前页' })).toBeEnabled();
+  });
+
   it('keeps details generation visibly running and disabled after leaving and remounting', async () => {
     const test = harness();
     const first = test.mount();

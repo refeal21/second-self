@@ -45,6 +45,7 @@ export function NativeWorkspacePage({
   const [generation, setGeneration] = useState<ProjectGeneration | null>(
     () => adapter.getProjectGeneration(projectId),
   );
+  const [elapsedNow, setElapsedNow] = useState(() => Date.now());
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const [visualFeedback, setVisualFeedback] = useState('');
@@ -108,6 +109,13 @@ export function NativeWorkspacePage({
       setError(next.error || '生成失败，请重试。');
     }
   }), [adapter, projectId]);
+
+  useEffect(() => {
+    if (generation?.status !== 'running') return;
+    setElapsedNow(Date.now());
+    const timer = window.setInterval(() => setElapsedNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [generation?.operationId, generation?.status]);
 
   useEffect(() => adapter.subscribeProjectEdit(projectId, (next) => {
     setEdit(next);
@@ -228,6 +236,7 @@ export function NativeWorkspacePage({
 
   const status = pipeline.project.workflowStatus;
   const visualBlocked = status === 'blocked' && pipeline.blockedCondition?.resumeStage === 'visual_review';
+  const visualGenerationRunning = generation?.status === 'running' && generation.kind === 'visual';
   const qaBlocked = status === 'blocked' && pipeline.blockedCondition?.resumeStage === 'qa';
   const canApproveCurrent = currentVisual?.version.status === 'draft' &&
     currentVisual.byteLength > 0 && previewState === 'ready';
@@ -303,7 +312,9 @@ export function NativeWorkspacePage({
         <div><strong>{stageLabel(status)}</strong><p>检查点 r{pipeline.revision}</p></div>
       </header>
       {generation?.status === 'running' && <p className="app-notice" role="status">
-        {generationRunningLabel(generation)}，离开本页后仍会继续。
+        {generationRunningLabel(generation)}。
+        {generationProgress(generation) && <> {generationProgress(generation)}。</>}
+        {' '}已用时 {generationElapsed(generation.startedAt, elapsedNow)}，离开本页后仍会继续。
       </p>}
       {edit?.status === 'running' && <p className="app-notice" role="status">正在保存或确认编辑，请等待持久化结果。离开本页后仍会继续。</p>}
       {editUncertain && <div className="app-notice"><p>原编辑提交结果尚未核实，输入及操作身份已保留。请核实后再继续。</p>
@@ -415,7 +426,13 @@ export function NativeWorkspacePage({
               busy={busy || editUncertain} promptContextDirty={promptContextDirty} run={update} onReload={applyPipeline} />
           </details>}
           {(status === 'visual_review' || visualBlocked) && <StageCard title={`5. 逐页视觉·${currentSpec?.title ?? pipeline.currentSlideId}`}>
-            <p>{currentSpec?.imageGenerationBrief}</p>
+            {!currentVisual && !visualGenerationRunning && <p className="native-outline-save-state">
+              当前阶段正在等待生成视觉候选。批准前必须检查完整的 PNG；仅有提示词或任务完成状态不能批准。
+            </p>}
+            {currentSpec?.imageGenerationBrief && <details className="native-prompt-preview native-visual-prompt">
+              <summary>查看完整技术提示词</summary>
+              <pre>{currentSpec.imageGenerationBrief}</pre>
+            </details>}
             {pipeline.blockedCondition && <p className="capability-note">{pipeline.blockedCondition.message}不会切换到收费 API。</p>}
             {currentVisual?.relativePath && <dl><dt>当前候选</dt><dd>{currentVisual.relativePath}</dd><dt>SHA-256</dt><dd>{currentVisual.sha256}</dd></dl>}
             {currentVisual && previewSrc && <figure className="native-visual-preview">
@@ -437,11 +454,14 @@ export function NativeWorkspacePage({
                 placeholder="例如：减少装饰，突出数据；不要在图中生成标题文字。" />
             </label>
             <div className="review-actions">
-              {!currentVisual && <button className="button button-secondary" disabled={busy} onClick={() => void update(() => adapter.requestVisual(projectId, pipeline.currentSlideId!), 'ImageGen 请求已处理。')}>生成当前页</button>}
+              {!currentVisual && <button className="button button-secondary" disabled={busy} onClick={() => void update(
+                () => adapter.requestVisual(projectId, pipeline.currentSlideId!),
+                '视觉候选已生成并保存，请检查完整 PNG。',
+              )}>{visualActionLabel(generation, false)}</button>}
               {currentVisual && <button className="button button-secondary" disabled={busy || !visualFeedback.trim()} onClick={() => void update(
                 () => adapter.requestVisual(projectId, pipeline.currentSlideId!, visualFeedback),
-                '已按修改意见生成新候选，请重新检查完整 PNG。',
-              )}>按意见重新生成</button>}
+                '视觉候选已生成并保存，请重新检查完整 PNG。',
+              )}>{visualActionLabel(generation, true)}</button>}
               <label className={`button button-secondary${busy ? ' is-disabled' : ''}`} aria-disabled={busy}>上传替换 PNG<input hidden type="file" accept="image/png" disabled={busy} onChange={(event) => void replaceVisual(event)} /></label>
               <button className="button button-primary" disabled={busy || !canApproveCurrent} onClick={() => void update(() => adapter.approveVisual(projectId, pipeline.currentSlideId!), '当前页已批准，检查点已保存。')}>批准当前页</button>
             </div>
@@ -560,12 +580,13 @@ function stageLabel(stage: string): string {
 function generationRunningLabel(generation: ProjectGeneration | null): string {
   if (generation?.status !== 'running') return '';
   return ({ analysis: '正在分析材料', outline: '正在生成整份大纲', details: '正在生成逐页细化',
-    memory: '正在提议可复用偏好' })[generation.kind];
+    visual: '正在生成当前页视觉候选', memory: '正在提议可复用偏好' } as Record<string, string>)[generation.kind] ?? '正在生成';
 }
 
 function generationSuccessLabel(kind: ProjectGeneration['kind']): string {
   return ({ analysis: '材料分析已保存。', outline: '整份大纲已生成，等待你审核。',
-    details: '全部页面细化已生成。', memory: '偏好建议已提交。' })[kind];
+    details: '全部页面细化已生成。', visual: '视觉候选已生成并保存，请检查完整 PNG。',
+    memory: '偏好建议已提交。' } as Record<string, string>)[kind] ?? '生成结果已保存。';
 }
 
 function generationActionLabel(
@@ -575,10 +596,30 @@ function generationActionLabel(
 ): string {
   if (generation?.kind !== kind) return idle;
   if (generation.status === 'running') return ({ analysis: '正在分析材料…', outline: '正在生成整份大纲…',
-    details: '正在生成逐页细化…', memory: '正在提议可复用偏好…' })[kind];
+    details: '正在生成逐页细化…', visual: '正在生成当前页…', memory: '正在提议可复用偏好…' })[kind];
   if (generation.status === 'failed') return ({ analysis: '重试分析材料', outline: '重试生成整份大纲',
-    details: '重试生成逐页细化', memory: '重试提议可复用偏好' })[kind];
+    details: '重试生成逐页细化', visual: '重试生成当前页', memory: '重试提议可复用偏好' })[kind];
   return idle;
+}
+
+function visualActionLabel(generation: ProjectGeneration | null, replacing: boolean): string {
+  if (generation?.kind !== 'visual') return replacing ? '按意见重新生成' : '生成当前页';
+  if (generation.status === 'running') return '正在生成当前页…';
+  if (generation.status === 'failed') return replacing ? '重试按意见重新生成' : '重试生成当前页';
+  return replacing ? '按意见重新生成' : '生成当前页';
+}
+
+function generationProgress(generation: ProjectGeneration): string {
+  return generation.progress?.trim() ?? '';
+}
+
+function generationElapsed(startedAt: string, now: number): string {
+  const started = Date.parse(startedAt);
+  const elapsedSeconds = Number.isFinite(started) ? Math.max(0, Math.floor((now - started) / 1_000)) : 0;
+  if (elapsedSeconds < 60) return `${elapsedSeconds} 秒`;
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = elapsedSeconds % 60;
+  return seconds ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分`;
 }
 
 function memoryActionLabel(generation: ProjectGeneration | null): string {
@@ -598,6 +639,9 @@ function generationMatchesPipeline(
   const expected = pipeline.project.workflowStatus === 'intake' ? 'analysis'
     : pipeline.project.workflowStatus === 'source_analysis' ? 'outline'
       : pipeline.project.workflowStatus === 'detail_review' && !pipeline.slideSpecs ? 'details'
-        : null;
+        : pipeline.project.workflowStatus === 'visual_review' ||
+          (pipeline.project.workflowStatus === 'blocked' && pipeline.blockedCondition?.resumeStage === 'visual_review')
+          ? 'visual'
+          : null;
   return generation.kind === expected;
 }

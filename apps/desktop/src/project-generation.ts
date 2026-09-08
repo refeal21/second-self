@@ -1,7 +1,8 @@
 import type { NativePptPipeline } from '../../worker/src/native-pipeline.js';
 
-export type ProjectGenerationKind = 'analysis' | 'outline' | 'details' | 'memory';
+export type ProjectGenerationKind = 'analysis' | 'outline' | 'details' | 'visual' | 'memory';
 export interface ProjectMemoryProposalResult { status: string }
+export interface ProjectVisualGenerationContext { slideId: string; baseRevision: number }
 export type ProjectGenerationResult = NativePptPipeline | ProjectMemoryProposalResult;
 export interface ProjectGeneration {
   projectId: string;
@@ -13,6 +14,8 @@ export interface ProjectGeneration {
   error: string | null;
   pipeline: NativePptPipeline | null;
   result: ProjectMemoryProposalResult | null;
+  progress?: string;
+  visualContext?: ProjectVisualGenerationContext;
 }
 type Listener = (state: ProjectGeneration | null) => void;
 
@@ -20,7 +23,12 @@ type Listener = (state: ProjectGeneration | null) => void;
  * not a promise of continuing generation after the application exits. */
 export class ProjectGenerationRegistry {
   private readonly states = new Map<string, ProjectGeneration>();
-  private readonly active = new Map<string, { kind: ProjectGenerationKind; promise: Promise<ProjectGenerationResult> }>();
+  private readonly active = new Map<string, {
+    kind: ProjectGenerationKind;
+    operationId: string;
+    identity?: string;
+    promise: Promise<ProjectGenerationResult>;
+  }>();
   private readonly listeners = new Map<string, Set<Listener>>();
   private counter = 0;
 
@@ -39,35 +47,70 @@ export class ProjectGenerationRegistry {
     };
   }
 
+  updateProgress(projectId: string, message: string, operationId?: string): void {
+    const active = this.active.get(projectId);
+    const state = this.states.get(projectId);
+    if (!active || !state || state.status !== 'running') return;
+    if (operationId !== undefined && operationId !== active.operationId) return;
+    if (state.operationId !== active.operationId || !message.trim()) return;
+    this.publish({ ...state, progress: message, updatedAt: new Date().toISOString() });
+  }
+
+  updateVisualContext(
+    projectId: string,
+    context: ProjectVisualGenerationContext,
+    operationId?: string,
+  ): void {
+    const active = this.active.get(projectId);
+    const state = this.states.get(projectId);
+    if (!active || active.kind !== 'visual' || !state || state.status !== 'running') return;
+    if (operationId !== undefined && operationId !== active.operationId) return;
+    if (state.operationId !== active.operationId || active.identity !== context.slideId) return;
+    this.publish({ ...state, visualContext: structuredClone(context), updatedAt: new Date().toISOString() });
+  }
+
   run(projectId: string, kind: Exclude<ProjectGenerationKind, 'memory'>,
-    operation: () => Promise<NativePptPipeline>): Promise<NativePptPipeline>;
+    operation: () => Promise<NativePptPipeline>, identity?: string): Promise<NativePptPipeline>;
   run(projectId: string, kind: 'memory',
     operation: () => Promise<ProjectMemoryProposalResult>): Promise<ProjectMemoryProposalResult>;
   run(projectId: string, kind: ProjectGenerationKind,
-    operation: () => Promise<ProjectGenerationResult>): Promise<ProjectGenerationResult> {
+    operation: () => Promise<ProjectGenerationResult>, identity?: string): Promise<ProjectGenerationResult> {
     const pending = this.active.get(projectId);
-    if (pending) return pending.kind === kind
-      ? pending.promise
-      : Promise.reject(new Error('当前项目已有生成任务，请等待完成后再进行下一步。'));
+    if (pending) {
+      if (pending.kind !== kind) {
+        return Promise.reject(new Error('当前项目已有生成任务，请等待完成后再进行下一步。'));
+      }
+      if (kind === 'visual' && pending.identity !== identity) {
+        return Promise.reject(new Error('当前页视觉正在生成，不能将结果复用于另一页。'));
+      }
+      return pending.promise;
+    }
     const at = new Date().toISOString();
+    const operationId = `generation-${++this.counter}`;
     const state: ProjectGeneration = {
-      projectId, kind, operationId: `generation-${++this.counter}`, status: 'running',
+      projectId, kind, operationId, status: 'running',
       startedAt: at, updatedAt: at, error: null, pipeline: null, result: null,
     };
     // Install the single-flight lock before both the first await and notification.
     const promise = Promise.resolve().then(operation).then((result) => {
-      this.active.delete(projectId);
-      this.publish({ ...state, status: 'completed', updatedAt: new Date().toISOString(),
-        result: kind === 'memory' ? result as ProjectMemoryProposalResult : null,
-        pipeline: kind === 'memory' ? null : result as NativePptPipeline });
+      if (this.active.get(projectId)?.operationId === operationId) {
+        this.active.delete(projectId);
+        const latest = this.states.get(projectId) ?? state;
+        this.publish({ ...latest, status: 'completed', updatedAt: new Date().toISOString(),
+          result: kind === 'memory' ? result as ProjectMemoryProposalResult : null,
+          pipeline: kind === 'memory' ? null : result as NativePptPipeline });
+      }
       return result;
     }, (error: unknown) => {
-      this.active.delete(projectId);
-      this.publish({ ...state, status: 'failed', updatedAt: new Date().toISOString(),
-        error: error instanceof Error ? error.message : String(error) });
+      if (this.active.get(projectId)?.operationId === operationId) {
+        this.active.delete(projectId);
+        const latest = this.states.get(projectId) ?? state;
+        this.publish({ ...latest, status: 'failed', updatedAt: new Date().toISOString(),
+          error: error instanceof Error ? error.message : String(error) });
+      }
       throw error;
     });
-    this.active.set(projectId, { kind, promise });
+    this.active.set(projectId, { kind, operationId, identity, promise });
     this.publish(state);
     return promise;
   }

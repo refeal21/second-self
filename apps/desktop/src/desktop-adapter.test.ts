@@ -106,6 +106,26 @@ function observeConnection(adapter: DesktopAdapter) {
   return { updates, unsubscribe };
 }
 
+function authGateVisualPipeline() {
+  const pipeline = createNativePipeline({
+    id: 'project-auth', name: '鉴权检查', goal: '不启动付费生成', createdAt: 'now',
+  });
+  pipeline.revision = 7;
+  pipeline.project.workflowStatus = 'visual_review';
+  pipeline.currentSlideId = 'slide-auth';
+  pipeline.slideSpecs = {
+    version: {
+      id: 'specs-v1', projectId: 'project-auth', sequence: 1,
+      status: 'frozen', createdAt: 'now', frozenAt: 'now',
+    },
+    value: [{
+      id: 'slide-auth', title: '鉴权页', body: ['正文'], findingIds: [], dataPointIds: [],
+      tables: [], charts: [], shapes: [], sourceMap: [], imageGenerationBrief: '16:9 蓝色构图',
+    }],
+  };
+  return pipeline;
+}
+
 class NativeConnectionBridge implements TauriBridge {
   readonly commands: Array<{ command: string; args?: Record<string, unknown> }> = [];
   private generation = 0;
@@ -314,9 +334,14 @@ describe('desktop connection snapshots', () => {
   });
 
   it('publishes logged-out service state when a PPT account check blocks execution', async () => {
-    const adapter = createTauriDesktopAdapter(new ScriptedNativeServer(null), vi.fn());
+    const pipeline = authGateVisualPipeline();
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'ppt_load_pipeline') return structuredClone(pipeline);
+      throw new Error(`Unexpected native command: ${command}`);
+    });
+    const adapter = createTauriDesktopAdapter(new ScriptedNativeServer(null), invoke);
     const { updates } = observeConnection(adapter);
-    await expect(adapter.requestVisual('project', 'slide')).rejects.toThrow('ChatGPT');
+    await expect(adapter.requestVisual('project-auth', 'slide-auth')).rejects.toThrow('ChatGPT');
     expect(updates.at(-1)).toMatchObject({ account: { status: 'logged_out' }, runtime: { status: 'connected' } });
   });
 
@@ -390,9 +415,13 @@ describe('native desktop general-task bridge', () => {
     expect(invoke).not.toHaveBeenCalledWith('workspace_directory', undefined);
   });
 
-  it('blocks PPT visual model requests before native or Worker execution for non-ChatGPT auth', async () => {
+  it('scopes auth failure from a read-only checkpoint and blocks Worker/model execution', async () => {
     const transport = new ScriptedNativeServer({ type: 'apikey' });
-    const invoke = vi.fn();
+    const pipeline = authGateVisualPipeline();
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'ppt_load_pipeline') return structuredClone(pipeline);
+      throw new Error(`Unexpected native command: ${command}`);
+    });
     const worker: WorkflowWorkerGateway = {
       health: vi.fn(async () => ({
         protocolVersion: 1 as const,
@@ -411,9 +440,55 @@ describe('native desktop general-task bridge', () => {
     expect(transport.sent.some(({ method }) => method === 'account/read')).toBe(true);
     expect(transport.sent.some(({ method }) => method === 'thread/start')).toBe(false);
     expect(transport.sent.some(({ method }) => method === 'turn/start')).toBe(false);
-    expect(invoke).not.toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('ppt_load_pipeline', { projectId: 'project-auth' });
     expect(worker.restoreProject).not.toHaveBeenCalled();
     expect(worker.executeProject).not.toHaveBeenCalled();
+    expect(adapter.getProjectGeneration('project-auth')).toMatchObject({
+      status: 'failed', visualContext: { slideId: 'slide-auth', baseRevision: 7 },
+    });
+  });
+
+  it('times out a hung visual account read and ignores its late response without starting a turn', async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new ScriptedNativeServer();
+      transport.holdAccountReads = true;
+      const pipeline = authGateVisualPipeline();
+      const invoke = vi.fn(async (command: string) => {
+        if (command === 'ppt_load_pipeline') return structuredClone(pipeline);
+        throw new Error(`Unexpected native command: ${command}`);
+      });
+      const worker: WorkflowWorkerGateway = {
+        health: vi.fn(async () => ({ protocolVersion: 1 as const, worker: 'digital-twin-workflow-worker' as const, status: 'ready' as const })),
+        createProject: vi.fn(async () => ({} as never)),
+        restoreProject: vi.fn(async (value) => value),
+        executeProject: vi.fn(async () => ({} as never)),
+        snapshotProject: vi.fn(async () => ({} as never)),
+      };
+      const adapter = createTauriDesktopAdapter(transport, invoke, worker);
+      let outcome = 'pending';
+      const generation = adapter.requestVisual('project-auth', 'slide-auth');
+      void generation.then(() => { outcome = 'resolved'; }, (error: unknown) => {
+        outcome = error instanceof Error ? error.message : String(error);
+      });
+
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(outcome).toContain('账号状态超时');
+      expect(transport.sent.some(({ method }) => method === 'thread/start')).toBe(false);
+      expect(adapter.getProjectGeneration('project-auth')).toMatchObject({
+        status: 'failed', error: expect.stringContaining('账号状态超时'),
+        visualContext: { slideId: 'slide-auth', baseRevision: 7 },
+      });
+
+      transport.emit({ id: transport.heldAccountReads[0]!.id, result: {
+        account: { type: 'chatgpt', email: 'late@example.com', planType: 'plus' }, requiresOpenaiAuth: false,
+      } });
+      await Promise.resolve();
+      expect(transport.sent.some(({ method }) => method === 'thread/start')).toBe(false);
+      expect(worker.executeProject).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('uses only the canonical workspace returned by Rust for a general task', async () => {

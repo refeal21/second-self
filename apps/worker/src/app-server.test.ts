@@ -309,6 +309,46 @@ describe('Codex App Server connection', () => {
 });
 
 describe('Codex App Server task protocol', () => {
+  it('reads native image-generation capability without inferring it from authentication', async () => {
+    const transport = new FakeAppServerTransport((message) => (
+      message.method === 'modelProvider/capabilities/read'
+        ? { namespaceTools: true, imageGeneration: true, webSearch: true }
+        : initializeResponse
+    ));
+    const client = new CodexAppServerClient(transport);
+    await client.connect();
+
+    expect(await client.readModelProviderCapabilities()).toEqual({
+      namespaceTools: true, imageGeneration: true, webSearch: true,
+    });
+    expect(transport.sent.at(-1)).toEqual({
+      id: 2, method: 'modelProvider/capabilities/read', params: {},
+    });
+  });
+
+  it('starts a dedicated ephemeral read-only thread that cannot auto-accept approvals', async () => {
+    const transport = new FakeAppServerTransport((message) => (
+      message.method === 'thread/start'
+        ? { thread: { id: 'image-thread-1' } }
+        : initializeResponse
+    ));
+    const client = new CodexAppServerClient(transport);
+    await client.connect();
+
+    expect(await client.startImageThread('/workspace/project')).toBe('image-thread-1');
+    expect(transport.sent.at(-1)).toEqual({
+      id: 2,
+      method: 'thread/start',
+      params: {
+        cwd: '/workspace/project',
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        sandbox: 'read-only',
+        ephemeral: true,
+      },
+    });
+  });
+
   it('starts and resumes durable threads using the stable methods', async () => {
     const transport = new FakeAppServerTransport((message) => {
       if (message.method === 'thread/start' || message.method === 'thread/resume') {

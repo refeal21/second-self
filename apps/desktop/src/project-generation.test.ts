@@ -11,6 +11,72 @@ function deferred<T>() {
 const pipeline = () => createNativePipeline({ id: 'p1', name: '测试', goal: '测试', createdAt: 'now' });
 
 describe('project generation lifetime', () => {
+  it('publishes and retains visual-generation progress through completion', async () => {
+    const registry = new ProjectGenerationRegistry();
+    const visual = deferred<ReturnType<typeof pipeline>>();
+    const generated = registry.run('p1', 'visual', () => visual.promise);
+    const operationId = registry.get('p1')!.operationId;
+    const listener = vi.fn();
+    registry.subscribe('p1', listener);
+
+    registry.updateProgress('p1', 'ImageGen 正在生成视觉候选…', operationId);
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({
+      kind: 'visual', status: 'running', progress: 'ImageGen 正在生成视觉候选…',
+    }));
+
+    visual.resolve(pipeline());
+    await generated;
+    expect(registry.get('p1')).toMatchObject({
+      kind: 'visual', status: 'completed', progress: 'ImageGen 正在生成视觉候选…',
+    });
+  });
+
+  it('ignores progress from a completed or stale visual operation', async () => {
+    const registry = new ProjectGenerationRegistry();
+    await registry.run('p1', 'visual', async () => pipeline());
+    const completed = registry.get('p1')!;
+    registry.updateProgress('p1', 'late completed callback', completed.operationId);
+    expect(registry.get('p1')).toEqual(completed);
+
+    const retry = deferred<ReturnType<typeof pipeline>>();
+    const generated = registry.run('p1', 'visual', () => retry.promise);
+    registry.updateProgress('p1', 'stale callback', completed.operationId);
+    expect(registry.get('p1')!.progress).toBeUndefined();
+    retry.resolve(pipeline());
+    await generated;
+  });
+
+  it('deduplicates the same visual identity but rejects a different current slide', async () => {
+    const registry = new ProjectGenerationRegistry();
+    const visual = deferred<ReturnType<typeof pipeline>>();
+    const operation = vi.fn(() => visual.promise);
+    const mismatched = vi.fn(async () => pipeline());
+    const first = registry.run('p1', 'visual', operation, 'slide-a');
+
+    expect(registry.run('p1', 'visual', operation, 'slide-a')).toBe(first);
+    await expect(registry.run('p1', 'visual', mismatched, 'slide-b')).rejects.toThrow(/当前页|slide/i);
+    expect(mismatched).not.toHaveBeenCalled();
+    visual.resolve(pipeline());
+    await first;
+    expect(operation).toHaveBeenCalledOnce();
+  });
+
+  it('publishes the captured visual checkpoint and ignores stale context writers', async () => {
+    const registry = new ProjectGenerationRegistry();
+    const visual = deferred<ReturnType<typeof pipeline>>();
+    const generated = registry.run('p1', 'visual', () => visual.promise, 'slide-a');
+    const operationId = registry.get('p1')!.operationId;
+
+    registry.updateVisualContext('p1', { slideId: 'slide-a', baseRevision: 7 }, operationId);
+    expect(registry.get('p1')?.visualContext).toEqual({ slideId: 'slide-a', baseRevision: 7 });
+    registry.updateVisualContext('p1', { slideId: 'slide-a', baseRevision: 99 }, 'stale-operation');
+    expect(registry.get('p1')?.visualContext).toEqual({ slideId: 'slide-a', baseRevision: 7 });
+
+    visual.resolve(pipeline());
+    await generated;
+    expect(registry.get('p1')?.visualContext).toEqual({ slideId: 'slide-a', baseRevision: 7 });
+  });
+
   it('locks synchronously, replays running state on return, and shares one operation until persistence completes', async () => {
     const registry = new ProjectGenerationRegistry();
     const saved = deferred<ReturnType<typeof pipeline>>();

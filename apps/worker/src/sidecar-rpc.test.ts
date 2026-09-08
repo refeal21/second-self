@@ -99,6 +99,22 @@ describe('worker sidecar JSON-RPC boundary', () => {
     });
   });
 
+  it('does not claim ImageGen from an environment variable without a connected native runner', async () => {
+    const previous = process.env.DIGITAL_TWIN_IMAGEGEN;
+    process.env.DIGITAL_TWIN_IMAGEGEN = 'available';
+    try {
+      const response = await handleWorkerRpcLine(JSON.stringify({
+        jsonrpc: '2.0', id: 41, method: 'system.capabilities',
+      }));
+      expect(JSON.parse(response!).result.imageGen).toEqual({
+        id: 'image_gen.imagegen', status: 'unavailable', billedApiFallback: false,
+      });
+    } finally {
+      if (previous === undefined) delete process.env.DIGITAL_TWIN_IMAGEGEN;
+      else process.env.DIGITAL_TWIN_IMAGEGEN = previous;
+    }
+  });
+
   it('owns the production PPT aggregate and restores it after a process restart', async () => {
     const created = JSON.parse((await handleWorkerRpcLine(JSON.stringify({
       jsonrpc: '2.0',

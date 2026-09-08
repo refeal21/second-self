@@ -32,9 +32,9 @@ interface RpcError {
 
 class InvalidParams extends Error {}
 
-const nativePptRuntime = new NativePptRpcRuntime({
-  imageGenAvailable: process.env.DIGITAL_TWIN_IMAGEGEN === 'available',
-});
+// The standalone sidecar has no Codex App Server image-turn runner. Provider
+// availability is owned by the desktop adapter's live connection, never env.
+const nativePptRuntime = new NativePptRpcRuntime({ imageGenAvailable: false });
 
 export async function handleWorkerRpcLine(
   line: string,
@@ -106,10 +106,7 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
         protocolVersion: WORKER_RPC_PROTOCOL_VERSION,
         imageGen: {
           id: 'image_gen.imagegen',
-          status:
-            process.env.DIGITAL_TWIN_IMAGEGEN === 'available'
-              ? 'available'
-              : 'unavailable',
+          status: 'unavailable',
           billedApiFallback: false,
         },
       };

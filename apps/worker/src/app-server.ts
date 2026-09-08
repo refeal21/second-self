@@ -46,6 +46,12 @@ interface ChatGptLoginResponse {
   authUrl: string;
 }
 
+export interface ModelProviderCapabilities {
+  namespaceTools: boolean;
+  imageGeneration: boolean;
+  webSearch: boolean;
+}
+
 type PendingRequest = {
   resolve(value: unknown): void;
   reject(error: Error): void;
@@ -151,6 +157,21 @@ export class CodexAppServerClient {
       cwd,
       approvalPolicy: 'on-request',
       sandbox: 'workspace-write',
+    });
+    return response.thread.id;
+  }
+
+  async readModelProviderCapabilities(): Promise<unknown> {
+    return this.request('modelProvider/capabilities/read', {});
+  }
+
+  async startImageThread(cwd: string): Promise<string> {
+    const response = await this.request<{ thread: { id: string } }>('thread/start', {
+      cwd,
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      sandbox: 'read-only',
+      ephemeral: true,
     });
     return response.thread.id;
   }

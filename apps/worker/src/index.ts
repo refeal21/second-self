@@ -1,4 +1,6 @@
 export * from './app-server.js';
+export * from './codex-image-turn.js';
+export * from './visual-prompt.js';
 export * from './delivery-coordinator.js';
 export * from './general-tasks.js';
 export * from './libreoffice-qa.js';

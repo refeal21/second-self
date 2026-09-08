@@ -28,6 +28,8 @@ import {
 class ScriptedPptAppServer implements NativeAppServerTransport {
   readonly prompts: string[] = [];
   hold = false;
+  holdImage = false;
+  imageBase64: string | null = null;
   private line: ((line: string) => void) | null = null;
   private turn = 0;
   constructor(private readonly outputs: readonly unknown[] = [
@@ -42,14 +44,23 @@ class ScriptedPptAppServer implements NativeAppServerTransport {
       account: { type: 'chatgpt', email: 'production@example.com', planType: 'plus' },
       requiresOpenaiAuth: false,
     };
+    if (message.method === 'modelProvider/capabilities/read') result = {
+      namespaceTools: true, imageGeneration: this.imageBase64 !== null, webSearch: true,
+    };
     if (message.method === 'thread/start') result = { thread: { id: `thread-${this.turn + 1}` } };
     if (message.method === 'turn/start') {
       const params = message.params as { input: Array<{ text?: string }> };
-      this.prompts.push(params.input.map(({ text }) => text ?? '').join('\n'));
+      const prompt = params.input.map(({ text }) => text ?? '').join('\n');
+      this.prompts.push(prompt);
       result = { turn: { id: `turn-${++this.turn}` } };
     }
     queueMicrotask(() => this.line?.(JSON.stringify({ id: message.id, result })));
     if (message.method === 'turn/start') {
+      const prompt = this.prompts.at(-1)!;
+      if (prompt.includes('native ImageGen')) {
+        if (!this.holdImage) setTimeout(() => this.completeImage(this.turn), 0);
+        return;
+      }
       const output = this.outputs[this.turn - 1];
       if (this.hold) return;
       const turn = this.turn;
@@ -62,6 +73,20 @@ class ScriptedPptAppServer implements NativeAppServerTransport {
     this.line?.(JSON.stringify({ method: 'item/agentMessage/delta', params: {
       threadId: `thread-${turn}`, turnId: `turn-${turn}`,
       itemId: `answer-${turn}`, delta: JSON.stringify(output),
+    }}));
+    this.line?.(JSON.stringify({ method: 'turn/completed', params: {
+      threadId: `thread-${turn}`, turn: { id: `turn-${turn}`, status: 'completed', error: null },
+    }}));
+  }
+  completeImage(turn = this.turn) {
+    this.line?.(JSON.stringify({ method: 'item/started', params: {
+      threadId: `thread-${turn}`, turnId: `turn-${turn}`,
+      item: { type: 'imageGeneration', id: `image-${turn}`, status: 'inProgress', revisedPrompt: null, result: '', failure: null },
+    }}));
+    this.line?.(JSON.stringify({ method: 'item/completed', params: {
+      threadId: `thread-${turn}`, turnId: `turn-${turn}`, completedAtMs: 1,
+      item: { type: 'imageGeneration', id: `image-${turn}`, status: 'completed', revisedPrompt: null,
+        result: this.imageBase64, failure: null },
     }}));
     this.line?.(JSON.stringify({ method: 'turn/completed', params: {
       threadId: `thread-${turn}`, turn: { id: `turn-${turn}`, status: 'completed', error: null },
@@ -585,6 +610,132 @@ describe('production-equivalent UI adapter → App Server → Worker → Rust pe
     expect(server.prompts).toHaveLength(2);
   });
 
+  it('generates one current-slide candidate through native ImageGen and persists it as a conservative replacement', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    const adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    await adapter.analyzeProject('project-e2e');
+    await adapter.generateOutline('project-e2e');
+    await adapter.approveOutline('project-e2e');
+    const details = await adapter.generateDetails('project-e2e');
+    await adapter.approveDetails('project-e2e', details.revision);
+    server.imageBase64 = (await readFile(resolve('../..', 'fixtures/golden-project/sources/market-background.png'))).toString('base64');
+    server.holdImage = true;
+
+    const first = adapter.requestVisual('project-e2e', 'slide-cover', '增加左侧留白，但不要改写任何正文');
+    expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({ kind: 'visual', status: 'running' });
+    const duplicate = adapter.requestVisual('project-e2e', 'slide-cover', '重复点击不应再次生成');
+    expect(duplicate).toBe(first);
+    await expect(adapter.requestVisual('project-e2e', 'slide-summary')).rejects.toThrow(/当前页|slide/i);
+    await vi.waitFor(() => expect(server.prompts).toHaveLength(4));
+    expect(server.prompts[3]).toContain('native ImageGen');
+    expect(server.prompts[3]).toContain('1920×1080');
+    expect(server.prompts[3]).toContain('16:9');
+    expect(server.prompts[3]).toContain('2026 年经营复盘与增长计划');
+    expect(server.prompts[3]).toContain('增加左侧留白，但不要改写任何正文');
+    expect(server.prompts[3]).not.toContain('重复点击不应再次生成');
+
+    server.completeImage();
+    const [saved, shared] = await Promise.all([first, duplicate]);
+    expect(shared).toEqual(saved);
+    expect(saved.visuals['slide-cover']?.at(-1)).toMatchObject({
+      usage: 'full_slide_reference', textFree: false,
+    });
+    expect(saved.currentSlideId).toBe('slide-cover');
+    expect(adapter.getProjectGeneration('project-e2e')).toMatchObject({
+      kind: 'visual', status: 'completed', pipeline: saved,
+      visualContext: { slideId: 'slide-cover', baseRevision: details.revision + 1 },
+    });
+    expect(server.prompts).toHaveLength(4);
+  });
+
+  it('validates visual stage, frozen spec, and current slide before starting native ImageGen', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    server.imageBase64 = 'aW1hZ2U=';
+    const adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+
+    await expect(adapter.requestVisual('project-e2e', 'slide-cover')).rejects.toThrow(/视觉审核阶段/);
+    expect(server.prompts).toHaveLength(0);
+    await adapter.analyzeProject('project-e2e');
+    await adapter.generateOutline('project-e2e');
+    await adapter.approveOutline('project-e2e');
+    await adapter.generateDetails('project-e2e');
+    const draft = await adapter.loadProjectPipeline('project-e2e');
+    await adapter.approveDetails('project-e2e', draft.revision);
+    await expect(adapter.requestVisual('project-e2e', 'slide-summary')).rejects.toThrow(/当前待审核页/);
+    expect(server.prompts).toHaveLength(3);
+  });
+
+  it('accepts a lost visual commit response only after rereading the exact proposed checkpoint', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    const adapter = createTauriDesktopAdapter(server, async (command, args) => {
+      if (command === 'ppt_commit_pipeline' && server.prompts.length === 4) {
+        await native.invoke(command, args);
+        throw new Error('lost commit response');
+      }
+      return native.invoke(command, args);
+    }, new DirectWorker());
+    await adapter.analyzeProject('project-e2e');
+    await adapter.generateOutline('project-e2e');
+    await adapter.approveOutline('project-e2e');
+    const details = await adapter.generateDetails('project-e2e');
+    await adapter.approveDetails('project-e2e', details.revision);
+    server.imageBase64 = (await readFile(resolve('../..', 'fixtures/golden-project/sources/market-background.png'))).toString('base64');
+
+    const saved = await adapter.requestVisual('project-e2e', 'slide-cover');
+    expect(saved).toEqual(native.state.pipeline);
+    expect(native.state.pipeline.visuals['slide-cover']).toHaveLength(1);
+    expect(server.prompts).toHaveLength(4);
+  });
+
+  it('retries native ImageGen from the exact recoverable capability block without a second Worker block', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    const worker = new DirectWorker();
+    const adapter = createTauriDesktopAdapter(server, native.invoke, worker);
+    await adapter.analyzeProject('project-e2e');
+    await adapter.generateOutline('project-e2e');
+    await adapter.approveOutline('project-e2e');
+    const details = await adapter.generateDetails('project-e2e');
+    const review = await adapter.approveDetails('project-e2e', details.revision);
+    const blocked = await worker.executeProject('project-e2e', {
+      kind: 'visual.generate', at: '2026-09-08T00:00:00.000Z', slideId: 'slide-cover',
+    });
+    expect(blocked.pipeline).toMatchObject({ project: { workflowStatus: 'blocked' } });
+    native.state.pipeline = structuredClone(blocked.pipeline);
+    server.imageBase64 = (await readFile(resolve('../..', 'fixtures/golden-project/sources/market-background.png'))).toString('base64');
+
+    const saved = await adapter.requestVisual('project-e2e', 'slide-cover', '恢复后明确重试');
+    expect(saved.project.workflowStatus).toBe('visual_review');
+    expect(saved.blockedCondition).toBeNull();
+    expect(saved.visuals['slide-cover']).toHaveLength(1);
+    expect(saved.revision).toBe(review.revision + 2);
+    expect(server.prompts).toHaveLength(4);
+  });
+
+  it('routes the legacy regenerate action through the native current-slide ImageGen path', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    const adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    await adapter.analyzeProject('project-e2e');
+    await adapter.generateOutline('project-e2e');
+    await adapter.approveOutline('project-e2e');
+    const details = await adapter.generateDetails('project-e2e');
+    await adapter.approveDetails('project-e2e', details.revision);
+    server.imageBase64 = (await readFile(resolve('../..', 'fixtures/golden-project/sources/market-background.png'))).toString('base64');
+
+    await expect(adapter.regenerateSlide('project-e2e', 1, '右侧增加几何层次')).resolves.toEqual({
+      status: '视觉候选已生成。', selectedSlide: 1,
+    });
+    expect(server.prompts[3]).toContain('右侧增加几何层次');
+    expect(native.state.pipeline.visuals['slide-cover']).toHaveLength(1);
+    expect(native.state.pipeline.visuals['slide-cover']?.at(-1)).toMatchObject({
+      usage: 'full_slide_reference', textFree: false,
+    });
+  });
+
   it('sends the saved project goal and exact source inventory even for a legacy project without extra instructions', async () => {
     const native = nativePersistenceHarness();
     const server = new ScriptedPptAppServer();
@@ -619,8 +770,9 @@ describe('production-equivalent UI adapter → App Server → Worker → Rust pe
     const restarted = createTauriDesktopAdapter(new ScriptedPptAppServer(), native.invoke, new DirectWorker());
     pipeline = await restarted.loadProjectPipeline('project-e2e');
     expect(pipeline.preferenceSnapshot[0]?.content).toBe('数据页优先图表');
-    pipeline = await restarted.requestVisual('project-e2e', 'slide-cover');
-    expect(pipeline).toMatchObject({ project: { workflowStatus: 'blocked' }, blockedCondition: { recoverable: true } });
+    await expect(restarted.requestVisual('project-e2e', 'slide-cover')).rejects.toThrow(/ImageGen/);
+    pipeline = await restarted.loadProjectPipeline('project-e2e');
+    expect(pipeline).toMatchObject({ project: { workflowStatus: 'visual_review' }, blockedCondition: null });
 
     const background = new Uint8Array(await readFile(resolve('../..', 'fixtures/golden-project/sources/market-background.png')));
     for (const [index, spec] of goldenSlideSpecs().entries()) {

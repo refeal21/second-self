@@ -4,6 +4,8 @@ import {
   type AppServerTransport,
   type JsonRpcMessage,
 } from '../../worker/src/app-server.js';
+import { CodexImageTurnRunner } from '../../worker/src/codex-image-turn.js';
+import { buildPageVisualPrompt } from '../../worker/src/visual-prompt.js';
 import { GeneralTaskManager, type GeneralTask } from '../../worker/src/general-tasks.js';
 import type {
   NativePipelineAction,
@@ -370,11 +372,13 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
 }
 
 type NativeCommandInvoker = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
+const VISUAL_ACCOUNT_CHECK_TIMEOUT_MS = 30_000;
 
 class TauriDesktopAdapter implements DesktopAdapter {
   readonly mode = 'tauri' as const;
   readonly initialState = structuredClone(nativeInitialState);
   private readonly client: CodexAppServerClient;
+  private readonly imageTurns: CodexImageTurnRunner;
   private readonly tasks: GeneralTaskManager;
   private readonly generations = new ProjectGenerationRegistry();
   private readonly edits = new ProjectEditRegistry((id) => this.generations.get(id)?.status !== 'running');
@@ -399,6 +403,7 @@ class TauriDesktopAdapter implements DesktopAdapter {
     private readonly worker: WorkflowWorkerGateway,
   ) {
     this.client = new CodexAppServerClient(transport);
+    this.imageTurns = new CodexImageTurnRunner(this.client);
     this.tasks = new GeneralTaskManager(this.client);
     this.client.onServerMessage((message) => {
       const params = asRecord(message.params);
@@ -634,12 +639,55 @@ class TauriDesktopAdapter implements DesktopAdapter {
     return this.runEdit(projectId, { kind: 'details.approve', expectedRevision },
       { kind: 'details.approve', at: new Date().toISOString(), expectedRevision });
   }
-  async requestVisual(projectId: string, slideId: string, feedback?: string): Promise<NativePptPipeline> {
-    await this.requireActiveChatGptAccount();
-    return this.applyCurrent(projectId, {
-      kind: 'visual.generate', at: new Date().toISOString(), slideId,
-      ...(feedback?.trim() ? { feedback: feedback.trim() } : {}),
-    });
+  requestVisual(projectId: string, slideId: string, feedback?: string): Promise<NativePptPipeline> {
+    if (this.editBlocksGeneration(projectId)) {
+      return Promise.reject(new Error('当前项目已有编辑操作，请等待保存或核实结果后再生成。'));
+    }
+    return this.generations.run(projectId, 'visual', async () => {
+      const pipeline = await this.callNative<NativePptPipeline>('ppt_load_pipeline', { projectId });
+      const recoverableImageGenBlock = pipeline.project.workflowStatus === 'blocked'
+        && pipeline.blockedCondition?.kind === 'capability_unavailable'
+        && pipeline.blockedCondition.capability === 'image_gen.imagegen'
+        && pipeline.blockedCondition.recoverable === true
+        && pipeline.blockedCondition.resumeStage === 'visual_review'
+        && pipeline.blockedCondition.slideId === slideId;
+      if (pipeline.project.workflowStatus !== 'visual_review' && !recoverableImageGenBlock) {
+        throw new Error('项目当前不在逐页视觉审核阶段，不能生成视觉。');
+      }
+      if (pipeline.slideSpecs?.version.status !== 'frozen') {
+        throw new Error('逐页规格尚未批准冻结，不能生成视觉。');
+      }
+      if (pipeline.currentSlideId !== slideId) {
+        throw new Error('请求页与当前待审核页不匹配，未启动 ImageGen。');
+      }
+      const spec = pipeline.slideSpecs.value.find(({ id }) => id === slideId);
+      if (!spec) throw new Error('当前页没有已批准的逐页规格，未启动 ImageGen。');
+      const operationId = this.generations.get(projectId)?.operationId;
+      this.generations.updateVisualContext(projectId, {
+        slideId,
+        baseRevision: pipeline.revision,
+      }, operationId);
+      await withTimeout(
+        this.requireActiveChatGptAccount(),
+        VISUAL_ACCOUNT_CHECK_TIMEOUT_MS,
+        '读取 ChatGPT 账号状态超时，未启动 ImageGen。',
+      );
+      const cwd = await this.callNative<string>('ppt_project_directory', { projectId });
+      if (!isCanonicalAbsolutePath(cwd)) throw new Error('Rust 未返回合法的项目绝对路径。');
+      const generated = await this.imageTurns.generate({
+        cwd,
+        prompt: buildPageVisualPrompt({ slideId, spec: structuredClone(spec) }, feedback),
+        onProgress: (message) => this.generations.updateProgress(projectId, message, operationId),
+      });
+      this.generations.updateProgress(projectId, '正在校验并保存视觉候选…', operationId);
+      return this.applyGeneratedVisual(projectId, pipeline, {
+        kind: 'visual.replace',
+        at: new Date().toISOString(),
+        slideId,
+        imageBase64: generated.imageBase64,
+        altText: `ImageGen 生成的“${spec.title}”视觉候选`,
+      });
+    }, slideId);
   }
   readProjectVisual(projectId: string, relativePath: string): Promise<string> {
     return this.callNative('ppt_read_artifact', { projectId, relativePath });
@@ -676,11 +724,11 @@ class TauriDesktopAdapter implements DesktopAdapter {
   }
   renameProject(projectId: string, name: string): Promise<{ status: string }> { return this.callNative('ppt_rename_project', { projectId, name }); }
   async regenerateSlide(projectId: string, slide: number, comment: string): Promise<RegenerateResult> {
-    void comment;
     const pipeline = await this.loadProjectPipeline(projectId);
     const slideId = pipeline.slideSpecs?.value[slide - 1]?.id;
     if (!slideId) throw new Error('页码与已批准规格不匹配。');
-    const next = await this.applyPipeline(projectId, pipeline, { kind: 'visual.generate', at: new Date().toISOString(), slideId });
+    if (pipeline.currentSlideId !== slideId) throw new Error('页码与当前待审核页不匹配。');
+    const next = await this.requestVisual(projectId, slideId, comment);
     return { status: next.blockedCondition?.message ?? '视觉候选已生成。', selectedSlide: slide };
   }
   async approveSlide(projectId: string, slide: number, comment: string): Promise<ApprovalResult> {
@@ -789,6 +837,30 @@ class TauriDesktopAdapter implements DesktopAdapter {
     return this.callNative<NativePptPipeline>('ppt_commit_pipeline', {
       input: { projectId, expectedRevision: current.revision, pipeline: result.pipeline, writes: result.writes },
     });
+  }
+  private async applyGeneratedVisual(
+    projectId: string,
+    current: NativePptPipeline,
+    action: Extract<NativePipelineAction, { kind: 'visual.replace' }>,
+  ): Promise<NativePptPipeline> {
+    await this.worker.restoreProject(current);
+    const result = await this.worker.executeProject(projectId, action);
+    try {
+      return await this.callNative<NativePptPipeline>('ppt_commit_pipeline', {
+        input: { projectId, expectedRevision: current.revision, pipeline: result.pipeline, writes: result.writes },
+      });
+    } catch (reason) {
+      let persisted: NativePptPipeline;
+      try { persisted = await this.loadProjectPipeline(projectId); }
+      catch {
+        throw new Error(`视觉候选保存结果尚未核实；请重新载入项目检查，系统不会自动再次生成。${reason instanceof Error ? reason.message : String(reason)}`);
+      }
+      if (sameCheckpoint(persisted, result.pipeline)) return persisted;
+      if (persisted.revision !== current.revision) {
+        throw new Error('版本冲突：其他操作已更新项目；生成的视觉未覆盖新检查点。');
+      }
+      throw reason;
+    }
   }
   private async runStructured<T>(projectId: string, prompt: string): Promise<T> {
     await this.requireActiveChatGptAccount();
@@ -965,4 +1037,13 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function isCanonicalAbsolutePath(value: string): boolean {
   return value.startsWith('/') && !value.includes('\0') && !value.split('/').includes('..');
+}
+
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try { return await Promise.race([operation, timeout]); }
+  finally { if (timer !== undefined) clearTimeout(timer); }
 }

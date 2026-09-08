@@ -85,6 +85,8 @@ pnpm --filter @digital-twin/desktop tauri build --bundles app
 
 ## LibreOffice QA 失败或中文方框
 
+注意：自动 QA 通过也不保证所有文字与形状都不互相遮挡。当前固定版式导出器对较长正文缺少完整的避让处理；2026-09-08 的合成验收封面出现正文与装饰条重叠，而自动检查仍通过。真实交付前请逐页核对渲染图，不能只看 `passed`。此限制不影响细化文档的保存和审批，详见 [验收记录](qa.md#已发现但未在本次扩展的导出版式问题)。
+
 先确认 LibreOffice 能从命令行启动。macOS 无头 LibreOffice 可能看不到系统中文字体，因此 QA 为每次运行在工作区外的隔离临时目录生成局部 Fontconfig，显式包含 `/System/Library/Fonts`、`/System/Library/Fonts/Supplemental` 和 `/Library/Fonts`，并把 `FONTCONFIG_FILE`、`FONTCONFIG_PATH`、`XDG_CACHE_HOME` 传给 LibreOffice 与 pdftoppm。临时字体缓存随本轮准备清理，不会写入项目交付目录。QA 除了检查字体文件，还会对真实 rendered PNG 检测连续方框/tofu；检测到不可读中文会进入可恢复的 `qa-rendering` 阻塞。
 
 ## 找不到 pdftoppm 或 soffice

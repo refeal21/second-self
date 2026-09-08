@@ -1,12 +1,12 @@
 # Slide Detail Editor Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Replace detail-review JSON with a lossless per-page CRUD editor and explicitly approved outline revisions.
 
 **Architecture:** Keep the native Rust persistence boundary and ordered workflow. A pending outline revision holds edited structure and matching details without replacing the frozen outline; confirmation archives the base, freezes the revised outline and leaves details draft. A controlled React document editor communicates through baseline-aware adapter methods.
 
-**Tech Stack:** Existing Tauri 2, Rust/rusqlite, React/TypeScript, Worker JSON-RPC, Vitest and Playwright; no new runtime dependencies.
+**Tech Stack:** Existing Tauri 2, Rust/rusqlite, React/TypeScript, Worker JSON-RPC, Vitest and Playwright. Implementation declares the already-locked `chrono 0.4.45` as a direct std-only dependency for strict timestamp validation; no new dependency download or JS runtime installation.
 
 **Spec:** `docs/superpowers/specs/2026-09-08-slide-detail-editor-design.md` (user approved 2026-09-08).
 
@@ -64,7 +64,7 @@ Existing `details.submit` and `details.approve` accept `expectedRevision`; editi
 
 **Interfaces:** Consumes existing source analysis, outline/spec domain types and native action/commit boundaries. Produces public fields/actions above, strict v1/v2 restore, immutable version histories, actual version-aware export/QA.
 
-- [ ] Write failing tests that drive the actual NativePptRpcRuntime from sources through outline approval and detail draft. Use synthetic fixtures only. Test new actions initially rejected by old parser, then state changes/provenance independently:
+- [x] Write failing tests that drive the actual NativePptRpcRuntime from sources through outline approval and detail draft. Use synthetic fixtures only. Test new actions initially rejected by old parser, then state changes/provenance independently:
 
 ```ts
 const before = structuredClone(runtime.snapshot(projectId));
@@ -79,12 +79,12 @@ expect(saved.pipeline.outlineRevisionDraft!.specs[0]!.body).toEqual(['第二页�
 expect(saved.pipeline.project.workflowStatus).toBe('detail_review');
 ```
 
-- [ ] Run `pnpm --filter @digital-twin/worker exec vitest run src/outline-revisions.test.ts`; record RED output due to unsupported revision action (not fixture/compile errors).
-- [ ] Implement save/confirm/cancel in a focused revision module. `save` keeps current versions unchanged, validates same ordered IDs in candidate outline/specs and known sources. `confirm` archives base, creates unique versioned artifacts, freezes new outline, appends its approval, creates matching details draft, clears pending. `cancel` archives cancelled draft and preserves current versions. No global backward transition.
-- [ ] Preserve v1 parsing and production fixtures. Add strict v2 parsing, version/history/approval/task chronology validation and recovery; no bypasses or synthetic replacement approvals. Existing frozen artifacts must never be overwritten. Let initial source/outline actions remain v1 until first structural edit. Version-aware replay must retain actual IDs, times and sequences through later visual/export/QA actions.
-- [ ] Test add/delete/reorder/title-purpose changes, repeated saves, two successive revisions, cancel then new revision ID, stale revision/base/id, duplicate page IDs, unknown references, malformed history, unknown schema, tampered approvals/times, pending revision blocking approval/images/export, frozen detail blocking edits, old v1 restore, v2 process restart, active details/body equality and new version artifact paths.
-- [ ] Add native Rust persistence tests on temporary workspaces for CAS, immutable historical artifacts and failed commit not producing partial new state; use actual workbench service, no user DB.
-- [ ] Run focused tests, `pnpm --filter @digital-twin/worker test`, Worker typecheck/lint and Rust tests once before commit. Self-review and commit only Task 1 files. Write report with RED/GREEN evidence and exact history shape.
+- [x] Run `pnpm --filter @digital-twin/worker exec vitest run src/outline-revisions.test.ts`; record RED output due to unsupported revision action (not fixture/compile errors).
+- [x] Implement save/confirm/cancel in a focused revision module. `save` keeps current versions unchanged, validates same ordered IDs in candidate outline/specs and known sources. `confirm` archives base, creates unique versioned artifacts, freezes new outline, appends its approval, creates matching details draft, clears pending. `cancel` archives cancelled draft and preserves current versions. No global backward transition.
+- [x] Preserve v1 parsing and production fixtures. Add strict v2 parsing, version/history/approval/task chronology validation and recovery; no bypasses or synthetic replacement approvals. Existing frozen artifacts must never be overwritten. Let initial source/outline actions remain v1 until first structural edit. Version-aware replay must retain actual IDs, times and sequences through later visual/export/QA actions.
+- [x] Test add/delete/reorder/title-purpose changes, repeated saves, two successive revisions, cancel then new revision ID, stale revision/base/id, duplicate page IDs, unknown references, malformed history, unknown schema, tampered approvals/times, pending revision blocking approval/images/export, frozen detail blocking edits, old v1 restore, v2 process restart, active details/body equality and new version artifact paths.
+- [x] Add native Rust persistence tests on temporary workspaces for CAS, immutable historical artifacts and failed commit not producing partial new state; use actual workbench service, no user DB.
+- [x] Run focused tests, `pnpm --filter @digital-twin/worker test`, Worker typecheck/lint and Rust tests once before commit. Self-review and commit only Task 1 files. Write report with RED/GREEN evidence and exact history shape.
 
 ## Task 2: Lossless structured detail editor
 
@@ -115,7 +115,7 @@ export function DetailPageIndex(props: {
 }): ReactNode;
 ```
 
-- [ ] Add failing tests for controlled title/body editing, ordered stable IDs on CRUD, delete confirmation/last-page guard, no model invocation, read-only/disabled controls, Chinese labels, and lossless compatibility suffix preservation:
+- [x] Add failing tests for controlled title/body editing, ordered stable IDs on CRUD, delete confirmation/last-page guard, no model invocation, read-only/disabled controls, Chinese labels, and lossless compatibility suffix preservation:
 
 ```ts
 fireEvent.change(screen.getByRole('textbox', { name: '第 1 页正文第 1 段' }),
@@ -125,12 +125,12 @@ expect(latest.specs[0]!.imageGenerationBrief).toBe(originalBrief);
 expect(screen.queryByRole('textbox', { name: '逐页细化 JSON' })).toBeNull();
 ```
 
-- [ ] Run `pnpm --filter @digital-twin/desktop exec vitest run src/detail-document.test.ts src/detail-editor.test.tsx`; record expected RED behavior.
-- [ ] Implement controlled document form using existing outline card styling conventions. Each page supports title/purpose, paragraph CRUD, table+row+column CRUD with delete confirmation, chart/category/series editing (blank numeric input is invalid, never silently 0), basic shape forms, known analysis evidence/source selection and source locator editing. New page inserted after current with safe unique ID and empty required content; sorting moves complete ID-associated objects.
-- [ ] Split compatibility brief only at exact known recovery marker; preserve suffix byte-for-byte on main-text edit, repeated saves and unsupported supplement parsing. Render known supplement in safe Chinese property lists, default-collapse raw fallback. Explain restored supplements are historical background, not authoritative current data; never re-key old index annotations to new objects.
-- [ ] Add field validation returning page+field Chinese errors; preserve body arrays/newlines/numeric strings without normalize-on-load. Tables keep rectangular shape, charts keep series/category length, IDs remain unique, titles/purposes/main prompt nonblank. Errors must reach integration to disable save/approve.
-- [ ] Style long data for internal table scroll only, safe wrapping and keyboard focus; include page index anchors, focus after insert/delete/sort and collision-free prefixes for history view. Add readonly per-page advanced JSON, never editable JSON.
-- [ ] Run focused tests plus desktop test/typecheck/lint once. Self-review and commit only Task 2 files. Report RED/GREEN and public interface details.
+- [x] Run `pnpm --filter @digital-twin/desktop exec vitest run src/detail-document.test.ts src/detail-editor.test.tsx`; record expected RED behavior.
+- [x] Implement controlled document form using existing outline card styling conventions. Each page supports title/purpose, paragraph CRUD, table+row+column CRUD with delete confirmation, chart/category/series editing (blank numeric input is invalid, never silently 0), basic shape forms, known analysis evidence/source selection and source locator editing. New page inserted after current with safe unique ID and empty required content; sorting moves complete ID-associated objects.
+- [x] Split compatibility brief only at exact known recovery marker; preserve suffix byte-for-byte on main-text edit, repeated saves and unsupported supplement parsing. Render known supplement in safe Chinese property lists, default-collapse raw fallback. Explain restored supplements are historical background, not authoritative current data; never re-key old index annotations to new objects.
+- [x] Add field validation returning page+field Chinese errors; preserve body arrays/newlines/numeric strings without normalize-on-load. Tables keep rectangular shape, charts keep series/category length, IDs remain unique, titles/purposes/main prompt nonblank. Errors must reach integration to disable save/approve.
+- [x] Style long data for internal table scroll only, safe wrapping and keyboard focus; include page index anchors, focus after insert/delete/sort and collision-free prefixes for history view. Add readonly per-page advanced JSON, never editable JSON.
+- [x] Run focused tests plus desktop test/typecheck/lint once. Self-review and commit only Task 2 files. Report RED/GREEN and public interface details.
 
 ## Task 3: Desktop persistence, approval and navigation integration
 
@@ -152,7 +152,7 @@ cancelOutlineRevision(projectId: string, revisionId: string,
 
 App-owned edit operation registry holds running/success/failure and persisted result through remount. Expose subscription/getter methods analogous to existing project-generation registry. Pass expectedRevision to detail approval too. Keep methods backward-compatible only where existing initial generation/readonly use requires it; edit callers never omit baseline.
 
-- [ ] Write RED UI tests for rendering actual per-page editor, editing body then attempting navigation/approval, saving and remounting, creating structure draft and confirming separately, losing response and stale baseline:
+- [x] Write RED UI tests for rendering actual per-page editor, editing body then attempting navigation/approval, saving and remounting, creating structure draft and confirming separately, losing response and stale baseline:
 
 ```ts
 expect(screen.getByRole('button', { name: '批准全部细化' })).toBeDisabled();
@@ -163,12 +163,12 @@ expect(await screen.findByRole('textbox', { name: '第 1 页正文第 1 段' }))
 expect(stored.approvals).toHaveLength(1); // save did not approve
 ```
 
-- [ ] Run targeted native detail/adapter/edit-state tests and record expected RED results.
-- [ ] Replace JSON textarea and parseJson save path with controlled DetailDocument initialized from pending revision or current outline/specs. Track base revision and persisted content; dirty drafts survive background refresh, with explicit conflict instead of reset. Add directory, sticky save/review actions, history readonly cards, pending diff/confirm/cancel UI and field errors.
-- [ ] Ordinary content saves call saveDetails; structural edits or already-pending edits save the candidate revision. Title and purpose changes are structural. Approval disables on dirty/pending/invalid/busy. Only successful persistence marks clean. Draft cancel confirms both structural and content loss. Native frozen details render readonly in later stages.
-- [ ] Anchor CAS to editor baseline at adapter and Worker boundaries. Do not reread latest then use it as the old edit's baseline. Coordinate edit actions with generation registry to avoid conflicting same-project actions; hold lock until persistence/reconciliation completes; never swallow uncertain commit failures. Route-away/remount sees same running operation and final result.
-- [ ] Extend dirty navigation/window guard and updated Chinese message; refreshing collections must not clobber editing state. Pending structure gets precedence over details in approval center/dashboard and links guarded workspace. Display historical approval proof separately. Update prompt building so restored supplements cannot override approved body/tables/data.
-- [ ] Run focused tests and desktop full tests/typecheck/lint, update existing fixtures/call sites to real interfaces, self-review and commit only Task 3 files. Report evidence.
+- [x] Run targeted native detail/adapter/edit-state tests and record expected RED results.
+- [x] Replace JSON textarea and parseJson save path with controlled DetailDocument initialized from pending revision or current outline/specs. Track base revision and persisted content; dirty drafts survive background refresh, with explicit conflict instead of reset. Add directory, sticky save/review actions, history readonly cards, pending diff/confirm/cancel UI and field errors.
+- [x] Ordinary content saves call saveDetails; structural edits or already-pending edits save the candidate revision. Title and purpose changes are structural. Approval disables on dirty/pending/invalid/busy. Only successful persistence marks clean. Draft cancel confirms both structural and content loss. Native frozen details render readonly in later stages.
+- [x] Anchor CAS to editor baseline at adapter and Worker boundaries. Do not reread latest then use it as the old edit's baseline. Coordinate edit actions with generation registry to avoid conflicting same-project actions; hold lock until persistence/reconciliation completes; never swallow uncertain commit failures. Route-away/remount sees same running operation and final result.
+- [x] Extend dirty navigation/window guard and updated Chinese message; refreshing collections must not clobber editing state. Pending structure gets precedence over details in approval center/dashboard and links guarded workspace. Display historical approval proof separately. Update prompt building so restored supplements cannot override approved body/tables/data.
+- [x] Run focused tests and desktop full tests/typecheck/lint, update existing fixtures/call sites to real interfaces, self-review and commit only Task 3 files. Report evidence.
 
 ## Task 4: Production acceptance, browser QA and release
 
@@ -179,7 +179,7 @@ expect(stored.approvals).toHaveLength(1); // save did not approve
 
 **Interfaces:** Consumes final editor, adapter and actual native pipeline. Uses mocked external Codex only, real domain/runtime/persistence code and actual exported PPTX inspection.
 
-- [ ] Add a failing production-equivalent acceptance test driving an initially v1 saved project through structure save, reload, confirm, ordinary edit, detail approval, visual approval, export and QA. Verify known literal text in resulting OOXML, actual new outline/detail version IDs, original approval/history preservation, and pending revision entry absence after confirm.
+- [x] Add a failing production-equivalent acceptance test driving an initially v1 saved project through structure save, reload, confirm, ordinary edit, detail approval, visual approval, export and QA. Verify known literal text in resulting OOXML, actual new outline/detail version IDs, original approval/history preservation, and pending revision entry absence after confirm.
 
 ```ts
 expect(reloaded.schemaVersion).toBe(2);
@@ -188,8 +188,17 @@ expect(reloaded.slideSpecs!.version.status).toBe('draft');
 expect(exportedXml).toContain('改后正文');
 ```
 
-- [ ] Add fault cases for persistence failure, stale edit, restart and uncertain response using actual production adapter and strict runtime, not a mock save that accepts any content.
-- [ ] Run targeted acceptance test RED/GREEN then full `pnpm test`, `pnpm typecheck`, `pnpm lint`, `git diff --check`.
-- [ ] Browser availability: Browser plugin not available; use installed Playwright without dependency install. Start `pnpm --filter @digital-twin/desktop dev --host 127.0.0.1 --port 1420 --strictPort` only if free. Follow dashboard/project → real structured editor → edit/save → navigate away/back → structural change/confirm → content approval. At 1440×1050 and 390×844 check identity, nonblank, no overlay/errors, no page overflow/scroll traps, reachable controls and screenshots. External adapters are explicitly synthetic; no user DB/models.
-- [ ] Perform independent task/final reviews, fix findings with tested scoped changes, then build serially with `pnpm --filter @digital-twin/desktop tauri build --bundles app` and `pnpm smoke:packaged-worker`. Do not restart an active app or replace an installed copy.
+- [x] Add fault cases for persistence failure, stale edit, restart and uncertain response using actual production adapter and strict runtime, not a mock save that accepts any content.
+- [x] Run targeted acceptance test RED/GREEN then full `pnpm test`, `pnpm typecheck`, `pnpm lint`, `git diff --check`.
+- [x] Browser availability: Browser plugin not available; use installed Playwright without dependency install. Start `pnpm --filter @digital-twin/desktop dev --host 127.0.0.1 --port 1420 --strictPort` only if free. Follow dashboard/project → real structured editor → edit/save → navigate away/back → structural change/confirm → content approval. At 1440×1050 and 390×844 check identity, nonblank, no overlay/errors, no page overflow/scroll traps, reachable controls and screenshots. External adapters are explicitly synthetic; no user DB/models.
+- [x] Perform independent task/final reviews, fix findings with tested scoped changes, then build serially with `pnpm --filter @digital-twin/desktop tauri build --bundles app` and `pnpm smoke:packaged-worker`. Do not restart an active app or replace an installed copy.
 - [ ] Update docs/checklists with actual evidence, commit scoped code/docs, push to user-authorized `refeal21/second-self` main only after verified completion (no force push). Tell user exact .app path, safe quit/reopen instructions, tested behavior and unverified real-model/PowerPoint boundaries.
+
+## Execution record — 2026-09-08
+
+- Implementation through `0085430` passed 527 tests (core8/Worker219/desktop260/Rust40), typecheck, lint, Rust format and diff checks. All task gates and final code review accepted after focused RED/GREEN fixes.
+- Real App browser flow passed at 1440×1050 and 390×844 with a synthetic 19-page project. Browser storage is explicitly in-memory CAS; strict Worker and production adapter are real.
+- Isolated arm64 app: `artifacts/build/detail-editor-target/release/bundle/macos/Digital Twin Workbench.app`, approximately123MiB. Existing default-target app kept running unchanged. v1 SEA smoke completed r29.
+- Actual native v2 harness completed r37 with outline-v2/detail-v3, original artifacts/history, separate approvals, stale-CAS rejection and one-commit response-loss recovery. Five-page LibreOffice QA automatically passed; operation-window RSS579.7MiB/112samples.
+- Manual rendered-page inspection found an existing fixed-layout limitation: longer cover text overlaps its decorative stripe although automatic QA passes. This is recorded in `docs/qa.md`, not hidden by shortening fixture content or weakening checks. This feature release does not claim all PPT layouts, real ImageGen, native GUI close behavior or PowerPoint compatibility are manually verified.
+- Detailed architectural rulings, evidence scope and limitations: [QA record](../../qa.md#2026-09-08逐页细化编辑增量验收). Final publication is recorded after remote verification.

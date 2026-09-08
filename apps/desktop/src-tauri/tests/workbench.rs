@@ -23,12 +23,14 @@ fn synthetic_revision_base(service: &WorkbenchService) -> serde_json::Value {
     let mut base = service.load_pipeline(&project.id).unwrap();
     base["revision"] = 2.into();
     base["project"]["workflowStatus"] = "detail_review".into();
+    base["project"]["updatedAt"] = "2026-09-08T01:02:00Z".into();
+    base["analysis"] = serde_json::json!({"output": {"sourceMap": [{"sourceId": "source-one"}], "findings": [{"id": "finding-one"}], "dataPoints": [{"id": "data-one"}]}});
     base["outline"] = serde_json::json!({"version": {"id": format!("{}-outline-v1", project.id), "projectId": project.id,
         "sequence": 1, "status": "frozen", "createdAt": "2026-09-08T01:00:00Z", "frozenAt": "2026-09-08T01:01:00Z"},
         "value": {"title": "合成大纲", "slides": [{"id": "page-one", "title": "第一页", "purpose": "介绍"}]}});
     base["slideSpecs"] = serde_json::json!({"version": {"id": format!("{}-slide-specs-v1", project.id), "projectId": project.id,
         "sequence": 1, "status": "draft", "createdAt": "2026-09-08T01:00:00Z", "frozenAt": null},
-        "value": [{"id": "page-one", "title": "第一页", "body": ["合成正文"]}]});
+        "value": [{"id": "page-one", "title": "第一页", "body": ["合成正文"], "tables": [], "charts": [], "shapes": [], "sourceMap": [], "imageGenerationBrief": "清晰的信息图"}]});
     base["approvals"] = serde_json::json!([{"id": format!("{}-outline_review-1", project.id), "projectId": project.id,
         "versionId": format!("{}-outline-v1", project.id), "stage": "outline_review", "status": "approved", "decidedAt": "2026-09-08T01:01:00Z"}]);
     let writes = vec![
@@ -146,6 +148,459 @@ fn synthetic_confirmed(
         ),
     ];
     (next, writes)
+}
+
+fn synthetic_detail_approved(confirmed: &serde_json::Value) -> serde_json::Value {
+    let mut next = confirmed.clone();
+    let id = confirmed["project"]["id"].as_str().unwrap();
+    let at = "2026-09-08T04:00:00Z";
+    next["revision"] = (confirmed["revision"].as_i64().unwrap() + 1).into();
+    next["project"]["updatedAt"] = at.into();
+    next["project"]["workflowStatus"] = "visual_review".into();
+    next["slideSpecs"]["version"]["status"] = "frozen".into();
+    next["slideSpecs"]["version"]["frozenAt"] = at.into();
+    next["currentSlideId"] = confirmed["slideSpecs"]["value"][0]["id"].clone();
+    next["approvals"].as_array_mut().unwrap().push(serde_json::json!({
+        "id": format!("{id}-detail_review-{}", confirmed["approvals"].as_array().unwrap().len() + 1),
+        "projectId": id, "versionId": confirmed["slideSpecs"]["version"]["id"],
+        "stage": "detail_review", "status": "approved", "decidedAt": at
+    }));
+    next
+}
+
+#[test]
+fn native_revision_candidates_reject_malformed_documents_and_event_times() {
+    let root = temporary_root("revision-document-validation");
+    std::fs::create_dir_all(&root).unwrap();
+    let workspace = root.join("workspace");
+    let service = WorkbenchService::open(root.join("state.sqlite3"), &workspace).unwrap();
+    let base = synthetic_revision_base(&service);
+    let id = base["project"]["id"].as_str().unwrap();
+    for corruption in [
+        "empty",
+        "mismatch",
+        "duplicate",
+        "title",
+        "blank-title",
+        "body",
+        "body-type",
+        "missing-field",
+        "purpose",
+        "brief",
+        "source",
+        "citation",
+        "finding",
+        "data",
+        "table",
+        "chart",
+        "shape",
+        "nested-duplicate",
+        "unknown",
+        "event-extra",
+        "identifier",
+        "time",
+        "backwards",
+    ] {
+        let mut forged = synthetic_pending(&base);
+        let event = &mut forged["revisionEvents"][0];
+        match corruption {
+            "empty" => {
+                event["outline"]["slides"] = serde_json::json!([]);
+                event["specs"] = serde_json::json!([]);
+            }
+            "mismatch" => event["specs"][0]["id"] = "page-other".into(),
+            "duplicate" => {
+                let page = event["outline"]["slides"][0].clone();
+                let spec = event["specs"][0].clone();
+                event["outline"]["slides"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(page);
+                event["specs"].as_array_mut().unwrap().push(spec);
+            }
+            "title" => event["specs"][0]["title"] = "不同标题".into(),
+            "blank-title" => event["outline"]["title"] = "  ".into(),
+            "body" => event["specs"][0]["body"] = serde_json::json!(["\n "]),
+            "body-type" => event["specs"][0]["body"] = serde_json::json!([42]),
+            "missing-field" => {
+                event["specs"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("imageGenerationBrief");
+            }
+            "purpose" => event["outline"]["slides"][0]["purpose"] = " ".into(),
+            "brief" => event["specs"][0]["imageGenerationBrief"] = " ".into(),
+            "source" => {
+                event["outline"]["slides"][0]["sourceIds"] = serde_json::json!(["unknown-source"])
+            }
+            "citation" => {
+                event["specs"][0]["sourceMap"] = serde_json::json!([{"sourceId": "unknown-source", "title": "出处", "locator": "p1"}])
+            }
+            "finding" => event["specs"][0]["findingIds"] = serde_json::json!(["unknown-finding"]),
+            "data" => {
+                event["outline"]["slides"][0]["dataPointIds"] = serde_json::json!(["unknown-data"])
+            }
+            "table" => {
+                event["specs"][0]["tables"] = serde_json::json!([{"id": "table-one", "headers": ["列"], "rows": [["a", "b"]]}])
+            }
+            "chart" => {
+                event["specs"][0]["charts"] = serde_json::json!([{"id": "chart-one", "type": "bar", "categories": ["a"], "series": [{"name": "系列", "values": []}]}])
+            }
+            "shape" => {
+                event["specs"][0]["shapes"] = serde_json::json!([{"id": "shape-one", "type": "rect", "x": -1, "y": 0, "w": 1, "h": 1}])
+            }
+            "nested-duplicate" => {
+                event["specs"][0]["tables"] =
+                    serde_json::json!([{"id": "same-id", "headers": [], "rows": []}]);
+                event["specs"][0]["shapes"] = serde_json::json!([{"id": "same-id", "type": "rect", "x": 0, "y": 0, "w": 1, "h": 1}]);
+            }
+            "unknown" => event["specs"][0]["extra"] = true.into(),
+            "event-extra" => event["extra"] = true.into(),
+            "identifier" => event["revisionId"] = "INVALID_ID".into(),
+            "time" => event["at"] = "not-a-time".into(),
+            "backwards" => event["at"] = "2026-09-08T01:00:00Z".into(),
+            _ => unreachable!(),
+        }
+        let event = forged["revisionEvents"][0].clone();
+        forged["project"]["updatedAt"] = event["at"].clone();
+        forged["outlineRevisionDraft"]["id"] = event["revisionId"].clone();
+        forged["outlineRevisionDraft"]["outline"] = event["outline"].clone();
+        forged["outlineRevisionDraft"]["specs"] = event["specs"].clone();
+        forged["outlineRevisionDraft"]["createdAt"] = event["at"].clone();
+        forged["outlineRevisionDraft"]["updatedAt"] = event["at"].clone();
+        assert!(
+            service
+                .commit_pipeline(PipelineCommitInput {
+                    project_id: id.into(),
+                    expected_revision: 2,
+                    pipeline: forged,
+                    writes: vec![origin_write(&base)]
+                })
+                .is_err(),
+            "must reject {corruption} candidate"
+        );
+        assert_eq!(service.load_pipeline(id).unwrap(), base);
+        assert!(!workspace
+            .join(id)
+            .join("history/checkpoint-v1-r2.json")
+            .exists());
+    }
+    let mut valid = synthetic_pending(&base);
+    valid["revisionEvents"][0]["outline"]["slides"][0]["sourceIds"] =
+        serde_json::json!(["source-one"]);
+    valid["revisionEvents"][0]["specs"][0]["sourceMap"] = serde_json::json!([{"sourceId": "source-one", "title": "真实出处", "locator": "第1页", "url": "https://example.test/source"}]);
+    valid["revisionEvents"][0]["specs"][0]["findingIds"] = serde_json::json!(["finding-one"]);
+    valid["revisionEvents"][0]["specs"][0]["dataPointIds"] = serde_json::json!(["data-one"]);
+    valid["revisionEvents"][0]["specs"][0]["tables"] =
+        serde_json::json!([{"id": "table-one", "headers": ["列"], "rows": [["值"]]}]);
+    valid["revisionEvents"][0]["specs"][0]["charts"] = serde_json::json!([{"id": "chart-one", "type": "bar", "categories": ["类"], "series": [{"name": "系列", "values": [1.5]}]}]);
+    valid["revisionEvents"][0]["specs"][0]["shapes"] = serde_json::json!([{"id": "shape-one", "type": "rect", "x": 0, "y": 1, "w": 2, "h": 3, "text": "形状文字"}]);
+    valid["outlineRevisionDraft"]["outline"] = valid["revisionEvents"][0]["outline"].clone();
+    valid["outlineRevisionDraft"]["specs"] = valid["revisionEvents"][0]["specs"].clone();
+    assert_eq!(
+        service
+            .commit_pipeline(PipelineCommitInput {
+                project_id: id.into(),
+                expected_revision: 2,
+                pipeline: valid.clone(),
+                writes: vec![origin_write(&base)]
+            })
+            .unwrap(),
+        valid
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn native_detail_freeze_requires_exact_approval_and_transition_evidence() {
+    let root = temporary_root("revision-detail-proof");
+    std::fs::create_dir_all(&root).unwrap();
+    let service =
+        WorkbenchService::open(root.join("state.sqlite3"), root.join("workspace")).unwrap();
+    let base = synthetic_revision_base(&service);
+    let id = base["project"]["id"].as_str().unwrap();
+    let pending = synthetic_pending(&base);
+    service
+        .commit_pipeline(PipelineCommitInput {
+            project_id: id.into(),
+            expected_revision: 2,
+            pipeline: pending.clone(),
+            writes: vec![origin_write(&base)],
+        })
+        .unwrap();
+    let (confirmed, writes) = synthetic_confirmed(&pending);
+    service
+        .commit_pipeline(PipelineCommitInput {
+            project_id: id.into(),
+            expected_revision: 3,
+            pipeline: confirmed.clone(),
+            writes,
+        })
+        .unwrap();
+    let valid = synthetic_detail_approved(&confirmed);
+    for corruption in [
+        "missing",
+        "version",
+        "timestamp",
+        "identity",
+        "extra-proof",
+        "task",
+        "page",
+        "visual",
+        "blocked",
+        "extra-field",
+        "invalid-time",
+        "backwards-time",
+    ] {
+        let mut forged = valid.clone();
+        match corruption {
+            "missing" => {
+                forged["approvals"].as_array_mut().unwrap().pop();
+            }
+            "version" => {
+                forged["approvals"][2]["versionId"] = "wrong-version".into();
+            }
+            "timestamp" => {
+                forged["approvals"][2]["decidedAt"] = "2026-09-08T03:00:00Z".into();
+            }
+            "identity" => {
+                forged["approvals"][2]["id"] = "forged-approval".into();
+            }
+            "extra-proof" => {
+                let proof = forged["approvals"][2].clone();
+                forged["approvals"].as_array_mut().unwrap().push(proof);
+            }
+            "task" => {
+                forged["tasks"].as_array_mut().unwrap().push(serde_json::json!({"id": "made-up-task", "kind": "detail_generation", "status": "completed", "createdAt": "now", "updatedAt": "now", "error": null}));
+            }
+            "page" => {
+                forged["currentSlideId"] = "wrong-first-page".into();
+            }
+            "visual" => {
+                forged["visuals"] = serde_json::json!({"page-one": []});
+            }
+            "blocked" => {
+                forged["blockedCondition"] = serde_json::json!({"kind": "fake"});
+            }
+            "extra-field" => {
+                forged["extra"] = true.into();
+            }
+            "invalid-time" | "backwards-time" => {
+                let at = if corruption == "invalid-time" {
+                    "not-a-time"
+                } else {
+                    "2026-09-08T02:00:00Z"
+                };
+                forged["project"]["updatedAt"] = at.into();
+                forged["slideSpecs"]["version"]["frozenAt"] = at.into();
+                forged["approvals"][2]["decidedAt"] = at.into();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            service
+                .commit_pipeline(PipelineCommitInput {
+                    project_id: id.into(),
+                    expected_revision: 4,
+                    pipeline: forged,
+                    writes: vec![]
+                })
+                .is_err(),
+            "must reject {corruption} detail approval proof"
+        );
+        assert_eq!(service.load_pipeline(id).unwrap(), confirmed);
+    }
+    let write = json_artifact(
+        "history/forged-detail.json",
+        "pipeline-origin",
+        "forged-detail",
+        &valid,
+    );
+    assert!(service
+        .commit_pipeline(PipelineCommitInput {
+            project_id: id.into(),
+            expected_revision: 4,
+            pipeline: valid.clone(),
+            writes: vec![write]
+        })
+        .is_err());
+    let committed = service
+        .commit_pipeline(PipelineCommitInput {
+            project_id: id.into(),
+            expected_revision: 4,
+            pipeline: valid.clone(),
+            writes: vec![],
+        })
+        .unwrap();
+    assert_eq!(committed, valid);
+    assert_eq!(service.persistence_counts(id).unwrap().approvals, 3);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn replace_test_time(value: &mut serde_json::Value, before: &str, after: &str) {
+    match value {
+        serde_json::Value::String(text) if text == before => *text = after.into(),
+        serde_json::Value::Array(entries) => entries
+            .iter_mut()
+            .for_each(|entry| replace_test_time(entry, before, after)),
+        serde_json::Value::Object(entries) => entries
+            .values_mut()
+            .for_each(|entry| replace_test_time(entry, before, after)),
+        _ => (),
+    }
+}
+
+#[test]
+fn native_revision_decisions_and_detail_saves_validate_time_and_generation_evidence() {
+    for kind in [
+        "outline.revision.approve",
+        "outline.revision.cancel",
+        "details.submit",
+    ] {
+        let root = temporary_root("revision-event-proof");
+        std::fs::create_dir_all(&root).unwrap();
+        let service =
+            WorkbenchService::open(root.join("state.sqlite3"), root.join("workspace")).unwrap();
+        let base = synthetic_revision_base(&service);
+        let id = base["project"]["id"].as_str().unwrap();
+        let pending = synthetic_pending(&base);
+        service
+            .commit_pipeline(PipelineCommitInput {
+                project_id: id.into(),
+                expected_revision: 2,
+                pipeline: pending.clone(),
+                writes: vec![origin_write(&base)],
+            })
+            .unwrap();
+        let (mut valid, _) = synthetic_confirmed(&pending);
+        let (current, time) = if kind == "details.submit" {
+            let (_, writes) = synthetic_confirmed(&pending);
+            service
+                .commit_pipeline(PipelineCommitInput {
+                    project_id: id.into(),
+                    expected_revision: 3,
+                    pipeline: valid.clone(),
+                    writes,
+                })
+                .unwrap();
+            let current = valid.clone();
+            valid["revision"] = 5.into();
+            valid["project"]["updatedAt"] = "2026-09-08T04:00:00Z".into();
+            valid["slideSpecs"]["version"]["id"] = format!("{id}-slide-specs-v3").into();
+            valid["slideSpecs"]["version"]["sequence"] = 3.into();
+            valid["slideSpecs"]["version"]["createdAt"] = "2026-09-08T04:00:00Z".into();
+            valid["slideSpecs"]["value"][0]["body"] = serde_json::json!(["用户修改\n第二行"]);
+            let specs = valid["slideSpecs"]["value"].clone();
+            valid["revisionEvents"].as_array_mut().unwrap().push(serde_json::json!({"kind": kind, "at": "2026-09-08T04:00:00Z", "expectedRevision": 4, "specs": specs}));
+            valid["tasks"].as_array_mut().unwrap().push(serde_json::json!({"id": format!("{id}-task-5-detail_generation"), "kind": "detail_generation", "status": "completed", "createdAt": "2026-09-08T04:00:00Z", "updatedAt": "2026-09-08T04:00:00Z", "error": null}));
+            (current, "2026-09-08T04:00:00Z")
+        } else {
+            if kind == "outline.revision.cancel" {
+                valid["outline"] = pending["outline"].clone();
+                valid["slideSpecs"] = pending["slideSpecs"].clone();
+                valid["approvals"] = pending["approvals"].clone();
+                valid["revisionHistory"][0]["status"] = "cancelled".into();
+                valid["revisionHistory"][0]["newOutlineVersionId"] = serde_json::Value::Null;
+                valid["revisionEvents"][1]["kind"] = kind.into();
+            }
+            (pending.clone(), "2026-09-08T03:00:00Z")
+        };
+        let writes_for = |checkpoint: &serde_json::Value| {
+            if kind == "details.submit" {
+                vec![json_artifact(
+                    "slide-specs/slide-specs-v3.json",
+                    "slide-specs",
+                    &format!("{id}-slide-specs-v3"),
+                    &serde_json::json!({"outlineVersionId": checkpoint["outline"]["version"]["id"], "specs": checkpoint["slideSpecs"]["value"]}),
+                )]
+            } else {
+                let mut writes = if kind == "outline.revision.approve" {
+                    synthetic_confirmed(&pending)
+                        .1
+                        .into_iter()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+                writes.push(json_artifact(
+                    "history/revision-one.json",
+                    "outline-revision-history",
+                    "revision-one",
+                    &checkpoint["revisionHistory"][0],
+                ));
+                writes
+            }
+        };
+        for corruption in [
+            "invalid-time",
+            "backwards-time",
+            "unknown-field",
+            "task-proof",
+            "document",
+        ] {
+            let mut forged = valid.clone();
+            match corruption {
+                "invalid-time" => replace_test_time(&mut forged, time, "not-a-time"),
+                "backwards-time" => replace_test_time(&mut forged, time, "2026-09-08T01:30:00Z"),
+                "unknown-field" => {
+                    forged["revisionEvents"]
+                        .as_array_mut()
+                        .unwrap()
+                        .last_mut()
+                        .unwrap()["unknown"] = true.into();
+                }
+                "task-proof" => {
+                    if kind == "details.submit" {
+                        forged["tasks"].as_array_mut().unwrap().pop();
+                    } else {
+                        forged["tasks"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!({"id": "forged"}));
+                    }
+                }
+                "document" => {
+                    if kind == "details.submit" {
+                        forged["slideSpecs"]["value"][0]["body"] = serde_json::json!([]);
+                        forged["revisionEvents"]
+                            .as_array_mut()
+                            .unwrap()
+                            .last_mut()
+                            .unwrap()["specs"][0]["body"] = serde_json::json!([]);
+                    } else {
+                        forged["revisionHistory"][0]["draft"]["specs"][0]["body"] =
+                            serde_json::json!([]);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                service
+                    .commit_pipeline(PipelineCommitInput {
+                        project_id: id.into(),
+                        expected_revision: current["revision"].as_i64().unwrap(),
+                        writes: writes_for(&forged),
+                        pipeline: forged
+                    })
+                    .is_err(),
+                "reject {kind} {corruption}"
+            );
+            assert_eq!(service.load_pipeline(id).unwrap(), current);
+        }
+        assert_eq!(
+            service
+                .commit_pipeline(PipelineCommitInput {
+                    project_id: id.into(),
+                    expected_revision: current["revision"].as_i64().unwrap(),
+                    writes: writes_for(&valid),
+                    pipeline: valid.clone()
+                })
+                .unwrap(),
+            valid
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

@@ -1,5 +1,6 @@
 pub mod codex_process;
 pub mod database;
+mod native_revision_validation;
 pub mod paths;
 pub mod tauri_codex;
 pub mod tauri_workbench;

@@ -1209,6 +1209,9 @@ fn validate_revision_artifacts(
         .ok_or("Missing revision events")?;
     let previous_count = current["revisionEvents"].as_array().map_or(0, Vec::len);
     if events.len() == previous_count {
+        if current["slideSpecs"]["version"]["status"] == "draft" && !writes.is_empty() {
+            return Err("Detail approval cannot write artifacts".into());
+        }
         return Ok(());
     }
     let event = events.last().ok_or("Missing revision event")?;
@@ -1371,12 +1374,38 @@ fn validate_revision_commit(
             return Err("Frozen details are immutable".into());
         }
         if current["slideSpecs"]["version"]["status"] == "draft" {
-            let mut frozen = current["slideSpecs"].clone();
-            frozen["version"]["status"] = "frozen".into();
-            frozen["version"]["frozenAt"] = next["project"]["updatedAt"].clone();
-            if next["slideSpecs"] != frozen || next["project"]["workflowStatus"] != "visual_review"
+            crate::native_revision_validation::time(
+                &next["project"]["updatedAt"],
+                &current["project"]["updatedAt"],
+            )?;
+            if current["project"]["workflowStatus"] != "detail_review"
+                || current["visuals"] != serde_json::json!({})
+                || [
+                    "currentSlideId",
+                    "blockedCondition",
+                    "exportReceipt",
+                    "qaReport",
+                ]
+                .iter()
+                .any(|field| !current[field].is_null())
             {
-                return Err("Unjournaled details mutation".into());
+                return Err("Detail approval requires an unblocked draft detail checkpoint".into());
+            }
+            let mut approved = current.clone();
+            approved["revision"] = (expected_revision + 1).into();
+            approved["project"]["updatedAt"] = next["project"]["updatedAt"].clone();
+            approved["project"]["workflowStatus"] = "visual_review".into();
+            approved["slideSpecs"]["version"]["status"] = "frozen".into();
+            approved["slideSpecs"]["version"]["frozenAt"] = next["project"]["updatedAt"].clone();
+            approved["currentSlideId"] = current["slideSpecs"]["value"][0]["id"].clone();
+            approved["approvals"].as_array_mut().unwrap().push(serde_json::json!({
+                "id": format!("{project_id}-detail_review-{}", old_approvals.len() + 1), "projectId": project_id,
+                "versionId": current["slideSpecs"]["version"]["id"], "stage": "detail_review", "status": "approved", "decidedAt": next["project"]["updatedAt"]
+            }));
+            if *next != approved {
+                return Err(
+                    "Detail approval requires its exact approval and transition evidence".into(),
+                );
             }
         }
         return Ok(());
@@ -1400,6 +1429,7 @@ fn validate_revision_commit(
         }
     }
     let event = events.last().unwrap();
+    crate::native_revision_validation::event(event, &current["project"]["updatedAt"])?;
     if event["expectedRevision"].as_i64() != Some(expected_revision)
         || event["at"] != next["project"]["updatedAt"]
     {
@@ -1416,6 +1446,12 @@ fn validate_revision_commit(
         if !pending.is_null() {
             return Err("Pending revision blocks details save".into());
         }
+        crate::native_revision_validation::document(
+            &current["outline"]["value"],
+            &event["specs"],
+            current,
+            true,
+        )?;
         expected["slideSpecs"]["value"] = event["specs"].clone();
         expected["slideSpecs"]["version"] = revision_version(
             project_id,
@@ -1427,6 +1463,10 @@ fn validate_revision_commit(
             &event["at"],
             false,
         );
+        expected["tasks"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": format!("{project_id}-task-{}-detail_generation", expected_revision + 1),
+            "kind": "detail_generation", "status": "completed", "createdAt": event["at"], "updatedAt": event["at"], "error": null
+        }));
     } else {
         let id = event["revisionId"].as_str().ok_or("Missing revision id")?;
         if id.is_empty()
@@ -1441,6 +1481,12 @@ fn validate_revision_commit(
         }
         match kind {
             "outline.revision.save" => {
+                crate::native_revision_validation::document(
+                    &event["outline"],
+                    &event["specs"],
+                    current,
+                    false,
+                )?;
                 expected["outlineRevisionDraft"] = serde_json::json!({"id": id, "baseOutlineVersionId": event["baseOutlineVersionId"],
                     "outline": event["outline"], "specs": event["specs"], "createdAt": if pending.is_null() { &event["at"] } else { &pending["createdAt"] }, "updatedAt": event["at"]});
             }
@@ -1448,6 +1494,12 @@ fn validate_revision_commit(
                 if pending.is_null() {
                     return Err("No pending revision to decide".into());
                 }
+                crate::native_revision_validation::document(
+                    &pending["outline"],
+                    &pending["specs"],
+                    current,
+                    false,
+                )?;
                 let confirmed = kind == "outline.revision.approve";
                 if confirmed {
                     expected["outline"] = serde_json::json!({"version": revision_version(project_id, "outline", current["outline"]["version"]["sequence"].as_i64().ok_or("Missing outline sequence")? + 1, &event["at"], true), "value": pending["outline"]});
@@ -1468,19 +1520,17 @@ fn validate_revision_commit(
             _ => return Err("Unknown revision event kind".into()),
         }
     }
-    for field in [
-        "outline",
-        "slideSpecs",
-        "outlineRevisionDraft",
-        "revisionHistory",
-        "approvals",
-    ] {
-        if expected[field] != next[field] {
-            return Err(format!("Revision event does not justify {field}"));
-        }
-    }
-    if kind != "details.submit" && tasks != old_tasks {
-        return Err("Structure edits cannot create generation tasks".into());
+    expected["schemaVersion"] = 2.into();
+    expected["revision"] = (expected_revision + 1).into();
+    expected["project"]["updatedAt"] = event["at"].clone();
+    expected["revisionOrigin"] = if old_schema == Some(1) {
+        current.clone()
+    } else {
+        current["revisionOrigin"].clone()
+    };
+    expected["revisionEvents"] = next["revisionEvents"].clone();
+    if expected != *next {
+        return Err("Revision event does not justify the complete checkpoint".into());
     }
     Ok(())
 }

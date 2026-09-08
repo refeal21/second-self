@@ -1,15 +1,17 @@
+import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
-import { basename, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 
 const repository = resolve(import.meta.dirname, '..');
-const binary = process.argv[2] ?? join(
+const binary = process.argv[2] ?? process.env.DIGITAL_TWIN_PACKAGED_WORKER ?? join(
   repository,
   'apps/desktop/src-tauri/target/release/bundle/macos/Digital Twin Workbench.app/Contents/MacOS/digital-twin-worker',
 );
+if (!isAbsolute(binary)) throw new Error('Packaged Worker path must be absolute');
 const goldenRoot = join(repository, 'artifacts/qa/golden-project/golden-project');
 const fixtureRoot = join(repository, 'fixtures/golden-project/sources');
 const at = '2026-09-03T04:00:00.000Z';
@@ -109,14 +111,22 @@ try {
   result = await execute({ kind: 'outline.submit', at, outline: editedOutline });
   result = await execute({ kind: 'outline.approve', at });
   result = await execute({ kind: 'details.submit', at, specs });
+  // This smoke deliberately retains v1, including its historical title mismatch.
+  // The production harness separately verifies the structural v2 upgrade.
+  const originalDraft = structuredClone(result.pipeline);
   const editedSpecs = structuredClone(specs);
   editedSpecs[0] = { ...editedSpecs[0], body: ['用户编辑｜管理层汇报｜2026 年 9 月'] };
-  result = await execute({ kind: 'details.submit', at, specs: editedSpecs });
-  result = await execute({ kind: 'details.approve', at });
+  result = await execute({ kind: 'details.submit', at, specs: editedSpecs, expectedRevision: result.pipeline.revision });
+  assert.equal(result.pipeline.schemaVersion, 1);
+  assert.deepEqual(result.pipeline.outline, originalDraft.outline);
+  assert.deepEqual(result.pipeline.approvals, originalDraft.approvals);
+  assert.equal(result.pipeline.slideSpecs.value[0].title, specs[0].title);
+  assert.deepEqual(result.pipeline.slideSpecs.value[0].body, ['用户编辑｜管理层汇报｜2026 年 9 月']);
+  result = await execute({ kind: 'details.approve', at, expectedRevision: result.pipeline.revision });
 
   await stop(worker);
   worker = start();
-  await worker.call('ppt.project.restore', { pipeline: result.pipeline });
+  assert.deepEqual(await worker.call('ppt.project.restore', { pipeline: result.pipeline }), result.pipeline);
   const executeRestored = (action) => worker.call('ppt.project.execute', {
     projectId: 'project-packaged-smoke', action,
   });
@@ -185,6 +195,8 @@ try {
   process.stdout.write(`${JSON.stringify({
     binary,
     architecture: process.arch,
+    schemaVersion: result.pipeline.schemaVersion,
+    legacyTitleAndBodyRoundtrip: true,
     workflowStatus: result.pipeline.project.workflowStatus,
     restartRestoredRevision: result.pipeline.revision,
     tasks: result.pipeline.tasks.length,

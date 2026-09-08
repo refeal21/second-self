@@ -4,7 +4,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
 import type { AppServerExit, AppServerTransport } from '../../worker/src/app-server.js';
 import {
@@ -46,6 +46,7 @@ const workerBinary = process.env.DIGITAL_TWIN_PACKAGED_WORKER ?? join(
   'apps/desktop/src-tauri/target/release/bundle/macos',
   'Digital Twin Workbench.app/Contents/MacOS/digital-twin-worker',
 );
+assert.ok(isAbsolute(workerBinary), 'DIGITAL_TWIN_PACKAGED_WORKER must be an absolute binary path');
 const fixtureRoot = join(repository, 'fixtures/golden-project/sources');
 
 interface JsonLineResponse { id: number; result?: unknown; error?: unknown }
@@ -384,11 +385,127 @@ async function main(): Promise<void> {
     pipeline = await adapter.approveOutline(project.id);
     record('outline-edit-save-approve', pipeline);
     pipeline = await adapter.generateDetails(project.id);
-    const editedSpecs = [...structuredClone(pipeline.slideSpecs!.value)];
-    editedSpecs[0] = { ...editedSpecs[0]!, body: ['用户编辑｜管理层汇报｜2026 年 9 月'] };
-    pipeline = await adapter.saveDetails(project.id, editedSpecs);
-    pipeline = await adapter.approveDetails(project.id);
-    record('detail-edit-save-approve', pipeline);
+    assert.equal(pipeline.schemaVersion, 1);
+
+    // Hold a real adapter commit while another adapter writes the same baseline.
+    // The losing request must reach Rust's actual CAS gate, not a fake save.
+    const raceBaseline = pipeline;
+    let commitEntered!: () => void;
+    const entered = new Promise<void>((ready) => { commitEntered = ready; });
+    let releaseCommit!: () => void;
+    const released = new Promise<void>((release) => { releaseCommit = release; });
+    let nativeCasRejected = false;
+    const racingAdapter = createTauriDesktopAdapter(codexTransport([]), async (command, args) => {
+      if (command === 'ppt_commit_pipeline') {
+        commitEntered();
+        await released;
+        try { return await rust.call(command, args); }
+        catch (reason) { nativeCasRejected = true; throw reason; }
+      }
+      return rust.call(command, args);
+    }, worker);
+    const losingSpecs = structuredClone(raceBaseline.slideSpecs!.value);
+    losingSpecs[0]!.body = ['过期编辑不应覆盖当前正文'];
+    const racingSave = racingAdapter.saveDetails(project.id, losingSpecs, raceBaseline.revision);
+    const rejectedRace = assert.rejects(racingSave, /版本冲突/);
+    await Promise.race([entered, racingSave]);
+    const winningSpecs = structuredClone(raceBaseline.slideSpecs!.value);
+    winningSpecs[0]!.body = ['已保存的并发编辑正文'];
+    try {
+      pipeline = await adapter.saveDetails(project.id, winningSpecs, raceBaseline.revision);
+    } finally { releaseCommit(); }
+    await rejectedRace;
+    assert.equal(nativeCasRejected, true);
+    assert.deepEqual(await adapter.loadProjectPipeline(project.id), pipeline);
+    assert.deepEqual(pipeline.approvals, raceBaseline.approvals);
+    record('actual-rust-cas-rejects-obsolete-detail-commit', pipeline);
+
+    const originalV1 = structuredClone(pipeline);
+    const originalArtifactPaths = ['outline/outline-v1.json', 'slide-specs/slide-specs-v1.json'];
+    const originalArtifactBytes = await Promise.all(originalArtifactPaths.map((relativePath) =>
+      rust.call<string>('ppt_read_artifact', { projectId: project.id, relativePath })));
+    const revisionOutline = structuredClone(pipeline.outline!.value);
+    revisionOutline.slides[0]!.title = '人工结构修订：经营复盘与增长计划';
+    revisionOutline.slides[0]!.purpose = '审核结构变化后再单独批准细化内容';
+    const revisionSpecs = pipeline.slideSpecs!.value.map((spec, index) => ({
+      ...structuredClone(spec), title: revisionOutline.slides[index]!.title,
+    }));
+    const revisionId = 'production-harness-revision';
+    const baseOutlineVersionId = pipeline.outline!.version.id;
+
+    // Rust really commits; only its response and one reconciliation read are lost.
+    let loseCommitResponse = true;
+    let loseReconciliationRead = false;
+    let revisionCommitCount = 0;
+    adapter = createTauriDesktopAdapter(codexTransport([]), async (command, args) => {
+      if (command === 'ppt_load_pipeline' && loseReconciliationRead) {
+        loseReconciliationRead = false;
+        throw new Error('Synthetic transport interruption after durable native commit');
+      }
+      const result = await rust.call(command, args);
+      if (command === 'ppt_commit_pipeline' && loseCommitResponse) {
+        revisionCommitCount += 1;
+        loseCommitResponse = false;
+        loseReconciliationRead = true;
+        throw new Error('Synthetic lost native commit response');
+      }
+      if (command === 'ppt_commit_pipeline') revisionCommitCount += 1;
+      return result;
+    }, worker);
+    await assert.rejects(adapter.saveOutlineRevision(project.id, {
+      id: revisionId, baseOutlineVersionId, outline: revisionOutline, specs: revisionSpecs,
+      createdAt: pipeline.project.updatedAt, updatedAt: pipeline.project.updatedAt,
+    }, pipeline.revision), /尚未核实/);
+    pipeline = await adapter.retryProjectEdit(project.id);
+    assert.equal(revisionCommitCount, 1, 'Reconciliation must not submit the saved revision twice');
+    assert.equal(pipeline.schemaVersion, 2);
+    assert.deepEqual(pipeline.revisionOrigin, originalV1);
+    assert.deepEqual(pipeline.approvals, originalV1.approvals);
+    assert.deepEqual(pipeline.outline, originalV1.outline);
+    assert.deepEqual(pipeline.slideSpecs, originalV1.slideSpecs);
+    const pendingRevision = structuredClone(pipeline);
+    record('structure-save-reconciles-uncertain-durable-commit', pipeline);
+
+    await rust.call('harness.restart');
+    await worker.restart();
+    adapter = createTauriDesktopAdapter(codexTransport([]), (command, args) => rust.call(command, args), worker);
+    pipeline = await adapter.loadProjectPipeline(project.id);
+    assert.deepEqual(pipeline, pendingRevision);
+    await assert.rejects(adapter.approveDetails(project.id, pipeline.revision));
+    assert.deepEqual(await adapter.loadProjectPipeline(project.id), pendingRevision);
+    record('restart-restores-pending-structure-without-approval', pipeline);
+    pipeline = await adapter.approveOutlineRevision(project.id, revisionId, baseOutlineVersionId, pipeline.revision);
+    assert.equal(pipeline.outlineRevisionDraft, null);
+    assert.equal(pipeline.project.workflowStatus, 'detail_review');
+    assert.equal(pipeline.outline!.version.id, `${project.id}-outline-v2`);
+    assert.equal(pipeline.slideSpecs!.version.id, `${project.id}-slide-specs-v2`);
+    assert.equal(pipeline.slideSpecs!.version.status, 'draft');
+    assert.deepEqual(pipeline.approvals.slice(0, originalV1.approvals.length), originalV1.approvals);
+    assert.equal(pipeline.approvals.length, originalV1.approvals.length + 1);
+    assert.deepEqual(pipeline.revisionHistory, [{
+      id: revisionId, status: 'confirmed', baseOutline: originalV1.outline,
+      baseSlideSpecs: originalV1.slideSpecs, draft: pendingRevision.outlineRevisionDraft,
+      decidedAt: pipeline.project.updatedAt, newOutlineVersionId: `${project.id}-outline-v2`,
+    }]);
+    const confirmedRevision = structuredClone(pipeline);
+    record('confirm-structure-keeps-details-draft', pipeline);
+    const editedSpecs = structuredClone(pipeline.slideSpecs!.value);
+    editedSpecs[0]!.body = ['改后正文：用户编辑｜管理层汇报｜2026 年 9 月', '第二段\n保留换行'];
+    pipeline = await adapter.saveDetails(project.id, editedSpecs, pipeline.revision);
+    assert.equal(pipeline.slideSpecs!.version.id, `${project.id}-slide-specs-v3`);
+    assert.equal(pipeline.slideSpecs!.version.status, 'draft');
+    assert.deepEqual(pipeline.approvals, confirmedRevision.approvals);
+    const contentDraft = structuredClone(pipeline);
+    await rust.call('harness.restart');
+    await worker.restart();
+    adapter = createTauriDesktopAdapter(codexTransport([]), (command, args) => rust.call(command, args), worker);
+    pipeline = await adapter.loadProjectPipeline(project.id);
+    assert.deepEqual(pipeline, contentDraft);
+    pipeline = await adapter.approveDetails(project.id, pipeline.revision);
+    assert.equal(pipeline.slideSpecs!.version.status, 'frozen');
+    const approvedDetails = structuredClone(pipeline.slideSpecs);
+    const contentApprovals = structuredClone(pipeline.approvals);
+    record('detail-edit-reload-separate-approval', pipeline);
 
     record('quit-worker-close-sqlite', pipeline);
     await rust.call('harness.restart');
@@ -436,6 +553,8 @@ async function main(): Promise<void> {
       relativePath: pipeline.exportReceipt!.relativePath,
     }), 'base64');
     const pptxInspection = await inspectPptxOoxml(exportedPptx);
+    assert.ok(pptxInspection.slideEvidence![0]!.textValues.includes('人工结构修订：经营复盘与增长计划'));
+    assert.ok(pptxInspection.slideEvidence![0]!.textValues.includes('改后正文：用户编辑｜管理层汇报｜2026 年 9 月'));
     if ((pptxInspection.mediaCount ?? 0) <= 0) {
       throw new Error('Production PPTX contains no embedded approved visual media');
     }
@@ -475,6 +594,8 @@ async function main(): Promise<void> {
       throw new Error('Rendered production PNG contains likely tofu replacement glyphs');
     }
     const codexMethods = codexTransports.flatMap(({ methods }) => methods);
+    assert.equal(codexMethods.filter((method) => method === 'turn/start').length, 4,
+      'Manual revision, recovery, confirmation and approval must not regenerate model content');
     const accountReads = codexMethods.filter((method) => method === 'account/read').length;
     const firstAccountRead = codexMethods.indexOf('account/read');
     const firstThreadStart = codexMethods.indexOf('thread/start');
@@ -490,6 +611,18 @@ async function main(): Promise<void> {
       worker,
     );
     const reopened = await reopenedAdapter.loadProjectPipeline(project.id);
+    assert.deepEqual(reopened, pipeline);
+    assert.equal(reopened.outlineRevisionDraft, null);
+    assert.deepEqual(reopened.revisionOrigin, originalV1);
+    assert.deepEqual(reopened.revisionHistory, confirmedRevision.revisionHistory);
+    assert.deepEqual(reopened.outline, confirmedRevision.outline);
+    assert.deepEqual(reopened.slideSpecs, approvedDetails);
+    assert.deepEqual(reopened.approvals.slice(0, contentApprovals.length), contentApprovals);
+    assert.equal(reopened.approvals.length, contentApprovals.length + 5);
+    for (const [index, relativePath] of originalArtifactPaths.entries()) {
+      assert.equal(await rust.call<string>('ppt_read_artifact', { projectId: project.id, relativePath }),
+        originalArtifactBytes[index], `Historical v1 artifact changed: ${relativePath}`);
+    }
     record('restart-reopen-completed', reopened);
     if (reopened.project.workflowStatus !== 'completed' || reopened.revision !== pipeline.revision) {
       throw new Error('Completed pipeline did not survive SQLite and Worker restart');
@@ -524,6 +657,18 @@ async function main(): Promise<void> {
       projectId: project.id,
       workflowStatus: reopened.project.workflowStatus,
       revision: reopened.revision,
+      structureRevision: {
+        schemaVersion: reopened.schemaVersion,
+        id: revisionId,
+        pendingRestartRestored: true,
+        actualRustCasRejected: nativeCasRejected,
+        uncertainCommitReconciledWithoutResubmit: revisionCommitCount === 1,
+        outlineVersionId: reopened.outline!.version.id,
+        detailVersionId: reopened.slideSpecs!.version.id,
+        historyPreserved: true,
+        originalArtifactsPreserved: true,
+        detailsApprovedSeparately: true,
+      },
       sqliteRestarted: true,
       workerRestarted: true,
       databasePath: inspection.databasePath,

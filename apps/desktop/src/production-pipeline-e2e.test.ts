@@ -7,11 +7,13 @@ import {
   type NativeJsonRpcMessage,
 } from './desktop-adapter.js';
 import { buildPptPrompt } from './ppt-prompts.js';
+import { inspectPptxOoxml } from '../../worker/src/libreoffice-qa.js';
 import type { WorkflowWorkerGateway, WorkflowWorkerHealth } from './workflow-worker-client.js';
 import {
   createNativePipeline,
   NativePptRpcRuntime,
   parseNativePipelineAction,
+  validateNativePipelineCheckpoint,
   type NativePipelineAction,
   type NativePptPipeline,
 } from '../../worker/src/native-pipeline.js';
@@ -102,6 +104,7 @@ function nativePersistenceHarness() {
       const input = args?.input as { expectedRevision: number; pipeline: NativePptPipeline; writes: Array<{ relativePath: string; contentsBase64: string }> };
       // Match the real Rust optimistic-concurrency gate before any file/state writes.
       if (input.expectedRevision !== state.pipeline.revision) throw new Error('stale pipeline revision');
+      validateNativePipelineCheckpoint(input.pipeline);
       for (const write of input.writes) state.files.set(write.relativePath, write.contentsBase64);
       state.pipeline = structuredClone(input.pipeline);
       return structuredClone(state.pipeline);
@@ -131,6 +134,158 @@ function nativePersistenceHarness() {
 }
 
 describe('production-equivalent UI adapter → App Server → Worker → Rust persistence flow', () => {
+  it('retains a failed content draft for explicit retry and refuses its stale baseline after saving', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    const generator = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    await generator.analyzeProject('project-e2e');
+    await generator.generateOutline('project-e2e');
+    await generator.approveOutline('project-e2e');
+    const original = await generator.generateDetails('project-e2e');
+    const originalFiles = new Map(native.state.files);
+    let failCommit = true;
+    const adapter = createTauriDesktopAdapter(server, async (command, args) => {
+      if (command === 'ppt_commit_pipeline' && failCommit) throw new Error('磁盘写入失败');
+      return native.invoke(command, args);
+    }, new DirectWorker());
+    const edited = structuredClone(original.slideSpecs!.value);
+    edited[0]!.body = ['仅在明确重试成功后保存'];
+    await expect(adapter.saveDetails('project-e2e', edited, original.revision)).rejects.toThrow('磁盘写入失败');
+    expect(native.state.pipeline).toEqual(original);
+    expect(native.state.files).toEqual(originalFiles);
+    expect(adapter.getProjectEdit('project-e2e')).toMatchObject({ status: 'failed', pipeline: null });
+    failCommit = false;
+    const saved = await adapter.saveDetails('project-e2e', edited, original.revision);
+    expect(saved.slideSpecs!.value[0]!.body).toEqual(['仅在明确重试成功后保存']);
+    expect(saved.approvals).toEqual(original.approvals);
+    await expect(adapter.saveDetails('project-e2e', original.slideSpecs!.value, original.revision)).rejects.toThrow(/冲突/);
+    expect(native.state.pipeline).toEqual(saved);
+    expect(server.prompts).toHaveLength(3);
+  });
+
+  it.each([false, true])('reconciles a durable detail commit with native JSON key ordering (uncertain read: %s)', async (uncertainRead) => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    const generator = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    await generator.analyzeProject('project-e2e');
+    await generator.generateOutline('project-e2e');
+    await generator.approveOutline('project-e2e');
+    const original = await generator.generateDetails('project-e2e');
+    // serde_json::Value may serialize map keys in sorted order. This changes no
+    // checkpoint values and must not turn a successful native commit into a conflict.
+    const nativeJson = (value: unknown): unknown => Array.isArray(value) ? value.map(nativeJson)
+      : value && typeof value === 'object'
+        ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+          .map(([key, item]) => [key, nativeJson(item)])) : value;
+    let commits = 0;
+    let interruptRead = false;
+    const adapter = createTauriDesktopAdapter(server, async (command, args) => {
+      if (command === 'ppt_load_pipeline' && interruptRead) {
+        interruptRead = false;
+        throw new Error('读取提交结果暂时失败');
+      }
+      const result = await native.invoke(command, args);
+      if (command === 'ppt_commit_pipeline') {
+        commits += 1;
+        native.state.pipeline = nativeJson(result) as NativePptPipeline;
+        interruptRead = uncertainRead;
+        throw new Error('已落盘但响应丢失');
+      }
+      return result;
+    }, new DirectWorker());
+    const edited = structuredClone(original.slideSpecs!.value);
+    edited[0]!.body = ['响应丢失后仍只保存一次'];
+    const saving = adapter.saveDetails('project-e2e', edited, original.revision);
+    let saved: NativePptPipeline;
+    if (uncertainRead) {
+      await expect(saving).rejects.toThrow(/尚未核实/);
+      saved = await adapter.retryProjectEdit('project-e2e');
+    } else saved = await saving;
+    expect(saved.slideSpecs!.value[0]!.body).toEqual(['响应丢失后仍只保存一次']);
+    expect(saved.revision).toBe(original.revision + 1);
+    expect(saved.approvals).toEqual(original.approvals);
+    expect(commits).toBe(1);
+    expect(adapter.getProjectEdit('project-e2e')).toMatchObject({ status: 'completed', pipeline: saved });
+    const reopened = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    expect(await reopened.loadProjectPipeline('project-e2e')).toEqual(saved);
+    expect(server.prompts).toHaveLength(3);
+  });
+
+  it('exports the explicitly approved v2 details after a pending structural revision survives adapter and Worker recreation', async () => {
+    const native = nativePersistenceHarness();
+    const server = new ScriptedPptAppServer();
+    let adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    await adapter.analyzeProject('project-e2e');
+    await adapter.generateOutline('project-e2e');
+    await adapter.approveOutline('project-e2e');
+    const original = await adapter.generateDetails('project-e2e');
+    expect(original.schemaVersion).toBe(1);
+    const originalFiles = new Map(native.state.files);
+    const outline = structuredClone(original.outline!.value);
+    outline.slides[0]!.title = '修订后的经营复盘';
+    outline.slides[0]!.purpose = '确认人工调整后的经营决策';
+    // An explicit structural candidate reconciles legacy titles; opening v1 never does.
+    const specs = original.slideSpecs!.value.map((spec, index) => ({
+      ...structuredClone(spec), title: outline.slides[index]!.title,
+    }));
+    const pending = await adapter.saveOutlineRevision('project-e2e', {
+      id: 'revision-acceptance', baseOutlineVersionId: original.outline!.version.id,
+      outline, specs, createdAt: original.project.updatedAt, updatedAt: original.project.updatedAt,
+    }, original.revision);
+    expect(pending.schemaVersion).toBe(2);
+    expect(pending.revisionOrigin).toEqual(original);
+    expect(pending.outline).toEqual(original.outline);
+    expect(pending.slideSpecs).toEqual(original.slideSpecs);
+    expect(pending.approvals).toEqual(original.approvals);
+    adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    expect(await adapter.loadProjectPipeline('project-e2e')).toEqual(pending);
+    await expect(adapter.approveDetails('project-e2e', pending.revision)).rejects.toThrow();
+    const confirmed = await adapter.approveOutlineRevision('project-e2e', 'revision-acceptance',
+      original.outline!.version.id, pending.revision);
+    expect(confirmed.outlineRevisionDraft).toBeNull();
+    expect(confirmed.project.workflowStatus).toBe('detail_review');
+    expect(confirmed.outline!.version.id).toBe('project-e2e-outline-v2');
+    expect(confirmed.slideSpecs!.version).toMatchObject({ id: 'project-e2e-slide-specs-v2', status: 'draft' });
+    expect(confirmed.approvals.slice(0, original.approvals.length)).toEqual(original.approvals);
+    expect(confirmed.approvals).toHaveLength(original.approvals.length + 1);
+    expect(confirmed.revisionHistory).toEqual([{
+      id: 'revision-acceptance', status: 'confirmed', baseOutline: original.outline,
+      baseSlideSpecs: original.slideSpecs, draft: pending.outlineRevisionDraft,
+      decidedAt: confirmed.project.updatedAt, newOutlineVersionId: 'project-e2e-outline-v2',
+    }]);
+    const edited = structuredClone(confirmed.slideSpecs!.value);
+    edited[0]!.body = ['改后正文', '第二段\n保留换行'];
+    const saved = await adapter.saveDetails('project-e2e', edited, confirmed.revision);
+    expect(saved.slideSpecs!.version).toMatchObject({ id: 'project-e2e-slide-specs-v3', status: 'draft' });
+    expect(saved.approvals).toEqual(confirmed.approvals);
+    adapter = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    expect(await adapter.loadProjectPipeline('project-e2e')).toEqual(saved);
+    const approved = await adapter.approveDetails('project-e2e', saved.revision);
+    expect(approved.slideSpecs!.version).toMatchObject({ id: 'project-e2e-slide-specs-v3', status: 'frozen' });
+    const background = new Uint8Array(await readFile(resolve('../..', 'fixtures/golden-project/sources/market-background.png')));
+    for (const [index, spec] of approved.slideSpecs!.value.entries()) {
+      await adapter.replaceVisual('project-e2e', spec.id,
+        Buffer.from(createDistinctApprovedVisual(background, index)).toString('base64'), `人工视觉 ${spec.id}`);
+      await adapter.approveVisual('project-e2e', spec.id);
+    }
+    await adapter.exportProject('project-e2e', 'revision-acceptance.pptx');
+    const inspection = await inspectPptxOoxml(Buffer.from(native.state.files.get('exports/revision-acceptance.pptx')!, 'base64'));
+    expect(inspection.slideEvidence![0]!.textValues).toContain('修订后的经营复盘');
+    expect(inspection.slideEvidence![0]!.textValues).toContain('改后正文');
+    const completed = await adapter.runProjectQa('project-e2e');
+    expect(completed).toMatchObject({ project: { workflowStatus: 'completed' }, qaReport: { status: 'passed', actualPageCount: 5 } });
+    expect(completed.revisionOrigin).toEqual(original);
+    expect(completed.revisionHistory).toEqual(confirmed.revisionHistory);
+    expect(completed.outline).toEqual(confirmed.outline);
+    expect(completed.slideSpecs).toEqual(approved.slideSpecs);
+    expect(completed.approvals.slice(0, approved.approvals.length)).toEqual(approved.approvals);
+    expect(completed.approvals).toHaveLength(original.approvals.length + 7);
+    for (const [path, bytes] of originalFiles) expect(native.state.files.get(path)).toBe(bytes);
+    expect(server.prompts).toHaveLength(3);
+    const reopened = createTauriDesktopAdapter(server, native.invoke, new DirectWorker());
+    expect(await reopened.loadProjectPipeline('project-e2e')).toEqual(completed);
+  });
+
   it('accepts real-world legacy detail forms through strict Worker parsing and keeps them pending review after reload', async () => {
     const raw = structuredClone(goldenSlideSpecs()) as unknown as Record<string, unknown>[];
     raw[0] = { ...raw[0], body: '业务背景。\n\n建设目标。',
@@ -266,8 +421,8 @@ describe('production-equivalent UI adapter → App Server → Worker → Rust pe
     await adapter.analyzeProject('project-e2e');
     await adapter.generateOutline('project-e2e');
     await adapter.approveOutline('project-e2e');
-    await adapter.generateDetails('project-e2e');
-    await adapter.approveDetails('project-e2e');
+    const details = await adapter.generateDetails('project-e2e');
+    await adapter.approveDetails('project-e2e', details.revision);
     const [approvedSlide, draftSlide] = goldenSlideSpecs();
     const background = new Uint8Array(await readFile(resolve('../..', 'fixtures/golden-project/sources/market-background.png')));
     await adapter.replaceVisual('project-e2e', approvedSlide!.id,
@@ -434,7 +589,7 @@ describe('production-equivalent UI adapter → App Server → Worker → Rust pe
     expect(pipeline.project.workflowStatus).toBe('detail_review');
     pipeline = await adapter.generateDetails('project-e2e');
     expect(pipeline.slideSpecs?.value).toHaveLength(5);
-    pipeline = await adapter.approveDetails('project-e2e');
+    pipeline = await adapter.approveDetails('project-e2e', pipeline.revision);
     expect(pipeline.currentSlideId).toBe('slide-cover');
 
     const restarted = createTauriDesktopAdapter(new ScriptedPptAppServer(), native.invoke, new DirectWorker());

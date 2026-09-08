@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use digital_twin_desktop_lib::database::{
     Database, NewMemoryProposal, NewProject, ProjectMutation,
 };
+use rusqlite::Connection;
 
 #[test]
 fn creates_all_workbench_domain_tables() {
@@ -146,4 +147,184 @@ fn rename_keeps_the_relational_name_and_authoritative_pipeline_name_in_sync() {
         project.pipeline["project"]["updatedAt"],
         "2026-09-04T00:01:00Z"
     );
+}
+
+#[test]
+fn persists_superseded_visual_version_status_across_reopen() {
+    let path = temporary_database("superseded-visual");
+    let revision_three = {
+        let database = Database::open(&path).expect("database opens");
+        database
+            .insert_project(&NewProject {
+                id: "project-visual".into(),
+                name: "视觉版本".into(),
+                goal: "验证旧视觉草稿被替代".into(),
+                created_at: "2026-09-08T00:00:00Z".into(),
+            })
+            .expect("project inserted");
+
+        let revision_two = visual_pipeline(2, "draft", false);
+        assert!(database
+            .replace_pipeline("project-visual", 1, &revision_two, &[])
+            .expect("revision two saved"));
+
+        let revision_three = visual_pipeline(3, "superseded", true);
+        assert!(database
+            .replace_pipeline("project-visual", 2, &revision_three, &[])
+            .expect("revision three saved"));
+        revision_three
+    };
+
+    let reopened = Database::open(&path).expect("database reopens");
+    assert_eq!(
+        reopened
+            .get_project("project-visual")
+            .expect("project queried")
+            .expect("project exists")
+            .pipeline,
+        revision_three
+    );
+    drop(reopened);
+
+    let connection = Connection::open(&path).expect("relational database opens");
+    let old_status: String = connection
+        .query_row(
+            "SELECT status FROM versions WHERE id = 'visual-v1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("old visual version queried");
+    assert_eq!(old_status, "superseded");
+    drop(connection);
+
+    std::fs::remove_file(path).expect("temporary database removed");
+}
+
+#[test]
+fn rejects_changes_to_superseded_visual_version_metadata() {
+    let database = Database::open_in_memory().expect("database opens");
+    database
+        .insert_project(&NewProject {
+            id: "project-visual".into(),
+            name: "视觉版本".into(),
+            goal: "验证被替代版本不可恢复".into(),
+            created_at: "2026-09-08T00:00:00Z".into(),
+        })
+        .expect("project inserted");
+    database
+        .replace_pipeline(
+            "project-visual",
+            1,
+            &visual_pipeline(2, "draft", false),
+            &[],
+        )
+        .expect("revision two saved");
+
+    let revision_three = visual_pipeline(3, "superseded", true);
+    database
+        .replace_pipeline("project-visual", 2, &revision_three, &[])
+        .expect("revision three saved");
+
+    for (forbidden_status, forged_frozen_at) in [
+        ("draft", None),
+        ("frozen", Some("2026-09-08T00:03:00Z")),
+        ("superseded", Some("2026-09-08T00:03:00Z")),
+    ] {
+        let mut forbidden = revision_three.clone();
+        forbidden["revision"] = 4.into();
+        forbidden["visuals"]["slide-1"][0]["version"]["status"] = forbidden_status.into();
+        if let Some(frozen_at) = forged_frozen_at {
+            forbidden["visuals"]["slide-1"][0]["version"]["frozenAt"] = frozen_at.into();
+        }
+
+        let error = database
+            .replace_pipeline("project-visual", 3, &forbidden, &[])
+            .expect_err("superseded visual metadata is immutable");
+        assert!(error
+            .to_string()
+            .contains("historical version metadata is immutable"));
+        assert_eq!(
+            database
+                .get_project("project-visual")
+                .expect("project queried")
+                .expect("project exists")
+                .pipeline,
+            revision_three,
+            "a rejected {forbidden_status} transition must roll back the pipeline"
+        );
+    }
+}
+
+#[test]
+fn rejects_unknown_visual_version_status_from_draft() {
+    let database = Database::open_in_memory().expect("database opens");
+    database
+        .insert_project(&NewProject {
+            id: "project-visual".into(),
+            name: "视觉版本".into(),
+            goal: "验证未知版本状态被拒绝".into(),
+            created_at: "2026-09-08T00:00:00Z".into(),
+        })
+        .expect("project inserted");
+    let revision_two = visual_pipeline(2, "draft", false);
+    database
+        .replace_pipeline("project-visual", 1, &revision_two, &[])
+        .expect("revision two saved");
+
+    let unknown_status = visual_pipeline(3, "unknown", false);
+    let error = database
+        .replace_pipeline("project-visual", 2, &unknown_status, &[])
+        .expect_err("draft visual accepts only known transitions");
+    assert!(error
+        .to_string()
+        .contains("historical version metadata is immutable"));
+    assert_eq!(
+        database
+            .get_project("project-visual")
+            .expect("project queried")
+            .expect("project exists")
+            .pipeline,
+        revision_two
+    );
+}
+
+fn visual_pipeline(
+    revision: i64,
+    first_visual_status: &str,
+    include_second_visual: bool,
+) -> serde_json::Value {
+    let mut visual_history = vec![serde_json::json!({
+        "version": {
+            "id": "visual-v1",
+            "status": first_visual_status,
+            "createdAt": "2026-09-08T00:01:00Z"
+        }
+    })];
+    if include_second_visual {
+        visual_history.push(serde_json::json!({
+            "version": {
+                "id": "visual-v2",
+                "status": "draft",
+                "createdAt": "2026-09-08T00:02:00Z"
+            }
+        }));
+    }
+
+    serde_json::json!({
+        "schemaVersion": 2,
+        "revision": revision,
+        "project": {
+            "id": "project-visual",
+            "name": "视觉版本",
+            "goal": "验证视觉版本状态",
+            "workflowStatus": "visual_review",
+            "createdAt": "2026-09-08T00:00:00Z",
+            "updatedAt": format!("2026-09-08T00:0{revision}:00Z")
+        },
+        "visuals": { "slide-1": visual_history },
+        "approvals": [],
+        "tasks": [],
+        "blockedCondition": null,
+        "exportReceipt": null
+    })
 }

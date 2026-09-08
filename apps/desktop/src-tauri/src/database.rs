@@ -502,19 +502,33 @@ impl Database {
                 let created_at = json_str(version, "/createdAt")?;
                 let frozen_at = version.get("frozenAt").and_then(serde_json::Value::as_str);
                 if let Some((old_status, old_created_at, old_frozen_at)) = existing {
-                    if old_created_at != created_at
-                        || (old_status == "frozen"
-                            && (status != "frozen" || old_frozen_at.as_deref() != frozen_at))
-                    {
+                    if old_created_at != created_at {
                         return Err(invalid_parameter(
                             "historical version metadata is immutable",
                         ));
                     }
-                    if old_status == "draft" && status == "frozen" {
-                        transaction.execute(
-                            "UPDATE versions SET status = 'frozen', frozen_at = ?2 WHERE id = ?1",
-                            params![json_str(version, "/id")?, frozen_at],
-                        )?;
+                    match (old_status.as_str(), status) {
+                        ("draft", "draft")
+                        | ("frozen", "frozen")
+                        | ("superseded", "superseded")
+                            if old_frozen_at.as_deref() == frozen_at => {}
+                        ("draft", "frozen") => {
+                            transaction.execute(
+                                "UPDATE versions SET status = 'frozen', frozen_at = ?2 WHERE id = ?1",
+                                params![json_str(version, "/id")?, frozen_at],
+                            )?;
+                        }
+                        ("draft", "superseded") if old_frozen_at.as_deref() == frozen_at => {
+                            transaction.execute(
+                                "UPDATE versions SET status = 'superseded' WHERE id = ?1",
+                                params![json_str(version, "/id")?],
+                            )?;
+                        }
+                        _ => {
+                            return Err(invalid_parameter(
+                                "historical version metadata is immutable",
+                            ));
+                        }
                     }
                     continue;
                 }

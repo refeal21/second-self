@@ -16,6 +16,7 @@ import { DetailEditor, DetailPageIndex } from './detail-editor.js';
 
 afterEach(() => {
   cleanup();
+  window.history.replaceState({}, '', '#/');
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -178,6 +179,9 @@ describe('DetailEditor document editing', () => {
     expect(latest.specs[0]!.body).toHaveLength(3);
     await user.click(screen.getByRole('button', { name: '确认删除第 1 页正文第 2 段' }));
     expect(latest.specs[0]!.body).toEqual(['原始正文', '保留段落']);
+    const nextParagraph = screen.getByRole('textbox', { name: '第 1 页正文第 2 段' });
+    expect(document.activeElement).toBe(nextParagraph);
+    expect(nextParagraph).toBeEnabled();
   });
 });
 
@@ -247,6 +251,19 @@ describe('DetailEditor page management and index', () => {
     expect(screen.getByRole('button', { name: '删除第 1 页' })).toBeDisabled();
   });
 
+  it('focuses an enabled move control after moving a page into the first position', async () => {
+    const user = userEvent.setup();
+    let latest = initialDocument;
+    render(<Harness onValue={(value) => { latest = value; }} />);
+
+    await user.click(screen.getByRole('button', { name: '上移第 2 页' }));
+
+    expect(latest.specs.map(({ id }) => id)).toEqual(['slide-plan', 'slide-overview']);
+    const enabledMove = screen.getByRole('button', { name: '下移第 1 页' });
+    expect(document.activeElement).toBe(enabledMove);
+    expect(enabledMove).toBeEnabled();
+  });
+
   it('performs page management locally without network or model requests', async () => {
     const user = userEvent.setup();
     const fetch = vi.fn();
@@ -277,6 +294,24 @@ describe('DetailEditor page management and index', () => {
     expect(screen.getByRole('article', { name: '第 1 页：增长概览' })).toHaveAttribute(
       'id', 'draft-page-slide-overview',
     );
+  });
+
+  it('scrolls and focuses an indexed page without replacing the App workspace hash route', async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, '', '#/workspace/project-route');
+    render(<>
+      <DetailPageIndex value={initialDocument} idPrefix="draft" />
+      <Harness idPrefix="draft" />
+    </>);
+    const target = screen.getByRole('article', { name: '第 2 页：行动计划' });
+    const scrollIntoView = vi.fn();
+    target.scrollIntoView = scrollIntoView;
+
+    await user.click(screen.getByRole('link', { name: '第 2 页：行动计划' }));
+
+    expect(window.location.hash).toBe('#/workspace/project-route');
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'start' });
+    expect(document.activeElement).toBe(target);
   });
 
   it('uses idPrefix for every DOM identity when draft and readonly history render together', () => {
@@ -364,6 +399,20 @@ describe('DetailEditor nested structured content', () => {
     expect(latest.specs[0]!.charts[0]!.series).toHaveLength(1);
   });
 
+  it('accepts decimal chart values without native number-input step mismatch', () => {
+    let latest = initialDocument;
+    render(<Harness onValue={(value) => { latest = value; }} />);
+    const input = screen.getByRole('spinbutton', {
+      name: '第 1 页图表 1 系列 1 第 1 个数值',
+    }) as HTMLInputElement;
+    expect(input).toHaveAttribute('step', 'any');
+
+    fireEvent.change(input, { target: { value: '108.5' } });
+
+    expect(latest.specs[0]!.charts[0]!.series[0]!.values[0]).toBe(108.5);
+    expect(input.validity.stepMismatch).toBe(false);
+  });
+
   it('edits basic shape fields without turning recovered conceptual diagrams into shapes', () => {
     let latest = initialDocument;
     render(<Harness onValue={(value) => { latest = value; }} />);
@@ -378,7 +427,7 @@ describe('DetailEditor nested structured content', () => {
     expect(latest.specs[0]!.shapes).toHaveLength(1);
   });
 
-  it('selects only analyzed evidence and sources and edits the current citation locator', async () => {
+  it('selects an analyzed citation, edits its locator, then removes that exact current citation', async () => {
     const user = userEvent.setup();
     let latest = initialDocument;
     render(<Harness onValue={(value) => { latest = value; }} />);
@@ -393,6 +442,11 @@ describe('DetailEditor nested structured content', () => {
       target: { value: '第 12-13 段' },
     });
     expect(latest.specs[0]!.sourceMap[1]!.locator).toBe('第 12-13 段');
+
+    await user.click(within(firstPage).getByRole('button', { name: '移除第 1 页来源 2' }));
+    expect(latest.specs[0]!.sourceMap).toEqual([
+      { sourceId: 'source-report', title: '年度报告', locator: '第 3 页' },
+    ]);
   });
 });
 

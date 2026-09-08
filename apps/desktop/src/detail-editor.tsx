@@ -50,7 +50,14 @@ export function DetailPageIndex({
     <nav className="detail-page-index" aria-label="逐页细化目录">
       <ol>{value.outline.slides.map((slide, index) => (
         <li key={slide.id}>
-          <a href={`#${pageDomId(idPrefix, slide.id)}`}>
+          <a href={`#${pageDomId(idPrefix, slide.id)}`}
+            aria-controls={pageDomId(idPrefix, slide.id)}
+            onClick={(event) => {
+              event.preventDefault();
+              const target = document.getElementById(pageDomId(idPrefix, slide.id));
+              target?.scrollIntoView?.({ block: 'start' });
+              target?.focus();
+            }}>
             第 {index + 1} 页：{specsById.get(slide.id)?.title || slide.title || '未命名页面'}
           </a>
         </li>
@@ -73,7 +80,8 @@ export function DetailEditor({
   const pendingFocus = useRef<FocusTarget | null>(null);
   const titleRefs = useRef(new Map<string, HTMLTextAreaElement>());
   const paragraphRefs = useRef(new Map<string, HTMLTextAreaElement>());
-  const moveRefs = useRef(new Map<string, HTMLButtonElement>());
+  const moveUpRefs = useRef(new Map<string, HTMLButtonElement>());
+  const moveDownRefs = useRef(new Map<string, HTMLButtonElement>());
   const pageRefs = useRef(new Map<string, HTMLElement>());
   const sourceNames = useMemo(
     () => new Map(sources.map(({ id, fileName }) => [id, fileName])),
@@ -88,7 +96,14 @@ export function DetailEditor({
     if (target.kind === 'paragraph') {
       paragraphRefs.current.get(`${target.pageId}-${target.index}`)?.focus();
     }
-    if (target.kind === 'move') moveRefs.current.get(target.pageId)?.focus();
+    if (target.kind === 'move') {
+      const moveUp = moveUpRefs.current.get(target.pageId);
+      const moveDown = moveDownRefs.current.get(target.pageId);
+      const enabledMove = moveUp && !moveUp.disabled ? moveUp
+        : moveDown && !moveDown.disabled ? moveDown
+          : pageRefs.current.get(target.pageId);
+      enabledMove?.focus();
+    }
     if (target.kind === 'page') pageRefs.current.get(target.pageId)?.focus();
   }, [value]);
 
@@ -192,10 +207,11 @@ export function DetailEditor({
                 <div className="detail-page__actions">
                   <button type="button" className="detail-editor__compact-button"
                     aria-label={`上移${pageLabel}`} disabled={blocked || index === 0}
-                    ref={(element) => setMapRef(moveRefs.current, spec.id, element)}
+                    ref={(element) => setMapRef(moveUpRefs.current, spec.id, element)}
                     onClick={() => movePage(index, -1)}>↑</button>
                   <button type="button" className="detail-editor__compact-button"
                     aria-label={`下移${pageLabel}`} disabled={blocked || index === value.specs.length - 1}
+                    ref={(element) => setMapRef(moveDownRefs.current, spec.id, element)}
                     onClick={() => movePage(index, 1)}>↓</button>
                   <button type="button" className="detail-editor__compact-button detail-editor__delete-button"
                     aria-label={`删除${pageLabel}`} disabled={blocked || value.specs.length <= 1}
@@ -340,8 +356,11 @@ function ParagraphEditor({
             {confirmation?.key === key && <DeleteConfirmation confirmation={confirmation}
               blocked={blocked} confirmLabel={`确认删除第 ${page} 页正文第 ${number} 段`}
               onCancel={() => setConfirmation(null)} onConfirm={() => {
+                const next = body.filter((_, index) => index !== paragraphIndex);
                 setConfirmation(null);
-                onChange(body.filter((_, index) => index !== paragraphIndex));
+                onChange(next, {
+                  kind: 'paragraph', pageId, index: Math.min(paragraphIndex, next.length - 1),
+                });
               }} />}
           </div>
         );
@@ -516,7 +535,7 @@ function ChartEditor({
                   key: `${chartKey}-series-${seriesIndex}`,
                   message: `确认删除第 ${page} 页图表 ${chartNumber} 系列 ${seriesIndex + 1}？`,
                 })}>删除系列</button></th>
-            {series.values.map((chartValue, valueIndex) => <td key={valueIndex}><input type="number"
+            {series.values.map((chartValue, valueIndex) => <td key={valueIndex}><input type="number" step="any"
               aria-label={`第 ${page} 页图表 ${chartNumber} 系列 ${seriesIndex + 1} 第 ${valueIndex + 1} 个数值`}
               value={Number.isFinite(chartValue) ? String(chartValue) : ''} readOnly={readOnly} disabled={disabled}
               onChange={(event) => {
@@ -657,6 +676,13 @@ function EvidenceEditor({
             ...citation, locator: event.currentTarget.value,
           }),
         })} /></label>
+      <div className="detail-editor__inline-actions">
+        <button type="button" className="detail-editor__compact-button detail-editor__delete-button"
+          aria-label={`移除第 ${page} 页来源 ${sourceIndex + 1}`} disabled={blocked}
+          onClick={() => !blocked && onChange({
+            ...spec, sourceMap: spec.sourceMap.filter((_, index) => index !== sourceIndex),
+          })}>移除来源</button>
+      </div>
     </div>)}</div>
     {!spec.sourceMap.length && <p className="detail-editor__hint">本页尚未绑定参考来源。</p>}
     <details className="detail-editor__picker">

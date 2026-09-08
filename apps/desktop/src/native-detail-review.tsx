@@ -27,6 +27,10 @@ export function useNativeDetailDraft(pipeline: NativePptPipeline | null, edit: P
       const dirty = JSON.stringify(previous.value) !== previous.savedKey;
       const ownSave = edit?.status === 'completed' && edit.pipeline?.revision === pipeline.revision &&
         edit.identity.expectedRevision === previous.baseline.revision && 'payloadKey' in edit.identity &&
+        // A details-only save cannot persist local purpose or other outline edits.
+        // Revision saves below already match the complete outline/spec document.
+        (edit.kind !== 'details.save' || (!previous.baseline.outlineRevisionDraft &&
+          JSON.stringify(previous.value.outline) === JSON.stringify(previous.baseline.outline?.value))) &&
         edit.identity.payloadKey === JSON.stringify(edit.kind === 'details.save' ? previous.value.specs : previous.value);
       if (dirty && !ownSave) return { ...previous, conflict: true };
       return loadedDraft(pipeline);

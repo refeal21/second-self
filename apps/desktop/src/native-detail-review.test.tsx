@@ -12,6 +12,32 @@ async function setup() {
   return { ...h, mount, onBack, onDirtyChange };
 }
 describe('document detail review integration', () => {
+  it.each([false, true])('preserves a purpose-only draft when an unrelated save finishes (pending revision: %s)', async (pending) => {
+    const h = await setup();
+    if (pending) {
+      const before = h.getStored();
+      const outline = structuredClone(before.outline!.value);
+      outline.slides[0]!.purpose = '已保存的修订目的';
+      await h.adapter.saveOutlineRevision(h.id, { id: 'revision-purpose', baseOutlineVersionId: before.outline!.version.id,
+        outline, specs: before.slideSpecs!.value, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }, before.revision);
+    }
+    h.mount();
+    const review = await screen.findByRole('region', { name: '审核全部页面细化' });
+    const purpose = within(review).getByRole('textbox', { name: '第 1 页页面目的' });
+    await waitFor(() => expect(purpose).toBeEnabled());
+    fireEvent.change(purpose, { target: { value: '尚未保存的页面目的' } });
+    expect(h.onDirtyChange).toHaveBeenLastCalledWith(true);
+    const before = h.getStored();
+    await act(async () => {
+      if (pending) await h.adapter.saveOutlineRevision(h.id, before.outlineRevisionDraft!, before.revision);
+      else await h.adapter.saveDetails(h.id, before.slideSpecs!.value, before.revision);
+    });
+    expect(purpose).toHaveValue('尚未保存的页面目的');
+    expect(h.onDirtyChange).toHaveBeenLastCalledWith(true);
+    expect(screen.getByRole('button', { name: '批准全部细化' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '放弃修改并载入最新版本' })).toBeEnabled();
+    if (pending) expect(screen.getByRole('button', { name: '确认结构变更' })).toBeDisabled();
+  });
   it('keeps an off-page edit failure visible after the initial persisted load', async () => {
     const h = await setup(); h.controls.failCommit = true; const before = h.getStored();
     await expect(h.adapter.saveDetails(h.id, before.slideSpecs!.value, before.revision)).rejects.toThrow('磁盘暂时不可用');

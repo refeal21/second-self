@@ -7,6 +7,7 @@ import {
 import { GeneralTaskManager, type GeneralTask } from '../../worker/src/general-tasks.js';
 import type {
   NativePipelineAction,
+  NativeOutlineRevisionDraft,
   NativePipelineResult,
   NativePptPipeline,
   NativePromptContext,
@@ -16,6 +17,7 @@ import { TauriCodexTransport } from './codex-transport.js';
 import { buildPptPrompt, promptContextError } from './ppt-prompts.js';
 import { normalizeGeneratedSlideSpecs } from '../../worker/src/slide-spec-contract.js';
 import { ProjectGenerationRegistry, type ProjectGeneration } from './project-generation.js';
+import { ProjectEditRegistry, type ProjectEdit, type ProjectEditIdentity } from './project-edits.js';
 import { derivePendingPptApprovals } from './collection-read-model.js';
 import {
   TauriWorkflowWorkerClient,
@@ -142,6 +144,9 @@ export interface DesktopAdapter {
   loadProjectPipeline(projectId: string): Promise<NativePptPipeline>;
   getProjectGeneration(projectId: string): ProjectGeneration | null;
   subscribeProjectGeneration(projectId: string, listener: (state: ProjectGeneration | null) => void): () => void;
+  getProjectEdit(projectId: string): ProjectEdit | null;
+  retryProjectEdit(projectId: string): Promise<NativePptPipeline>;
+  subscribeProjectEdit(projectId: string, listener: (state: ProjectEdit | null) => void): () => void;
   attachSource(projectId: string, input: SourceFileInput): Promise<NativePptPipeline>;
   saveProjectContext(projectId: string, context: NativePromptContext): Promise<NativePptPipeline>;
   analyzeProject(projectId: string): Promise<NativePptPipeline>;
@@ -149,8 +154,11 @@ export interface DesktopAdapter {
   saveOutline(projectId: string, outline: PptOutline): Promise<NativePptPipeline>;
   approveOutline(projectId: string): Promise<NativePptPipeline>;
   generateDetails(projectId: string): Promise<NativePptPipeline>;
-  saveDetails(projectId: string, specs: readonly SlideSpec[]): Promise<NativePptPipeline>;
-  approveDetails(projectId: string): Promise<NativePptPipeline>;
+  saveDetails(projectId: string, specs: readonly SlideSpec[], expectedRevision: number): Promise<NativePptPipeline>;
+  approveDetails(projectId: string, expectedRevision: number): Promise<NativePptPipeline>;
+  saveOutlineRevision(projectId: string, draft: NativeOutlineRevisionDraft, expectedRevision: number): Promise<NativePptPipeline>;
+  approveOutlineRevision(projectId: string, revisionId: string, baseOutlineVersionId: string, expectedRevision: number): Promise<NativePptPipeline>;
+  cancelOutlineRevision(projectId: string, revisionId: string, baseOutlineVersionId: string, expectedRevision: number): Promise<NativePptPipeline>;
   requestVisual(projectId: string, slideId: string, feedback?: string): Promise<NativePptPipeline>;
   readProjectVisual(projectId: string, relativePath: string): Promise<string>;
   replaceVisual(projectId: string, slideId: string, imageBase64: string, altText: string): Promise<NativePptPipeline>;
@@ -317,6 +325,9 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
     async loadProjectPipeline() { throw new Error('演示模式不使用本地持久化 PPT 管线。'); },
     getProjectGeneration: (projectId) => generations.get(projectId),
     subscribeProjectGeneration: (projectId, listener) => generations.subscribe(projectId, listener),
+    getProjectEdit: () => null,
+    async retryProjectEdit() { throw new Error('演示模式没有待核实编辑操作。'); },
+    subscribeProjectEdit: (_projectId, listener) => { listener(null); return () => {}; },
     async attachSource() { throw new Error('演示模式不会写入本地材料。'); },
     async saveProjectContext() { throw new Error('演示模式不会保存项目说明。'); },
     async analyzeProject() { throw new Error('演示模式不会消耗 Codex 任务。'); },
@@ -326,6 +337,9 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
     async generateDetails() { throw new Error('演示模式不会消耗 Codex 任务。'); },
     async saveDetails() { throw new Error('演示模式不会保存生产细化。'); },
     async approveDetails() { throw new Error('演示模式不会保存生产审批。'); },
+    async saveOutlineRevision() { throw new Error('演示模式不会保存生产修订。'); },
+    async approveOutlineRevision() { throw new Error('演示模式不会批准生产修订。'); },
+    async cancelOutlineRevision() { throw new Error('演示模式不会取消生产修订。'); },
     async requestVisual() { throw new Error('演示模式不会请求 ImageGen。'); },
     async readProjectVisual() { throw new Error('演示模式没有生产视觉文件。'); },
     async replaceVisual() { throw new Error('演示模式不会写入视觉文件。'); },
@@ -363,6 +377,8 @@ class TauriDesktopAdapter implements DesktopAdapter {
   private readonly client: CodexAppServerClient;
   private readonly tasks: GeneralTaskManager;
   private readonly generations = new ProjectGenerationRegistry();
+  private readonly edits = new ProjectEditRegistry((id) => this.generations.get(id)?.status !== 'running');
+  private readonly uncertainEdits = new Map<string, { identity: ProjectEditIdentity; action: NativePipelineAction; pipeline: NativePptPipeline }>();
   private readonly taskIds = new Set<string>();
   private readonly taskPrompts = new Map<string, string>();
   private readonly listeners = new Map<string, Set<(task: TaskSummary) => void>>();
@@ -528,6 +544,15 @@ class TauriDesktopAdapter implements DesktopAdapter {
   subscribeProjectGeneration(projectId: string, listener: (state: ProjectGeneration | null) => void): () => void {
     return this.generations.subscribe(projectId, listener);
   }
+  getProjectEdit(projectId: string): ProjectEdit | null { return this.edits.get(projectId); }
+  retryProjectEdit(projectId: string): Promise<NativePptPipeline> {
+    const pending = this.uncertainEdits.get(projectId);
+    if (!pending) return Promise.reject(new Error('没有待核实的编辑提交，请重新载入检查点。'));
+    return this.runEdit(projectId, pending.identity, pending.action);
+  }
+  subscribeProjectEdit(projectId: string, listener: (state: ProjectEdit | null) => void): () => void {
+    return this.edits.subscribe(projectId, listener);
+  }
   async attachSource(projectId: string, input: SourceFileInput): Promise<NativePptPipeline> {
     const pipeline = await this.callNative<NativePptPipeline>('ppt_attach_source', {
       input: { projectId, ...input },
@@ -536,6 +561,7 @@ class TauriDesktopAdapter implements DesktopAdapter {
     return pipeline;
   }
   analyzeProject(projectId: string): Promise<NativePptPipeline> {
+    if (this.editBlocksGeneration(projectId)) return Promise.reject(new Error('当前项目已有编辑操作，请等待保存或核实结果后再生成。'));
     return this.generations.run(projectId, 'analysis', async () => {
       const pipeline = await this.loadProjectPipeline(projectId);
       if (pipeline.project.workflowStatus !== 'intake' || pipeline.sources.length === 0) {
@@ -560,6 +586,7 @@ class TauriDesktopAdapter implements DesktopAdapter {
     return this.applyCurrent(projectId, { kind: 'outline.submit', at: new Date().toISOString(), outline });
   }
   generateOutline(projectId: string): Promise<NativePptPipeline> {
+    if (this.editBlocksGeneration(projectId)) return Promise.reject(new Error('当前项目已有编辑操作，请等待保存或核实结果后再生成。'));
     return this.generations.run(projectId, 'outline', async () => {
       const pipeline = await this.loadProjectPipeline(projectId);
       if (!pipeline.analysis || pipeline.project.workflowStatus !== 'source_analysis') {
@@ -572,10 +599,26 @@ class TauriDesktopAdapter implements DesktopAdapter {
   async approveOutline(projectId: string): Promise<NativePptPipeline> {
     return this.applyCurrent(projectId, { kind: 'outline.approve', at: new Date().toISOString() });
   }
-  async saveDetails(projectId: string, specs: readonly SlideSpec[]): Promise<NativePptPipeline> {
-    return this.applyCurrent(projectId, { kind: 'details.submit', at: new Date().toISOString(), specs });
+  saveDetails(projectId: string, specs: readonly SlideSpec[], expectedRevision: number): Promise<NativePptPipeline> {
+    return this.runEdit(projectId, { kind: 'details.save', expectedRevision, payloadKey: JSON.stringify(specs) },
+      { kind: 'details.submit', at: new Date().toISOString(), specs, expectedRevision });
+  }
+  saveOutlineRevision(projectId: string, draft: NativeOutlineRevisionDraft, expectedRevision: number): Promise<NativePptPipeline> {
+    const { id: revisionId, baseOutlineVersionId, outline, specs } = draft;
+    return this.runEdit(projectId, { kind: 'outline.revision.save', expectedRevision, revisionId, baseOutlineVersionId,
+      payloadKey: JSON.stringify({ outline, specs }) },
+    { kind: 'outline.revision.save', at: new Date().toISOString(), expectedRevision, revisionId, baseOutlineVersionId, outline, specs });
+  }
+  approveOutlineRevision(projectId: string, revisionId: string, baseOutlineVersionId: string, expectedRevision: number): Promise<NativePptPipeline> {
+    const identity = { kind: 'outline.revision.approve' as const, expectedRevision, revisionId, baseOutlineVersionId };
+    return this.runEdit(projectId, identity, { ...identity, at: new Date().toISOString() });
+  }
+  cancelOutlineRevision(projectId: string, revisionId: string, baseOutlineVersionId: string, expectedRevision: number): Promise<NativePptPipeline> {
+    const identity = { kind: 'outline.revision.cancel' as const, expectedRevision, revisionId, baseOutlineVersionId };
+    return this.runEdit(projectId, identity, { ...identity, at: new Date().toISOString() });
   }
   generateDetails(projectId: string): Promise<NativePptPipeline> {
+    if (this.editBlocksGeneration(projectId)) return Promise.reject(new Error('当前项目已有编辑操作，请等待保存或核实结果后再生成。'));
     return this.generations.run(projectId, 'details', async () => {
       const pipeline = await this.loadProjectPipeline(projectId);
       if (pipeline.outline?.version.status !== 'frozen' || pipeline.project.workflowStatus !== 'detail_review') {
@@ -587,8 +630,9 @@ class TauriDesktopAdapter implements DesktopAdapter {
       return this.applyPipeline(projectId, pipeline, { kind: 'details.submit', at: new Date().toISOString(), specs });
     });
   }
-  async approveDetails(projectId: string): Promise<NativePptPipeline> {
-    return this.applyCurrent(projectId, { kind: 'details.approve', at: new Date().toISOString() });
+  approveDetails(projectId: string, expectedRevision: number): Promise<NativePptPipeline> {
+    return this.runEdit(projectId, { kind: 'details.approve', expectedRevision },
+      { kind: 'details.approve', at: new Date().toISOString(), expectedRevision });
   }
   async requestVisual(projectId: string, slideId: string, feedback?: string): Promise<NativePptPipeline> {
     await this.requireActiveChatGptAccount();
@@ -620,6 +664,7 @@ class TauriDesktopAdapter implements DesktopAdapter {
     });
   }
   proposeProjectMemory(projectId: string): Promise<{ status: string }> {
+    if (this.editBlocksGeneration(projectId)) return Promise.reject(new Error('当前项目已有编辑操作，请等待保存或核实结果后再生成。'));
     return this.generations.run(projectId, 'memory', async () => {
       const pipeline = await this.loadProjectPipeline(projectId);
       const proposal = await this.runStructured<{ title: string; content: string }>(
@@ -685,6 +730,53 @@ class TauriDesktopAdapter implements DesktopAdapter {
     this.codexPath = input.codexPath;
     if (this.transport instanceof TauriCodexTransport) await this.transport.setConfiguredPath(input.codexPath);
     return result;
+  }
+
+  private editBlocksGeneration(projectId: string): boolean {
+    return this.edits.get(projectId)?.status === 'running' || this.uncertainEdits.has(projectId);
+  }
+
+  private runEdit(projectId: string, identity: ProjectEditIdentity, action: NativePipelineAction): Promise<NativePptPipeline> {
+    const ownedAction = structuredClone(action);
+    const previous = this.uncertainEdits.get(projectId);
+    if (previous && JSON.stringify(previous.identity) !== JSON.stringify(identity)) {
+      return Promise.reject(new Error('上次编辑提交结果尚未核实，请先重试原操作核实检查点。'));
+    }
+    return this.edits.run(projectId, identity, async () => {
+      const uncertain = this.uncertainEdits.get(projectId);
+      let current: NativePptPipeline;
+      try { current = await this.loadProjectPipeline(projectId); }
+      catch (reason) {
+        if (uncertain) throw new Error(`提交结果尚未核实，请重试原操作以重新读取检查点。${reason instanceof Error ? reason.message : String(reason)}`);
+        throw reason;
+      }
+      if (uncertain) {
+        this.uncertainEdits.delete(projectId);
+        if (sameCheckpoint(current, uncertain.pipeline)) return current;
+      }
+      if (current.revision !== identity.expectedRevision) {
+        throw new Error('版本冲突：其他操作已更新项目。你的输入已保留，请明确放弃修改并载入最新版本。');
+      }
+      const result = await this.worker.executeProject(projectId, ownedAction);
+      this.uncertainEdits.set(projectId, { identity: structuredClone(identity), action: ownedAction, pipeline: result.pipeline });
+      try {
+        const saved = await this.callNative<NativePptPipeline>('ppt_commit_pipeline', {
+          input: { projectId, expectedRevision: identity.expectedRevision, pipeline: result.pipeline, writes: result.writes },
+        });
+        this.uncertainEdits.delete(projectId);
+        return saved;
+      } catch (reason) {
+        let persisted: NativePptPipeline;
+        try { persisted = await this.loadProjectPipeline(projectId); }
+        catch { throw new Error(`提交结果尚未核实，请重试原操作以重新读取检查点。${reason instanceof Error ? reason.message : String(reason)}`); }
+        this.uncertainEdits.delete(projectId);
+        if (sameCheckpoint(persisted, result.pipeline)) return persisted;
+        if (persisted.revision !== identity.expectedRevision) {
+          throw new Error('版本冲突：其他操作已更新项目，当前输入仍保留。请放弃修改并载入最新版本。');
+        }
+        throw reason;
+      }
+    });
   }
 
   private async applyCurrent(projectId: string, action: NativePipelineAction): Promise<NativePptPipeline> {
@@ -854,6 +946,16 @@ function memoryProposalPrompt(pipeline: NativePptPipeline): string {
     '这只是建议，必须由用户后续明确批准，不要声称已保存为记忆。',
     JSON.stringify(approvedSnapshot, null, 2),
   ].join('\n');
+}
+
+// Rust JSON objects may return keys in a different order. Arrays, strings and
+// numeric values must still match exactly before acknowledging a lost response.
+function sameCheckpoint(left: NativePptPipeline, right: NativePptPipeline): boolean {
+  const canonical = (value: NativePptPipeline) => JSON.stringify(value, (_key, entry: unknown) =>
+    entry !== null && typeof entry === 'object' && !Array.isArray(entry)
+      ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a.localeCompare(b)))
+      : entry);
+  return canonical(left) === canonical(right);
 }
 
 function cloneTask(task: TaskSummary): TaskSummary { return structuredClone(task); }

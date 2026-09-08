@@ -9,8 +9,11 @@ import {
 } from 'react';
 import type { DesktopAdapter } from './desktop-adapter.js';
 import type { NativePptPipeline, NativePromptContext } from '../../worker/src/native-pipeline.js';
-import type { PptOutline, SlideSpec } from '../../worker/src/ppt-project.js';
+import type { PptOutline } from '../../worker/src/ppt-project.js';
 import type { ProjectGeneration } from './project-generation.js';
+import type { ProjectEdit } from './project-edits.js';
+import { DetailPageIndex } from './detail-editor.js';
+import { NativeDetailReview, useNativeDetailDraft } from './native-detail-review.js';
 import { OutlineEditor, outlineDraftError } from './outline-editor.js';
 import {
   buildPptPrompt,
@@ -36,7 +39,8 @@ export function NativeWorkspacePage({
 }) {
   const [pipeline, setPipeline] = useState<NativePptPipeline | null>(null);
   const [outlineDraft, setOutlineDraft] = useState<PptOutline | null>(null);
-  const [detailsText, setDetailsText] = useState('');
+  const [edit, setEdit] = useState<ProjectEdit | null>(() => adapter.getProjectEdit(projectId));
+  const detailState = useNativeDetailDraft(pipeline, edit);
   const [localBusy, setLocalBusy] = useState(false);
   const [generation, setGeneration] = useState<ProjectGeneration | null>(
     () => adapter.getProjectGeneration(projectId),
@@ -53,7 +57,8 @@ export function NativeWorkspacePage({
   const [promptContextExpanded, setPromptContextExpanded] = useState(false);
   const mounted = useRef(true);
   const pipelineRef = useRef<NativePptPipeline | null>(null);
-  const busy = localBusy || generation?.status === 'running';
+  const busy = localBusy || generation?.status === 'running' || edit?.status === 'running';
+  const editUncertain = edit?.status === 'failed' && /尚未核实/.test(edit.error ?? '');
 
   const applyPipeline = (next: NativePptPipeline, onlyIfNewer = false) => {
     const current = pipelineRef.current;
@@ -104,6 +109,12 @@ export function NativeWorkspacePage({
     }
   }), [adapter, projectId]);
 
+  useEffect(() => adapter.subscribeProjectEdit(projectId, (next) => {
+    setEdit(next);
+    if (next?.status === 'completed' && next.pipeline) applyPipeline(next.pipeline, true);
+    if (next?.status === 'failed') setError(next.error ?? '编辑操作失败，请重试。');
+  }), [adapter, projectId]);
+
   useEffect(() => {
     let active = true;
     setLocalBusy(true);
@@ -111,7 +122,10 @@ export function NativeWorkspacePage({
       if (active) {
         if (applyPipeline(loaded, true)) {
           setPromptContext(normalizePromptContext(loaded, getPromptContext(loaded)));
-          if (!generationMatchesPipeline(adapter.getProjectGeneration(projectId), loaded)) {
+          const savedEdit = adapter.getProjectEdit(projectId);
+          const relevantEditFailure = savedEdit?.status === 'failed' &&
+            (savedEdit.identity.expectedRevision === loaded.revision || /尚未核实/.test(savedEdit.error ?? ''));
+          if (!generationMatchesPipeline(adapter.getProjectGeneration(projectId), loaded) && !relevantEditFailure) {
             setError('');
             setNotice('');
           }
@@ -129,10 +143,6 @@ export function NativeWorkspacePage({
     // changes, never when an unrelated checkpoint response refreshes the page.
     setOutlineDraft(JSON.parse(savedOutlineKey) as PptOutline | null);
   }, [projectId, savedOutlineKey]);
-
-  useEffect(() => {
-    if (pipeline?.slideSpecs) setDetailsText(JSON.stringify(pipeline.slideSpecs.value, null, 2));
-  }, [pipeline?.slideSpecs?.version.id]);
 
   const savedPromptContextKey = pipeline ? JSON.stringify(getPromptContext(pipeline)) : '';
   useEffect(() => {
@@ -183,8 +193,8 @@ export function NativeWorkspacePage({
     JSON.stringify(normalizePromptContext(pipeline, promptContext)) !==
     JSON.stringify(normalizePromptContext(pipeline, getPromptContext(pipeline)));
   useEffect(() => {
-    onDirtyChange?.(outlineDirty || promptContextDirty);
-  }, [onDirtyChange, outlineDirty, promptContextDirty]);
+    onDirtyChange?.(outlineDirty || promptContextDirty || detailState.dirty);
+  }, [onDirtyChange, outlineDirty, promptContextDirty, detailState.dirty]);
   useEffect(() => () => { onDirtyChange?.(false); }, [onDirtyChange]);
 
   const attachFiles = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -212,7 +222,8 @@ export function NativeWorkspacePage({
   };
 
   if (!pipeline) {
-    return <main id="main-content" className="workspace-unavailable"><h1>{projectName}</h1><p role={error ? 'alert' : 'status'}>{error || generationRunningLabel(generation) || '正在恢复完整工作流检查点…'}</p></main>;
+    return <main id="main-content" className="workspace-unavailable"><h1>{projectName}</h1><p role={error ? 'alert' : 'status'}>{error || generationRunningLabel(generation) || '正在恢复完整工作流检查点…'}</p>
+      {editUncertain && <button className="button button-primary" disabled={busy} onClick={() => void update(() => adapter.retryProjectEdit(projectId), '已核实原编辑提交。')}>核实并重试原操作</button>}</main>;
   }
 
   const status = pipeline.project.workflowStatus;
@@ -253,8 +264,8 @@ export function NativeWorkspacePage({
   const backToProjects = () => {
     // App handles sidebar/history navigation too; standalone consumers still
     // get a local guard without displaying a second confirmation in App.
-    if (!onDirtyChange && (promptContextDirty || outlineDirty) &&
-      !window.confirm('大纲或生成说明尚未保存。返回 PPT 项目将丢弃这些修改，是否继续？')) return;
+    if (!onDirtyChange && (promptContextDirty || outlineDirty || detailState.dirty) &&
+      !window.confirm('大纲、逐页细化、结构修订或生成说明尚未保存。返回 PPT 项目将丢弃这些修改，是否继续？')) return;
     onBack();
   };
 
@@ -294,6 +305,9 @@ export function NativeWorkspacePage({
       {generation?.status === 'running' && <p className="app-notice" role="status">
         {generationRunningLabel(generation)}，离开本页后仍会继续。
       </p>}
+      {edit?.status === 'running' && <p className="app-notice" role="status">正在保存或确认编辑，请等待持久化结果。离开本页后仍会继续。</p>}
+      {editUncertain && <div className="app-notice"><p>原编辑提交结果尚未核实，输入及操作身份已保留。请核实后再继续。</p>
+        <button className="button button-primary" disabled={busy} onClick={() => void update(() => adapter.retryProjectEdit(projectId), '已核实原编辑提交。')}>核实并重试原操作</button></div>}
       {(notice || error) && <p className={error ? 'app-notice is-error' : 'app-notice'} role={error ? 'alert' : 'status'}>{error || notice}</p>}
       <div className="workspace-layout">
         <aside className="workflow-rail" aria-label="PPT 工作流">
@@ -302,6 +316,7 @@ export function NativeWorkspacePage({
               <span className="stage-mark">{index + 1}</span>{stageLabel(stage)}
             </li>
           ))}</ol>
+          {status === 'detail_review' && detailState.draft && <DetailPageIndex value={detailState.draft.value} />}
           <h3>项目材料</h3>
           <ul className="source-list">{pipeline.sources.map((source) => <li key={source.id}>{source.fileName}<small>{source.byteLength} bytes</small></li>)}</ul>
           {status === 'intake' && <label className={`button button-secondary${busy || promptContextDirty ? ' is-disabled' : ''}`} aria-disabled={busy || promptContextDirty}>选择材料<input hidden type="file" multiple disabled={busy || promptContextDirty} onChange={(event) => void attachFiles(event)} /></label>}
@@ -392,13 +407,13 @@ export function NativeWorkspacePage({
             <p>已批准大纲不会被后续操作覆盖。</p>
             <button className="button button-primary" disabled={busy} onClick={() => void update(() => adapter.generateDetails(projectId), '全部页面细化已生成。')}>{generationActionLabel('details', generation, '生成逐页细化')}</button>
           </StageCard>}
-          {status === 'detail_review' && pipeline.slideSpecs && <StageCard title="4. 审核全部页面细化">
-            <textarea aria-label="逐页细化 JSON" rows={24} value={detailsText} disabled={busy} onChange={(event) => setDetailsText(event.target.value)} />
-            <div className="review-actions">
-              <button className="button button-secondary" disabled={busy || pipeline.slideSpecs.version.status === 'frozen'} onClick={() => void update(() => adapter.saveDetails(projectId, parseJson<SlideSpec[]>(detailsText)), '逐页细化修改已保存。')}>保存修改</button>
-              <button className="button button-primary" disabled={busy || pipeline.slideSpecs.version.status !== 'draft'} onClick={() => void update(() => adapter.approveDetails(projectId), '全部页面细化已批准并冻结。')}>批准全部细化</button>
-            </div>
-          </StageCard>}
+          {status === 'detail_review' && pipeline.slideSpecs && <NativeDetailReview pipeline={pipeline} adapter={adapter} state={detailState}
+            busy={busy || editUncertain} promptContextDirty={promptContextDirty} run={update} onReload={applyPipeline} />}
+          {status !== 'detail_review' && pipeline.slideSpecs && <details className="native-approved-details">
+            <summary>已批准细化（只读）</summary>
+            <NativeDetailReview pipeline={pipeline} adapter={adapter} state={detailState}
+              busy={busy || editUncertain} promptContextDirty={promptContextDirty} run={update} onReload={applyPipeline} />
+          </details>}
           {(status === 'visual_review' || visualBlocked) && <StageCard title={`5. 逐页视觉·${currentSpec?.title ?? pipeline.currentSlideId}`}>
             <p>{currentSpec?.imageGenerationBrief}</p>
             {pipeline.blockedCondition && <p className="capability-note">{pipeline.blockedCondition.message}不会切换到收费 API。</p>}
@@ -478,11 +493,6 @@ function StageCard({ title, actions, children }: { title: string; actions?: Reac
     <header className="native-stage-header"><h2>{title}</h2>{actions}</header>
     {children}
   </article>;
-}
-
-function parseJson<T>(value: string): T {
-  try { return JSON.parse(value) as T; }
-  catch { throw new Error('JSON 格式不正确，已保留原检查点。'); }
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

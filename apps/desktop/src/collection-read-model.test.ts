@@ -32,6 +32,14 @@ function pipeline(
 }
 
 describe('pending PPT approval read model', () => {
+  it('prioritizes saved structure confirmation over detail approval', () => {
+    const ready = pipeline('detail_review');
+    ready.outlineRevisionDraft = { id: 'revision-2', baseOutlineVersionId: 'outline-1',
+      outline: { title: '修订', slides: [] }, specs: [], createdAt: 'now', updatedAt: 'now' };
+    expect(derivePendingPptApprovals([ready])).toEqual([expect.objectContaining({
+      id: 'ppt-review:project-review:structure:revision-2', detail: '大纲结构修订待确认', projectId: 'project-review',
+    })]);
+  });
   it('derives an outline review from the current draft instead of approval history', () => {
     const ready = pipeline('outline_review');
     ready.outline = {

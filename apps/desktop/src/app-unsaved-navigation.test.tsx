@@ -13,7 +13,7 @@ import {
 
 const projectId = 'native-guard-project';
 const projectUrl = `#/workspace/${projectId}`;
-const discardMessage = '大纲或生成说明尚未保存。离开将丢弃这些修改，是否继续？';
+const discardMessage = '大纲、逐页细化、结构修订或生成说明尚未保存。离开将丢弃这些修改，是否继续？';
 
 function nativeAdapter(): DesktopAdapter {
   const demo = createDemoDesktopAdapter();

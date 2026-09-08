@@ -8,6 +8,7 @@ import { createNativePipeline, type NativePptPipeline } from '../../worker/src/n
 import { createDemoDesktopAdapter, type DesktopAdapter } from './desktop-adapter.js';
 import { buildPptPrompt } from './ppt-prompts.js';
 import { NativeWorkspacePage } from './native-workspace.js';
+import { detailTestHarness } from './native-detail-test-support.js';
 
 afterEach(cleanup);
 
@@ -448,44 +449,20 @@ describe('native PPT QA workspace', () => {
 
   it('edits, saves, and approves the whole slide-spec document', async () => {
     const user = userEvent.setup();
-    const initial = createNativePipeline({
-      id: 'project-details-ui', name: '经营复盘', goal: '管理层决策',
-      createdAt: '2026-09-04T00:00:00.000Z',
-    });
-    initial.project.workflowStatus = 'detail_review';
-    initial.slideSpecs = {
-      version: { id: 'project-details-ui-slide-specs-v1', projectId: initial.project.id,
-        sequence: 1, status: 'draft', createdAt: initial.project.createdAt, frozenAt: null },
-      value: [{ id: 'slide-cover', title: '封面', body: ['旧文案'], tables: [], charts: [],
-        shapes: [], sourceMap: [], imageGenerationBrief: '无文字封面' }],
-    };
-    const saved = structuredClone(initial);
-    saved.revision = 2;
-    saved.slideSpecs!.value[0]!.body = ['用户修改后的文案'];
-    const approved = structuredClone(saved);
-    approved.revision = 3;
-    approved.slideSpecs!.version.status = 'frozen';
-    approved.slideSpecs!.version.frozenAt = '2026-09-04T00:02:00.000Z';
-    approved.project.workflowStatus = 'visual_review';
-    approved.currentSlideId = 'slide-cover';
-    const base = createDemoDesktopAdapter();
-    const saveDetails = vi.fn(async () => saved);
-    const approveDetails = vi.fn(async () => approved);
-    const adapter = { ...base, mode: 'tauri' as const,
-      loadProjectPipeline: vi.fn(async () => initial), saveDetails, approveDetails } satisfies DesktopAdapter;
-    render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
+    const h = await detailTestHarness(); const initial = h.getStored();
+    render(<NativeWorkspacePage adapter={h.adapter} projectId={initial.project.id}
       projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
-
-    // Wait for the persisted document, not the empty textbox on the loading render.
-    const editor = await screen.findByDisplayValue(/旧文案/);
-    const edited = structuredClone(initial.slideSpecs.value);
-    edited[0]!.body = ['用户修改后的文案'];
-    fireEvent.change(editor, { target: { value: JSON.stringify(edited) } });
+    const editor = await screen.findByRole('textbox', { name: '第 1 页正文第 1 段' });
+    fireEvent.change(editor, { target: { value: '用户修改后的文案' } });
     await user.click(screen.getByRole('button', { name: '保存修改' }));
-    expect(saveDetails).toHaveBeenCalledWith(initial.project.id, edited);
-    expect(await screen.findByDisplayValue(/用户修改后的文案/)).toBeInTheDocument();
+    expect(h.getStored().slideSpecs!.value[0]!.body[0]).toBe('用户修改后的文案');
+    expect(h.commits).toEqual([5]);
     await user.click(screen.getByRole('button', { name: '批准全部细化' }));
-    expect(approveDetails).toHaveBeenCalledWith(initial.project.id);
+    expect(h.getStored().slideSpecs!.version.status).toBe('frozen');
+    expect(h.commits).toEqual([5, 6]);
     expect(await screen.findByText(/5\. 逐页视觉/)).toBeInTheDocument();
+    expect(screen.getByLabelText('第 1 页正文第 1 段')).not.toBeVisible();
+    fireEvent.click(screen.getByText('已批准细化（只读）', { selector: 'summary' }));
+    expect(screen.getByRole('textbox', { name: '第 1 页正文第 1 段' })).toHaveAttribute('readonly');
   });
 });

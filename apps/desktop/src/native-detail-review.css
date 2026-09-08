@@ -1,0 +1,18 @@
+.native-detail-review { min-width: 0; padding-bottom: 24px; }
+.native-detail-actions { position: sticky; top: 0; z-index: 3; background: #fff; border-bottom: 1px solid #dce3df; padding: 16px; }
+.native-detail-actions h2 { margin-top: 0; }
+.native-detail-actions p, .native-revision-summary p, .native-revision-history p { overflow-wrap: anywhere; }
+.native-revision-summary { margin: 16px 0; padding: 16px; background: #f4f7f4; border: 1px solid #dce3df; border-radius: 12px; }
+.native-revision-history { margin: 16px 0; }
+.native-detail-review summary { cursor: pointer; padding: 10px 0; overflow-wrap: anywhere; }
+.native-detail-actions .review-actions { flex-wrap: wrap; }
+.native-workspace .workflow-rail .detail-page-index ol { list-style: none; padding: 0; margin: 12px 0; }
+.native-workspace .workflow-rail .detail-page-index li { display: block; padding: 0; margin: 4px 0; }
+.native-workspace .workflow-rail .detail-page-index a { display: block; color: #354351; text-decoration: none; padding: 8px 10px; border-radius: 8px; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.native-workspace .workflow-rail .detail-page-index a:hover { background: #edf2f1; }
+.native-workspace .workflow-rail .detail-page-index a:focus-visible { outline: 2px solid #3643e8; outline-offset: 2px; }
+.native-detail-review .detail-page { scroll-margin-top: 180px; }
+@media (max-width: 956px) {
+  .native-detail-actions { top: 61px; }
+  .native-detail-review .detail-page { scroll-margin-top: 300px; }
+}

@@ -21,6 +21,12 @@ export function derivePendingPptApprovals(
         detail: '整份大纲待审核',
       }];
     }
+    if (pipeline.project.workflowStatus === 'detail_review' && pipeline.outlineRevisionDraft) {
+      return [{ ...base,
+        id: `ppt-review:${pipeline.project.id}:structure:${pipeline.outlineRevisionDraft.id}`,
+        detail: '大纲结构修订待确认',
+      }];
+    }
     if (
       pipeline.project.workflowStatus === 'detail_review' &&
       pipeline.slideSpecs?.version.status === 'draft'

@@ -84,12 +84,12 @@ describe('native generation lifecycle review', () => {
     const first = test.mount();
     fireEvent.click(await screen.findByRole('button', { name: '生成逐页细化' }));
     test.finish();
-    const details = await screen.findByRole('textbox', { name: '逐页细化 JSON' }) as HTMLTextAreaElement;
+    const details = await screen.findByRole('textbox', { name: '第 1 页正文第 1 段' }) as HTMLTextAreaElement;
     await waitFor(() => expect(details.value).toContain('关键结论'));
     first.unmount();
 
     const second = test.mount();
-    await screen.findByRole('textbox', { name: '逐页细化 JSON' });
+    await screen.findByRole('textbox', { name: '第 1 页正文第 1 段' });
     second.unmount();
     const offPage = test.registry.run('project-a', 'details', async () => detailPipeline('project-a', 3, true));
     await offPage;
@@ -186,7 +186,7 @@ describe('native generation lifecycle review', () => {
     expect(await screen.findByText('检查点 r5')).toBeVisible();
     lateLoad.resolve(detailPipeline('project-a', 1));
     await waitFor(() => expect(screen.getByText('检查点 r5')).toBeVisible());
-    expect(screen.getByRole('textbox', { name: '逐页细化 JSON' })).toBeVisible();
+    expect(screen.getByRole('textbox', { name: '第 1 页正文第 1 段' })).toBeVisible();
   });
 
   it('does not disable mutations in another project', async () => {

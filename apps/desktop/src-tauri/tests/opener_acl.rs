@@ -59,6 +59,29 @@ fn allowed_login_url(scope: &[Value], url: &str) -> bool {
 }
 
 #[test]
+fn only_main_window_can_complete_a_confirmed_native_close() {
+    let resolved = resolved_main_acl();
+    let commands = resolved
+        .allowed_commands
+        .get("plugin:window|destroy")
+        .expect("native close listener needs window destroy after user confirmation");
+    assert!(commands
+        .iter()
+        .any(|command| command.windows.iter().any(|window| window.matches("main"))));
+    assert!(!commands.iter().any(|command| command
+        .windows
+        .iter()
+        .any(|window| window.matches("secondary"))));
+    for forbidden in [
+        "plugin:window|create",
+        "plugin:window|close",
+        "plugin:window|set_title",
+    ] {
+        assert!(!resolved.allowed_commands.contains_key(forbidden));
+    }
+}
+
+#[test]
 fn main_window_can_open_only_official_https_login_urls() {
     let resolved = resolved_main_acl();
     for forbidden_command in [

@@ -26,6 +26,7 @@ import {
 } from './workbench-store.js';
 import './styles.css';
 import { NativeWorkspacePage } from './native-workspace.js';
+import { installNativeCloseGuard } from './native-window-close.js';
 import { formatProjectTime, parseProjectTime, projectStatus, sortProjectsByUpdatedAt } from './task-presentation.js';
 
 type Route =
@@ -39,7 +40,7 @@ type Route =
 type Notice = { kind: 'status' | 'error'; text: string } | null;
 
 const nativeUnsavedNavigationMessage =
-  '大纲或生成说明尚未保存。离开将丢弃这些修改，是否继续？';
+  '大纲、逐页细化、结构修订或生成说明尚未保存。离开将丢弃这些修改，是否继续？';
 
 const navItems: Array<{
   route: Exclude<Route, 'workspace'>;
@@ -145,6 +146,12 @@ export function App({
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
   }, []);
 
+  useEffect(() => installNativeCloseGuard(
+    () => nativeWorkspaceDirty.current,
+    () => window.confirm(nativeUnsavedNavigationMessage),
+    (text) => setNotice({ kind: 'error', text }),
+  ), []);
+
   useEffect(() => {
     let active = true;
     let projectsHydrated = false;
@@ -200,11 +207,11 @@ export function App({
 
   useEffect(() => {
     if (
-      adapter.mode !== 'tauri' || !['dashboard', 'memory'].includes(route) ||
+      adapter.mode !== 'tauri' || !['dashboard', 'approvals', 'memory'].includes(route) ||
       !adapter.loadCollections
     ) return;
     const completed = new Set<string>();
-    const unsubscribers = workbench.projects.map(({ id }) =>
+    const unsubscribers = workbench.projects.flatMap(({ id }) => [
       adapter.subscribeProjectGeneration(id, (generation) => {
         if (
           generation?.status !== 'completed' ||
@@ -215,7 +222,13 @@ export function App({
         ) return;
         completed.add(generation.operationId);
         setCollectionRefresh((value) => value + 1);
-      }));
+      }),
+      adapter.subscribeProjectEdit(id, (edit) => {
+        if (route === 'memory' || edit?.status !== 'completed' || completed.has(edit.operationId)) return;
+        completed.add(edit.operationId);
+        setCollectionRefresh((value) => value + 1);
+      }),
+    ]);
     return () => { for (const unsubscribe of unsubscribers) unsubscribe(); };
   }, [adapter, route, workbench.projects]);
 

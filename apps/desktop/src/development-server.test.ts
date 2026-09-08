@@ -48,6 +48,7 @@ describe('development server boundary', () => {
     ))).toEqual([
       'core:event:allow-listen',
       'core:event:allow-unlisten',
+      'core:window:allow-destroy',
     ]);
     const opener = capability.permissions.find((permission): permission is {
       identifier: string;

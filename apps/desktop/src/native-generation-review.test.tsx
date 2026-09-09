@@ -6,6 +6,7 @@ import { createNativePipeline, type NativePptPipeline } from '../../worker/src/n
 import { createDemoDesktopAdapter, type DesktopAdapter } from './desktop-adapter.js';
 import { ProjectGenerationRegistry } from './project-generation.js';
 import { NativeWorkspacePage } from './native-workspace.js';
+import type { VisualStyleState } from '../../worker/src/visual-style.js';
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -133,7 +134,103 @@ function harness(projectIds = ['project-a']) {
   return { adapter, registry, attempts, memoryAttempts, mount, finish, saved };
 }
 
+function withSavedVisualStyle(test: ReturnType<typeof visualHarness>, template = true) {
+  const style: VisualStyleState = { revision: 1, locked: false, profile: {
+    primaryColor: '#D2232A', backgroundColor: '#FFFFFF', textColor: '#222222',
+    accentColors: ['#EEEEEE'], instructions: '品牌配色',
+    template: template ? { fileName: '品牌模板.pptx', sha256: 'a'.repeat(64),
+      relativePath: `visuals/style-templates/${'a'.repeat(64)}.pptx` } : null,
+  } };
+  test.adapter.loadVisualStyle = async () => structuredClone(style);
+  test.adapter.loadVisualRecords = async () => [{
+    id: 'saved-visual-request', projectId: 'project-visual', expectedRevision: 0, styleRevision: 1,
+    slideId: 'slide-1', kind: 'imagegen', prompt: '生成完整页面', feedback: '', promptVersion: 'full-slide-v1',
+    createdAt: '2026-09-09T00:00:00.000Z', promptSha256: 'a'.repeat(64), specSha256: 'c'.repeat(64), style,
+    receipt: { relativePath: 'visuals/slide-1-v1.png', sha256: 'b'.repeat(64), committedRevision: 1,
+      createdAt: '2026-09-09T00:01:00.000Z', provider: {} },
+  }];
+  return test;
+}
+
 describe('native generation lifecycle review', () => {
+  it('generates from a saved template with optional adjustments collapsed and no invented feedback', async () => {
+    const test = withSavedVisualStyle(visualHarness());
+    test.mount();
+    const action = await screen.findByRole('button', { name: '按项目模板生成' });
+    expect(action).toBeEnabled();
+    expect(screen.getByText(/已应用模板配色/)).toHaveTextContent('品牌模板.pptx');
+    expect(screen.getByText('额外调整（选填）').closest('details')).not.toHaveAttribute('open');
+    expect(screen.getByLabelText('修改意见')).not.toBeVisible();
+    fireEvent.click(action);
+    expect(test.adapter.requestVisual).toHaveBeenCalledWith('project-visual', 'slide-1', undefined);
+    test.finish();
+    await waitFor(() => expect(test.registry.get('project-visual')?.status).toBe('completed'));
+  });
+
+  it('allows empty-feedback regeneration on an unchanged template and remains single-flight after remount', async () => {
+    const test = withSavedVisualStyle(visualHarness({ candidate: true }));
+    const first = test.mount();
+    const action = await screen.findByRole('button', { name: '按项目模板重新生成' });
+    expect(screen.queryByText(/当前图片未使用已确认的配色版本/)).not.toBeInTheDocument();
+    expect(action).toBeEnabled();
+    fireEvent.click(action);
+    first.unmount();
+    test.mount();
+    const running = await screen.findByRole('button', { name: '正在生成当前页…' });
+    expect(running).toBeDisabled();
+    fireEvent.click(running);
+    expect(test.adapter.requestVisual).toHaveBeenCalledTimes(1);
+    expect(test.adapter.requestVisual).toHaveBeenCalledWith('project-visual', 'slide-1', undefined);
+    test.finish();
+    await waitFor(() => expect(test.registry.get('project-visual')?.status).toBe('completed'));
+  });
+
+  it('previews only enabled adjustments and includes them in initial template generation', async () => {
+    const test = withSavedVisualStyle(visualHarness());
+    test.mount();
+    await screen.findByRole('button', { name: '按项目模板生成' });
+    const previewSummary = screen.getByText('查看完整技术提示词');
+    fireEvent.click(previewSummary);
+    const prompt = () => previewSummary.closest('details')!.querySelector('pre')!.textContent;
+    expect(prompt()).toContain('"userFeedback": ""');
+    const summary = screen.getByText('额外调整（选填）');
+    fireEvent.click(summary);
+    fireEvent.change(screen.getByRole('textbox', { name: '修改意见' }), { target: { value: '  减少装饰，让图表更突出。  ' } });
+    expect(prompt()).toContain('"userFeedback": "减少装饰，让图表更突出。"');
+    fireEvent.click(summary);
+    expect(prompt()).toContain('"userFeedback": ""');
+    fireEvent.click(summary);
+    expect(screen.getByRole('textbox', { name: '修改意见' })).toHaveValue('  减少装饰，让图表更突出。  ');
+    fireEvent.click(screen.getByRole('button', { name: '按项目模板生成' }));
+    expect(test.adapter.requestVisual).toHaveBeenCalledWith('project-visual', 'slide-1', '减少装饰，让图表更突出。');
+    test.finish();
+    await waitFor(() => expect(test.registry.get('project-visual')?.status).toBe('completed'));
+  });
+
+  it('does not send retained feedback when extra adjustments are collapsed', async () => {
+    const test = withSavedVisualStyle(visualHarness({ candidate: true }));
+    test.mount();
+    const summary = await screen.findByText('额外调整（选填）');
+    const disclosure = summary.closest('details')!;
+    fireEvent.click(summary);
+    await waitFor(() => expect(disclosure).toHaveAttribute('open'));
+    fireEvent.change(screen.getByRole('textbox', { name: '修改意见' }), { target: { value: '未启用的额外意见' } });
+    fireEvent.click(summary);
+    await waitFor(() => expect(disclosure).not.toHaveAttribute('open'));
+    fireEvent.click(screen.getByRole('button', { name: '按项目模板重新生成' }));
+    expect(test.adapter.requestVisual).toHaveBeenCalledWith('project-visual', 'slide-1', undefined);
+    test.finish();
+    await waitFor(() => expect(test.registry.get('project-visual')?.status).toBe('completed'));
+  });
+
+  it('does not claim a template is applied when only manual project colors are saved', async () => {
+    const test = withSavedVisualStyle(visualHarness({ candidate: true }), false);
+    test.mount();
+    const action = await screen.findByRole('button', { name: '按项目配色重新生成' });
+    expect(action).toBeEnabled();
+    expect(screen.getByText(/已应用项目配色/)).toBeVisible();
+    expect(screen.queryByText(/已应用模板配色/)).not.toBeInTheDocument();
+  });
   it('requires human whole-slide content and palette review, and labels legacy provenance honestly', async () => {
     const test = visualHarness({ candidate: true });
     test.mount();
@@ -193,8 +290,9 @@ describe('native generation lifecycle review', () => {
     const test = visualHarness({ candidate: true });
     const first = test.mount();
     await screen.findByRole('img', { name: '第 1 页视觉候选' });
+    fireEvent.click(screen.getByText('额外调整（选填）'));
     fireEvent.change(screen.getByRole('textbox', { name: '修改意见' }), { target: { value: '减少装饰' } });
-    fireEvent.click(screen.getByRole('button', { name: '按意见重新生成' }));
+    fireEvent.click(screen.getByRole('button', { name: '重新生成当前页' }));
     expect(screen.getByRole('button', { name: '正在生成当前页…' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '批准当前页' })).toBeDisabled();
     expect(screen.getByText('上传替换 PNG').closest('label')).toHaveAttribute('aria-disabled', 'true');
@@ -220,15 +318,16 @@ describe('native generation lifecycle review', () => {
     test.mount();
     expect(await screen.findByRole('img', { name: '第 1 页视觉候选' })).toBeVisible();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '重试按意见重新生成' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重试生成当前页' })).not.toBeInTheDocument();
   });
 
   it('does not replay a prior-slide visual failure after approval advances to the next slide', async () => {
     const test = visualHarness({ candidate: true });
     const first = test.mount();
     await screen.findByRole('img', { name: '第 1 页视觉候选' });
+    fireEvent.click(screen.getByText('额外调整（选填）'));
     fireEvent.change(screen.getByRole('textbox', { name: '修改意见' }), { target: { value: '减少装饰' } });
-    fireEvent.click(screen.getByRole('button', { name: '按意见重新生成' }));
+    fireEvent.click(screen.getByRole('button', { name: '重新生成当前页' }));
     first.unmount();
     test.attempts[0]!.reject(new Error('第 1 页旧失败'));
     await waitFor(() => expect(test.registry.get('project-visual')?.status).toBe('failed'));
@@ -283,14 +382,19 @@ describe('native generation lifecycle review', () => {
   it('shows an off-page failure and only retries after an explicit click', async () => {
     const test = harness();
     const first = test.mount();
-    fireEvent.click(await screen.findByRole('button', { name: '生成逐页细化' }));
+    const start = await screen.findByRole('button', { name: '生成逐页细化' });
+    // A visible stage or error is restored before the initial load releases its busy gate.
+    await waitFor(() => expect(start).toBeEnabled());
+    fireEvent.click(start);
     first.unmount();
     test.attempts.get('project-a')![0]!.reject(new Error('模型服务暂时不可用'));
     await waitFor(() => expect(test.registry.get('project-a')?.status).toBe('failed'));
     test.mount();
     expect(await screen.findByRole('alert')).toHaveTextContent('模型服务暂时不可用');
     expect(test.adapter.generateDetails).toHaveBeenCalledOnce();
-    fireEvent.click(screen.getByRole('button', { name: '重试生成逐页细化' }));
+    const retry = screen.getByRole('button', { name: '重试生成逐页细化' });
+    await waitFor(() => expect(retry).toBeEnabled());
+    fireEvent.click(retry);
     expect(test.adapter.generateDetails).toHaveBeenCalledTimes(2);
     expect(screen.getByRole('button', { name: '正在生成逐页细化…' })).toBeDisabled();
   });

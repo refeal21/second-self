@@ -83,6 +83,32 @@ describe('document outline review integration', () => {
     expect(test.adapter.analyzeProject).not.toHaveBeenCalled();
   });
 
+  it('preserves an outline edit made as soon as a save re-enables editing', async () => {
+    const test = setup(); test.mount();
+    fireEvent.change(await screen.findByRole('textbox', { name: '第 1 页标题' }), { target: { value: '现金流与增长' } });
+    const approve = screen.getByRole('button', { name: '批准整份大纲' });
+    const purpose = screen.getByRole('textbox', { name: '第 1 页页面目的' });
+    let editedAtFirstEnabledCommit = false;
+    // Edit at the first enabled DOM commit, before a pending passive draft
+    // synchronization can run. Waiting another turn would hide this race.
+    const observer = new MutationObserver(() => {
+      if (approve.hasAttribute('disabled')) return;
+      observer.disconnect();
+      fireEvent.change(purpose, { target: { value: '提出投入建议' } });
+      editedAtFirstEnabledCommit = true;
+    });
+    observer.observe(approve, { attributes: true, attributeFilter: ['disabled'] });
+    try {
+      fireEvent.click(screen.getByRole('button', { name: '保存修改' }));
+      await waitFor(() => expect(editedAtFirstEnabledCommit).toBe(true));
+      expect(purpose).toHaveValue('提出投入建议');
+      expect(screen.getByRole('button', { name: '保存修改' })).toBeEnabled();
+      expect(approve).toBeDisabled();
+    } finally {
+      observer.disconnect();
+    }
+  });
+
   it('retains unsaved edits on persistence failure and never approves them', async () => {
     const test = setup();
     test.saveOutline.mockRejectedValueOnce(new Error('磁盘暂时不可用'));

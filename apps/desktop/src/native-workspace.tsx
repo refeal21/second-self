@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -52,6 +53,8 @@ export function NativeWorkspacePage({
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const [visualFeedback, setVisualFeedback] = useState('');
+  const [visualAdjustmentsOpen, setVisualAdjustmentsOpen] = useState(false);
+  const effectiveVisualFeedback = visualAdjustmentsOpen ? visualFeedback.trim() || undefined : undefined;
   const [previewSrc, setPreviewSrc] = useState('');
   const [previewState, setPreviewState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [style, setStyle] = useState<VisualStyleState | null>(null);
@@ -156,7 +159,8 @@ export function NativeWorkspacePage({
   }, [adapter, projectId]);
 
   const savedOutlineKey = JSON.stringify(pipeline?.outline?.value ?? null);
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // Finish syncing before editing reopens, so saved content cannot overwrite fresh input.
     // Saving a draft retains its version ID. Sync only when persisted content
     // changes, never when an unrelated checkpoint response refreshes the page.
     setOutlineDraft(JSON.parse(savedOutlineKey) as PptOutline | null);
@@ -203,6 +207,7 @@ export function NativeWorkspacePage({
 
   useEffect(() => {
     setVisualFeedback('');
+    setVisualAdjustmentsOpen(false);
   }, [pipeline?.currentSlideId]);
 
   useEffect(() => {
@@ -467,8 +472,8 @@ export function NativeWorkspacePage({
             </p>}
             {currentSpec?.imageGenerationBrief && <details className="native-prompt-preview native-visual-prompt">
               <summary>查看完整技术提示词</summary>
-              <p>下次请求预览：整页包含已批准标题、正文和图表；不是仅生成背景。修改意见只能调整排版与风格。</p>
-              <pre>{buildPageVisualPrompt({ slideId: currentSpec.id, spec: currentSpec, style: style ?? undefined }, visualFeedback)}</pre>
+              <p>下次请求预览：整页包含已批准标题、正文和图表；不是仅生成背景。展开的额外调整只能影响排版与风格。</p>
+              <pre>{buildPageVisualPrompt({ slideId: currentSpec.id, spec: currentSpec, style: style ?? undefined }, effectiveVisualFeedback)}</pre>
             </details>}
             {pipeline.blockedCondition && <p className="capability-note">{pipeline.blockedCondition.message}不会切换到收费 API。</p>}
             {currentVisual?.relativePath && <dl><dt>当前候选</dt><dd>{currentVisual.relativePath}</dd><dt>SHA-256</dt><dd>{currentVisual.sha256}</dd></dl>}
@@ -497,11 +502,19 @@ export function NativeWorkspacePage({
               </> : <p>旧版本未记录生成依据，无法确认当时发送的提示词和修改意见。</p>}
               {styleMismatch && <p className="capability-note">当前图片未使用已确认的配色版本，请按当前配色重新生成，或上传匹配配色的整页 PNG 后再审核。</p>}
             </section>}
-            <label className="native-feedback">修改意见
-              <textarea aria-label="修改意见" rows={3} value={visualFeedback}
-                maxLength={4000} disabled={busy} onChange={(event) => setVisualFeedback(event.target.value)}
-                placeholder="例如：保留全部标题与正文，减少装饰，图表使用项目主色。" />
-            </label>
+            {styleReady && style?.profile && <section className="native-visual-style-status" aria-label="下次生成配色">
+              <p><strong>{style.profile.template ? `已应用模板配色 · ${style.profile.template.fileName}` : '已应用项目配色'}</strong></p>
+              <p>{styleDirty ? '配色有未保存修改，请先保存，再生成页面。' : '下次生成时自动使用已保存配色与已批准内容，无需填写配色意见。旧图片不会自动改变。'}</p>
+            </section>}
+            <details className="native-visual-adjustments" open={visualAdjustmentsOpen}>
+              <summary onClick={(event) => { event.preventDefault(); setVisualAdjustmentsOpen((open) => !open); }}>额外调整（选填）</summary>
+              <p>仅在需要额外调整排版或风格时填写；收起后不提交这里的意见。</p>
+              <label className="native-feedback">修改意见
+                <textarea aria-label="修改意见" rows={3} value={visualFeedback}
+                  maxLength={4000} disabled={busy} onChange={(event) => setVisualFeedback(event.target.value)}
+                  placeholder="例如：保留全部标题与正文，减少装饰，让图表更突出。" />
+              </label>
+            </details>
             {hasInspectableVisual && <fieldset className="native-visual-checks" disabled={busy || previewState !== 'ready' || !styleReady || styleMismatch}>
               <legend>整页人工检查（系统不会代你确认内容完整）</legend>
               <label><input type="checkbox" checked={contentReviewed} onChange={(event) => setContentReviewed(event.target.checked)} />标题、正文和数据完整，且与已批准细化一致</label>
@@ -509,13 +522,13 @@ export function NativeWorkspacePage({
             </fieldset>}
             <div className="review-actions">
               {!hasInspectableVisual && <button className="button button-secondary" disabled={busy || !styleReady || styleDirty} onClick={() => void update(
-                () => adapter.requestVisual(projectId, pipeline.currentSlideId!),
+                () => adapter.requestVisual(projectId, pipeline.currentSlideId!, effectiveVisualFeedback),
                 '视觉候选已生成并保存，请检查完整 PNG。',
-              )}>{visualActionLabel(visualGeneration, false)}</button>}
-              {hasInspectableVisual && <button className="button button-secondary" disabled={busy || !styleReady || styleDirty || (!visualFeedback.trim() && !styleMismatch)} onClick={() => void update(
-                () => adapter.requestVisual(projectId, pipeline.currentSlideId!, visualFeedback || '按本项目已确认配色生成完整 PPT 页面，保留全部已批准内容。'),
+              )}>{visualActionLabel(visualGeneration, false, style)}</button>}
+              {hasInspectableVisual && <button className="button button-secondary" disabled={busy || !styleReady || styleDirty} onClick={() => void update(
+                () => adapter.requestVisual(projectId, pipeline.currentSlideId!, effectiveVisualFeedback),
                 '视觉候选已生成并保存，请重新检查完整 PNG。',
-              )}>{visualActionLabel(visualGeneration, true)}</button>}
+              )}>{visualActionLabel(visualGeneration, true, style)}</button>}
               <label className={`button button-secondary${busy || styleDirty || !styleReady ? ' is-disabled' : ''}`} aria-disabled={busy || styleDirty || !styleReady}>上传替换 PNG<input hidden type="file" accept="image/png" disabled={busy || styleDirty || !styleReady} onChange={(event) => void replaceVisual(event)} /></label>
               <button className="button button-primary" disabled={busy || !canApproveCurrent} onClick={() => void update(() => adapter.approveVisual(projectId, pipeline.currentSlideId!), '当前页已批准，检查点已保存。')}>批准当前页</button>
             </div>
@@ -656,11 +669,13 @@ function generationActionLabel(
   return idle;
 }
 
-function visualActionLabel(generation: ProjectGeneration | null, replacing: boolean): string {
-  if (generation?.kind !== 'visual') return replacing ? '按意见重新生成' : '生成当前页';
+function visualActionLabel(generation: ProjectGeneration | null, replacing: boolean, style: VisualStyleState | null): string {
+  const source = style?.profile?.template ? '项目模板' : style?.profile ? '项目配色' : null;
+  const idle = source ? `按${source}${replacing ? '重新生成' : '生成'}` : replacing ? '重新生成当前页' : '生成当前页';
+  if (generation?.kind !== 'visual') return idle;
   if (generation.status === 'running') return '正在生成当前页…';
-  if (generation.status === 'failed') return replacing ? '重试按意见重新生成' : '重试生成当前页';
-  return replacing ? '按意见重新生成' : '生成当前页';
+  if (generation.status === 'failed') return source ? `重试按${source}生成` : '重试生成当前页';
+  return idle;
 }
 
 function generationProgress(generation: ProjectGeneration): string {

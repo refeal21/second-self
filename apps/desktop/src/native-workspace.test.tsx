@@ -339,8 +339,9 @@ describe('native PPT QA workspace', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: '排版无裁切，配色符合本项目要求' }));
     expect(approve).toBeEnabled();
 
+    await user.click(screen.getByText('额外调整（选填）'));
     await user.type(screen.getByRole('textbox', { name: '修改意见' }), '减少装饰，突出数据');
-    await user.click(screen.getByRole('button', { name: '按意见重新生成' }));
+    await user.click(screen.getByRole('button', { name: '重新生成当前页' }));
     expect(requestVisual).toHaveBeenCalledWith(
       initial.project.id,
       'slide-cover',
@@ -417,7 +418,7 @@ describe('native PPT QA workspace', () => {
 
     expect(await screen.findByText(/当前阶段正在等待生成视觉候选/)).toBeVisible();
     expect(screen.getByRole('button', { name: '生成当前页' })).toBeEnabled();
-    expect(screen.queryByRole('button', { name: '按意见重新生成' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重新生成当前页' })).not.toBeInTheDocument();
   });
 
   it('runs the production QA action and renders the real readable report path', async () => {

@@ -2335,6 +2335,19 @@ textarea::placeholder {
   resize: vertical;
 }
 
+.native-visual-style-status {
+  margin: 18px 0;
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: #f1f4fa;
+  overflow-wrap: anywhere;
+}
+.native-visual-style-status p { margin: 0; font-size: 14px; line-height: 1.7; }
+.native-visual-style-status p + p { margin-top: 4px; color: #505b6e; }
+.native-visual-adjustments { margin: 18px 0; }
+.native-visual-adjustments summary { cursor: pointer; font-weight: 600; }
+.native-visual-adjustments > p { color: #505b6e; font-size: 14px; line-height: 1.7; }
+
 .native-visual-checks {
   display: grid;
   gap: 12px;

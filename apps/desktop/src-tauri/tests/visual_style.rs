@@ -596,3 +596,56 @@ fn template_save_waits_for_database_write_ownership_before_creating_assets() {
         .is_ok());
     assert_eq!(std::fs::read(target).unwrap(), bytes);
 }
+
+#[test]
+fn native_commit_rejects_malformed_visual_shapes_without_changing_durable_state() {
+    for styled in [false, true] {
+        for schema in [1, 2] {
+            for malformed in [
+                serde_json::Value::Null,
+                json!([]),
+                json!("visuals"),
+                json!({"page-one": null}),
+                json!({"page-one": {"version":{"id":"legacy-object","status":"frozen","createdAt":"now"}}}),
+                json!({"page-one": []}),
+                json!({"page-one": [null]}),
+                json!({"page-one": ["candidate"]}),
+                json!({"page-one": [[]]}),
+                json!({"page-one": [{}]}),
+                json!({"page-one": [{"version":null}]}),
+            ] {
+                let (root, service, id) = setup();
+                if styled {
+                    service.save_visual_style(save(&id, 0)).unwrap();
+                }
+                let original = ready(&service, &id);
+                service
+                    .begin_visual_request(request(&id, "pending-request", i64::from(styled), 2))
+                    .unwrap();
+                let style = service.load_visual_style(&id).unwrap();
+                let records = service.visual_records(&id).unwrap();
+                let db =
+                    digital_twin_desktop_lib::database::Database::open(root.join("state.sqlite"))
+                        .unwrap();
+                let checkpoint = db.latest_checkpoint(&id).unwrap();
+                let counts = service.persistence_counts(&id).unwrap();
+                let mut next = original.clone();
+                next["revision"] = 3.into();
+                next["schemaVersion"] = schema.into();
+                next["visuals"] = malformed.clone();
+                let error = commit(&service, &id, 2, &next, json!([]), None).expect_err(&format!(
+                    "invalid visual shape must be rejected: {malformed}"
+                ));
+                assert!(
+                    error.contains("visual"),
+                    "shape validation should run before other transitions: {error}"
+                );
+                assert_eq!(service.load_pipeline(&id).unwrap(), original);
+                assert_eq!(service.load_visual_style(&id).unwrap(), style);
+                assert_eq!(service.visual_records(&id).unwrap(), records);
+                assert_eq!(db.latest_checkpoint(&id).unwrap(), checkpoint);
+                assert_eq!(service.persistence_counts(&id).unwrap(), counts);
+            }
+        }
+    }
+}

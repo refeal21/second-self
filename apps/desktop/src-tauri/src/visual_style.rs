@@ -280,13 +280,43 @@ pub struct VisualCommitContext<'a> {
     pub provider: Option<&'a VisualProvider>,
     pub expected_style_revision: Option<i64>,
 }
+/// Native v1/v2 checkpoints always map slide IDs to nonempty visual-history
+/// arrays. Validate this at the command boundary, even without a saved style or
+/// artifact writes, so malformed values cannot disappear from approval checks.
+pub(crate) fn validate_native_visual_shape(pipeline: &Value) -> Result<(), String> {
+    let slides = pipeline["visuals"]
+        .as_object()
+        .ok_or("Native visuals must be a slide-to-history object")?;
+    for history in slides.values() {
+        let history = history
+            .as_array()
+            .filter(|history| !history.is_empty())
+            .ok_or("Native visual histories must be nonempty arrays")?;
+        for visual in history {
+            if !visual.is_object() || !visual["version"].is_object() {
+                return Err(
+                    "Native visual history entries must be objects with a version object".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// Generic persisted projects may contain the older single-object shape. Keep
+// those entries visible to the shared guards; new native inputs are checked
+// above and cannot introduce this legacy representation.
 fn candidates(pipeline: &Value) -> Vec<&Value> {
     pipeline["visuals"]
         .as_object()
         .map(|slides| {
             slides
                 .values()
-                .flat_map(|v| v.as_array().into_iter().flatten())
+                .flat_map(|v| match v {
+                    Value::Array(history) => history.as_slice(),
+                    Value::Object(_) => std::slice::from_ref(v),
+                    _ => &[],
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -295,6 +325,7 @@ pub(crate) fn validate_visual_writes(
     pipeline: &Value,
     writes: &[crate::workbench::ArtifactWriteInput],
 ) -> Result<(), String> {
+    validate_native_visual_shape(pipeline)?;
     for write in writes
         .iter()
         .filter(|w| w.kind == "approved-visual-candidate")

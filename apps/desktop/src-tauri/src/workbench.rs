@@ -678,6 +678,7 @@ impl WorkbenchService {
         if current_revision != input.expected_revision {
             return Err("stale pipeline revision".into());
         }
+        crate::visual_style::validate_native_visual_shape(&input.pipeline)?;
         validate_revision_commit(
             &current.pipeline,
             &input.pipeline,

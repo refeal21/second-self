@@ -20,6 +20,9 @@ fn creates_all_workbench_domain_tables() {
             "settings",
             "tasks",
             "versions",
+            "visual_generation_records",
+            "visual_style_locks",
+            "visual_style_versions",
         ]
     );
 }

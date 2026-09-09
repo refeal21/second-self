@@ -6,6 +6,7 @@ pub mod tauri_codex;
 pub mod tauri_workbench;
 pub mod tauri_worker;
 pub mod workbench;
+pub mod visual_style;
 
 use tauri::Manager;
 
@@ -41,6 +42,10 @@ pub fn run() {
             tauri_workbench::load_desktop_state,
             tauri_workbench::ppt_create_project,
             tauri_workbench::ppt_load_pipeline,
+            tauri_workbench::ppt_load_visual_style,
+            tauri_workbench::ppt_save_visual_style,
+            tauri_workbench::ppt_begin_visual_request,
+            tauri_workbench::ppt_visual_records,
             tauri_workbench::ppt_project_directory,
             tauri_workbench::workspace_directory,
             tauri_workbench::ppt_read_artifact,

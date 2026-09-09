@@ -49,6 +49,9 @@ fn synthetic_revision_base(service: &WorkbenchService) -> serde_json::Value {
     ];
     service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: project.id,
             expected_revision: 1,
             pipeline: base,
@@ -271,6 +274,9 @@ fn native_revision_candidates_reject_malformed_documents_and_event_times() {
         assert!(
             service
                 .commit_pipeline(PipelineCommitInput {
+                    visual_request_id: None,
+                    visual_provider: None,
+                    expected_style_revision: None,
                     project_id: id.into(),
                     expected_revision: 2,
                     pipeline: forged,
@@ -300,6 +306,9 @@ fn native_revision_candidates_reject_malformed_documents_and_event_times() {
     assert_eq!(
         service
             .commit_pipeline(PipelineCommitInput {
+                visual_request_id: None,
+                visual_provider: None,
+                expected_style_revision: None,
                 project_id: id.into(),
                 expected_revision: 2,
                 pipeline: valid.clone(),
@@ -322,6 +331,9 @@ fn native_detail_freeze_requires_exact_approval_and_transition_evidence() {
     let pending = synthetic_pending(&base);
     service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 2,
             pipeline: pending.clone(),
@@ -331,6 +343,9 @@ fn native_detail_freeze_requires_exact_approval_and_transition_evidence() {
     let (confirmed, writes) = synthetic_confirmed(&pending);
     service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 3,
             pipeline: confirmed.clone(),
@@ -400,6 +415,9 @@ fn native_detail_freeze_requires_exact_approval_and_transition_evidence() {
         assert!(
             service
                 .commit_pipeline(PipelineCommitInput {
+                    visual_request_id: None,
+                    visual_provider: None,
+                    expected_style_revision: None,
                     project_id: id.into(),
                     expected_revision: 4,
                     pipeline: forged,
@@ -418,6 +436,9 @@ fn native_detail_freeze_requires_exact_approval_and_transition_evidence() {
     );
     assert!(service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 4,
             pipeline: valid.clone(),
@@ -426,6 +447,9 @@ fn native_detail_freeze_requires_exact_approval_and_transition_evidence() {
         .is_err());
     let committed = service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 4,
             pipeline: valid.clone(),
@@ -466,6 +490,9 @@ fn native_revision_decisions_and_detail_saves_validate_time_and_generation_evide
         let pending = synthetic_pending(&base);
         service
             .commit_pipeline(PipelineCommitInput {
+                visual_request_id: None,
+                visual_provider: None,
+                expected_style_revision: None,
                 project_id: id.into(),
                 expected_revision: 2,
                 pipeline: pending.clone(),
@@ -477,6 +504,9 @@ fn native_revision_decisions_and_detail_saves_validate_time_and_generation_evide
             let (_, writes) = synthetic_confirmed(&pending);
             service
                 .commit_pipeline(PipelineCommitInput {
+                    visual_request_id: None,
+                    visual_provider: None,
+                    expected_style_revision: None,
                     project_id: id.into(),
                     expected_revision: 3,
                     pipeline: valid.clone(),
@@ -578,6 +608,9 @@ fn native_revision_decisions_and_detail_saves_validate_time_and_generation_evide
             assert!(
                 service
                     .commit_pipeline(PipelineCommitInput {
+                        visual_request_id: None,
+                        visual_provider: None,
+                        expected_style_revision: None,
                         project_id: id.into(),
                         expected_revision: current["revision"].as_i64().unwrap(),
                         writes: writes_for(&forged),
@@ -591,6 +624,9 @@ fn native_revision_decisions_and_detail_saves_validate_time_and_generation_evide
         assert_eq!(
             service
                 .commit_pipeline(PipelineCommitInput {
+                    visual_request_id: None,
+                    visual_provider: None,
+                    expected_style_revision: None,
                     project_id: id.into(),
                     expected_revision: current["revision"].as_i64().unwrap(),
                     writes: writes_for(&valid),
@@ -614,6 +650,9 @@ fn native_revision_origin_and_frozen_artifacts_are_immutable() {
     let pending = synthetic_pending(&base);
     service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 2,
             pipeline: pending.clone(),
@@ -630,6 +669,9 @@ fn native_revision_origin_and_frozen_artifacts_are_immutable() {
     assert!(
         service
             .commit_pipeline(PipelineCommitInput {
+                visual_request_id: None,
+                visual_provider: None,
+                expected_style_revision: None,
                 project_id: id.into(),
                 expected_revision: 3,
                 pipeline: forged,
@@ -642,6 +684,9 @@ fn native_revision_origin_and_frozen_artifacts_are_immutable() {
     assert!(
         service
             .commit_pipeline(PipelineCommitInput {
+                visual_request_id: None,
+                visual_provider: None,
+                expected_style_revision: None,
                 project_id: id.into(),
                 expected_revision: 2,
                 pipeline: pending,
@@ -664,6 +709,9 @@ fn revision_upgrade_requires_its_exact_origin_artifact() {
     assert!(
         service
             .commit_pipeline(PipelineCommitInput {
+                visual_request_id: None,
+                visual_provider: None,
+                expected_style_revision: None,
                 project_id: id.into(),
                 expected_revision: 2,
                 pipeline: synthetic_pending(&base),
@@ -687,6 +735,9 @@ fn renaming_v2_changes_display_metadata_without_rewriting_workflow_time_or_origi
     let pending = synthetic_pending(&base);
     service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 2,
             pipeline: pending.clone(),
@@ -713,6 +764,9 @@ fn renaming_v2_changes_display_metadata_without_rewriting_workflow_time_or_origi
     let (confirmed, writes) = synthetic_confirmed(&renamed);
     service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 3,
             pipeline: confirmed,
@@ -753,6 +807,9 @@ fn revision_confirm_rolls_back_new_files_when_a_later_write_fails_then_restarts_
     let pending = synthetic_pending(&base);
     service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 2,
             pipeline: pending.clone(),
@@ -764,6 +821,9 @@ fn revision_confirm_rolls_back_new_files_when_a_later_write_fails_then_restarts_
     std::fs::write(&conflict, b"existing file must survive").unwrap();
     assert!(service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 3,
             pipeline: confirmed.clone(),
@@ -798,6 +858,9 @@ fn revision_confirm_rolls_back_new_files_when_a_later_write_fails_then_restarts_
     .unwrap();
     service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 3,
             pipeline: confirmed.clone(),
@@ -831,6 +894,9 @@ fn revision_confirm_rolls_back_new_files_when_a_later_write_fails_then_restarts_
     );
     assert!(reopened
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 4,
             pipeline: next,
@@ -866,6 +932,9 @@ fn rejected_pipeline_commit_does_not_leave_new_artifacts() {
     };
     assert!(service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: id.into(),
             expected_revision: 2,
             pipeline: invalid,
@@ -1059,6 +1128,9 @@ fn rust_owns_source_and_worker_write_intents_and_restores_the_complete_pipeline(
         }]);
         committed = service
             .commit_pipeline(PipelineCommitInput {
+                visual_request_id: None,
+                visual_provider: None,
+                expected_style_revision: None,
                 project_id: project_id.clone(),
                 expected_revision: 2,
                 pipeline,
@@ -1076,6 +1148,9 @@ fn rust_owns_source_and_worker_write_intents_and_restores_the_complete_pipeline(
             })
             .expect("pipeline and artifacts committed");
         let stale = service.commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: project_id.clone(),
             expected_revision: 2,
             pipeline: committed.clone(),
@@ -1156,6 +1231,9 @@ fn rust_accepts_only_the_conservative_prompt_context_transition_shape() {
     }]);
     service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: project.id.clone(),
             expected_revision: 1,
             pipeline: valid.clone(),
@@ -1180,6 +1258,9 @@ fn rust_accepts_only_the_conservative_prompt_context_transition_shape() {
     let artifact_path = workspace.join(&project.id).join("outline/forged.json");
     let error = service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: project.id.clone(),
             expected_revision: 2,
             pipeline: forged,
@@ -1222,6 +1303,9 @@ fn rust_rejects_prompt_context_updates_after_the_outline_is_frozen() {
     frozen["project"]["updatedAt"] = "one".into();
     service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: project.id.clone(),
             expected_revision: 1,
             pipeline: frozen.clone(),
@@ -1242,6 +1326,9 @@ fn rust_rejects_prompt_context_updates_after_the_outline_is_frozen() {
     }]);
     let error = service
         .commit_pipeline(PipelineCommitInput {
+            visual_request_id: None,
+            visual_provider: None,
+            expected_style_revision: None,
             project_id: project.id.clone(),
             expected_revision: 2,
             pipeline: next,

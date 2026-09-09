@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 
 pub struct Database {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +275,24 @@ impl Database {
         let slides_json = serde_json::to_string(&mutation.slide_statuses)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let transaction = self.connection.unchecked_transaction()?;
+        if let Some(project) = self.get_project(id)? {
+            let style = crate::visual_style::load_style(&transaction, &project)
+                .map_err(|e| invalid_parameter(&e))?;
+            let newly_approved = mutation
+                .slide_statuses
+                .iter()
+                .zip(&project.slide_statuses)
+                .any(|(new, old)| new == "approved" && old != "approved");
+            if newly_approved && style.profile.is_some() {
+                return Err(invalid_parameter(
+                    "Styled projects require validated visual candidate approval",
+                ));
+            }
+            if newly_approved || style.locked {
+                crate::visual_style::lock_style(&transaction, id)
+                    .map_err(|e| invalid_parameter(&e))?;
+            }
+        }
         let changed = transaction.execute(
             "UPDATE projects SET workflow_status = ?2, progress = ?3,
              selected_slide = ?4, slide_statuses_json = ?5, export_ready = ?6,
@@ -383,6 +401,26 @@ impl Database {
         artifacts: &[PersistedArtifact],
         commit_artifacts: impl FnOnce() -> std::result::Result<(), String>,
     ) -> Result<bool> {
+        self.replace_pipeline_with_visual_artifacts(
+            project_id,
+            expected_revision,
+            pipeline,
+            artifacts,
+            crate::visual_style::VisualCommitContext::default(),
+            commit_artifacts,
+        )
+    }
+
+    pub fn replace_pipeline_with_visual_artifacts(
+        &self,
+        project_id: &str,
+        expected_revision: i64,
+        pipeline: &serde_json::Value,
+        artifacts: &[PersistedArtifact],
+        visual: crate::visual_style::VisualCommitContext<'_>,
+        commit_artifacts: impl FnOnce() -> std::result::Result<(), String>,
+    ) -> Result<bool> {
+        let transaction = self.connection.unchecked_transaction()?;
         let revision = json_i64(pipeline, "/revision")?;
         if revision != expected_revision + 1 {
             return Err(invalid_parameter(
@@ -431,7 +469,17 @@ impl Database {
         let slides_json = serde_json::to_string(&slide_statuses)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
 
-        let transaction = self.connection.unchecked_transaction()?;
+        let project = self
+            .get_project(project_id)?
+            .ok_or_else(|| invalid_parameter("Unknown project"))?;
+        crate::visual_style::guard_visual_commit(
+            &transaction,
+            &project,
+            pipeline,
+            artifacts,
+            visual,
+        )
+        .map_err(|error| invalid_parameter(&error))?;
         transaction.execute(
             "UPDATE projects SET workflow_status=?2, progress=?3, selected_slide=?4,
              slide_statuses_json=?5, export_ready=?6, slide_notice=?7, updated_at=?8,
@@ -689,11 +737,30 @@ impl Database {
 
     pub fn decide_approval(&self, id: &str, status: &str, decided_at: &str) -> Result<bool> {
         validate_decision(status, "approval")?;
-        Ok(self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        if status == "approved" {
+            let project_id: Option<String> = transaction.query_row("SELECT project_id FROM approvals WHERE id=?1 AND status='pending' AND stage='visual_review'", [id], |r| r.get(0)).optional()?;
+            if let Some(project_id) = project_id {
+                if let Some(project) = self.get_project(&project_id)? {
+                    let style = crate::visual_style::load_style(&transaction, &project)
+                        .map_err(|e| invalid_parameter(&e))?;
+                    if style.profile.is_some() {
+                        return Err(invalid_parameter(
+                            "Styled projects require validated visual candidate approval",
+                        ));
+                    }
+                    crate::visual_style::lock_style(&transaction, &project_id)
+                        .map_err(|e| invalid_parameter(&e))?;
+                }
+            }
+        }
+        let changed = transaction.execute(
             "UPDATE approvals SET status = ?2, decided_at = ?3
              WHERE id = ?1 AND status = 'pending'",
             params![id, status, decided_at],
-        )? == 1)
+        )? == 1;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     fn approved_memory_snapshot(&self) -> Result<Vec<PreferenceSnapshot>> {
@@ -761,6 +828,18 @@ impl Database {
                 slide_statuses_json TEXT NOT NULL, export_ready INTEGER NOT NULL,
                 created_at TEXT NOT NULL, pipeline_json TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY(project_id, sequence)
+            );
+            CREATE TABLE IF NOT EXISTS visual_style_versions (
+                project_id TEXT NOT NULL REFERENCES projects(id), revision INTEGER NOT NULL CHECK(revision > 0),
+                profile_json TEXT NOT NULL CHECK(length(profile_json) <= 32768), created_at TEXT NOT NULL,
+                PRIMARY KEY(project_id, revision)
+            );
+            CREATE TABLE IF NOT EXISTS visual_style_locks (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id), created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS visual_generation_records (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+                record_json TEXT NOT NULL CHECK(length(record_json) <= 524288)
             );
             ",
         )?;

@@ -1,5 +1,61 @@
+use crate::visual_style::{
+    SaveVisualStyleInput, VisualGenerationRecord, VisualGenerationRequest, VisualStyleState,
+};
 use serde::Serialize;
 use tauri::State;
+
+#[tauri::command]
+pub fn ppt_load_visual_style(
+    state: State<'_, WorkbenchService>,
+    project_id: String,
+) -> Result<VisualStyleState, String> {
+    ppt_load_visual_style_service(&state, project_id)
+}
+pub fn ppt_load_visual_style_service(
+    service: &WorkbenchService,
+    project_id: String,
+) -> Result<VisualStyleState, String> {
+    service.load_visual_style(&project_id)
+}
+#[tauri::command]
+pub fn ppt_save_visual_style(
+    state: State<'_, WorkbenchService>,
+    input: SaveVisualStyleInput,
+) -> Result<VisualStyleState, String> {
+    ppt_save_visual_style_service(&state, input)
+}
+pub fn ppt_save_visual_style_service(
+    service: &WorkbenchService,
+    input: SaveVisualStyleInput,
+) -> Result<VisualStyleState, String> {
+    service.save_visual_style(input)
+}
+#[tauri::command]
+pub fn ppt_begin_visual_request(
+    state: State<'_, WorkbenchService>,
+    input: VisualGenerationRequest,
+) -> Result<VisualGenerationRecord, String> {
+    ppt_begin_visual_request_service(&state, input)
+}
+pub fn ppt_begin_visual_request_service(
+    service: &WorkbenchService,
+    input: VisualGenerationRequest,
+) -> Result<VisualGenerationRecord, String> {
+    service.begin_visual_request(input)
+}
+#[tauri::command]
+pub fn ppt_visual_records(
+    state: State<'_, WorkbenchService>,
+    project_id: String,
+) -> Result<Vec<VisualGenerationRecord>, String> {
+    ppt_visual_records_service(&state, project_id)
+}
+pub fn ppt_visual_records_service(
+    service: &WorkbenchService,
+    project_id: String,
+) -> Result<Vec<VisualGenerationRecord>, String> {
+    service.visual_records(&project_id)
+}
 
 use crate::workbench::{
     ApprovalResult, AttachSourceInput, CreateProjectInput, DesktopInitialState,

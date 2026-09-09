@@ -7,8 +7,10 @@ use std::{
 use digital_twin_desktop_lib::{
     tauri_workbench::{
         load_desktop_state_service, memory_propose_service, ppt_attach_source_service,
-        ppt_commit_pipeline_service, ppt_create_project_service, ppt_load_pipeline_service,
-        ppt_prepare_qa_service, ppt_project_directory_service, ppt_read_artifact_service,
+        ppt_begin_visual_request_service, ppt_commit_pipeline_service, ppt_create_project_service,
+        ppt_load_pipeline_service, ppt_load_visual_style_service, ppt_prepare_qa_service,
+        ppt_project_directory_service, ppt_read_artifact_service, ppt_save_visual_style_service,
+        ppt_visual_records_service,
     },
     workbench::{AttachSourceInput, PipelineCommitInput, WorkbenchService},
 };
@@ -97,6 +99,22 @@ fn dispatch(
             serialize(ppt_create_project_service(service, decode_input(&args)?)?)
         }
         "ppt_load_pipeline" => ppt_load_pipeline_service(service, string_arg(&args, "projectId")?),
+        "ppt_load_visual_style" => serialize(ppt_load_visual_style_service(
+            service,
+            string_arg(&args, "projectId")?,
+        )?),
+        "ppt_save_visual_style" => serialize(ppt_save_visual_style_service(
+            service,
+            decode_input(&args)?,
+        )?),
+        "ppt_begin_visual_request" => serialize(ppt_begin_visual_request_service(
+            service,
+            decode_input(&args)?,
+        )?),
+        "ppt_visual_records" => serialize(ppt_visual_records_service(
+            service,
+            string_arg(&args, "projectId")?,
+        )?),
         "ppt_project_directory" => serialize(ppt_project_directory_service(
             service,
             string_arg(&args, "projectId")?,

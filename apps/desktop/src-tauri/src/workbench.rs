@@ -86,6 +86,9 @@ pub struct PipelineCommitInput {
     pub expected_revision: i64,
     pub pipeline: Value,
     pub writes: Vec<ArtifactWriteInput>,
+    pub visual_request_id: Option<String>,
+    pub visual_provider: Option<crate::visual_style::VisualProvider>,
+    pub expected_style_revision: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -689,6 +692,7 @@ impl WorkbenchService {
             input.expected_revision,
             !input.writes.is_empty(),
         )?;
+        crate::visual_style::validate_visual_writes(&input.pipeline, &input.writes)?;
         let mut artifacts = Vec::with_capacity(input.writes.len());
         let mut validated_writes = Vec::with_capacity(input.writes.len());
         let mut write_paths = std::collections::HashSet::new();
@@ -700,6 +704,11 @@ impl WorkbenchService {
                 );
             }
             validate_worker_relative_path(&write.relative_path)?;
+            if write.relative_path.starts_with("visuals/style-templates/") {
+                return Err(
+                    "Template assets can only be saved through visual style confirmation".into(),
+                );
+            }
             if !write_paths.insert(write.relative_path.clone()) {
                 return Err("Duplicate artifact write path".into());
             }
@@ -730,14 +739,22 @@ impl WorkbenchService {
         }
         let mut new_artifacts = Vec::new();
         if !database
-            .replace_pipeline_with_artifacts(
+            .replace_pipeline_with_visual_artifacts(
                 &input.project_id,
                 input.expected_revision,
                 &input.pipeline,
                 &artifacts,
+                crate::visual_style::VisualCommitContext {
+                    request_id: input.visual_request_id.as_deref(),
+                    provider: input.visual_provider.as_ref(),
+                    expected_style_revision: input.expected_style_revision,
+                },
                 || {
                     for (path, bytes) in &validated_writes {
-                        if input.pipeline["schemaVersion"] == 2 {
+                        if input.pipeline["schemaVersion"] == 2
+                            || input.visual_request_id.is_some()
+                            || path.starts_with(Path::new(&input.project_id).join("visuals"))
+                        {
                             new_artifacts
                                 .push(write_new_workspace_artifact(&workspace, path, bytes)?);
                         } else {
@@ -1055,13 +1072,13 @@ impl WorkbenchService {
         }
     }
 
-    fn database(&self) -> Result<std::sync::MutexGuard<'_, Database>, String> {
+    pub(crate) fn database(&self) -> Result<std::sync::MutexGuard<'_, Database>, String> {
         self.database
             .lock()
             .map_err(|_| "Database state lock poisoned".to_string())
     }
 
-    fn workspace(&self) -> Result<PathBuf, String> {
+    pub(crate) fn workspace(&self) -> Result<PathBuf, String> {
         self.workspace_root
             .lock()
             .map(|path| path.clone())
@@ -1148,7 +1165,7 @@ fn next_identifier(prefix: &str) -> String {
     )
 }
 
-fn now_string() -> String {
+pub(crate) fn now_string() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| format!("unix:{}", duration.as_millis()))

@@ -91,7 +91,7 @@ describe('complete-slide visual prompt contract', () => {
     );
   });
 
-  it('keeps literal concept-diagram labels and data in the visual brief authoritative', () => {
+  it('allows consistent supplementary brief copy without overriding structured values', () => {
     const visualBrief = 'Draw nodes labelled “经营韧性” and “现金流 00128”; use a text-free blue background.';
     const prompt = buildPageVisualPrompt({
       slideId: spec.id,
@@ -104,7 +104,9 @@ describe('complete-slide visual prompt contract', () => {
 
     expect(payload.visualBrief).toBe(visualBrief);
     expect(payload.approvedSlideSpec).not.toHaveProperty('imageGenerationBrief');
-    expect(prompt).toContain('Literal labels, narrative copy, and data in visualBrief are approved content');
+    expect(prompt).toContain('Structured approvedSlideSpec values take precedence');
+    expect(prompt).toContain('may render only when consistent with approvedSlideSpec');
+    expect(prompt).toContain('must never override, change, or contradict a structured value');
     expect(prompt).toContain('Aesthetic, color, no-text, text-free, and background-only directions in visualBrief are lower-priority');
   });
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { goldenOutline, goldenSlideSpecs, goldenSourceAnalysis } from './golden-project.js';
 import { parseNativePipelineAction } from './native-pipeline.js';
-import { normalizeGeneratedSlideSpecs } from './slide-spec-contract.js';
+import { DETAIL_SPEC_CONTRACT, normalizeGeneratedSlideSpecs } from './slide-spec-contract.js';
 
 describe('generated slide detail compatibility boundary', () => {
   const normalize = (raw: unknown) => normalizeGeneratedSlideSpecs(raw, goldenOutline(), goldenSourceAnalysis());
@@ -46,5 +46,14 @@ describe('generated slide detail compatibility boundary', () => {
   it('rejects missing and reordered pages instead of silently pairing by index', () => {
     expect(() => normalize(goldenSlideSpecs().slice(1))).toThrow(/页数/);
     expect(() => normalize([...goldenSlideSpecs()].reverse())).toThrow(/第 1 页.*id/);
+  });
+});
+
+describe('complete-slide detail generation contract', () => {
+  it('asks for a finished page brief that includes approved copy and data', () => {
+    expect(DETAIL_SPEC_CONTRACT).toContain('完整成品页');
+    expect(DETAIL_SPEC_CONTRACT).toContain('标题、正文、表格、图表');
+    expect(DETAIL_SPEC_CONTRACT).toContain('纯背景');
+    expect(DETAIL_SPEC_CONTRACT).toContain('无文字');
   });
 });

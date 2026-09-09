@@ -11,6 +11,7 @@ import {
   type NativePptPipeline,
   type NativePreferenceSnapshot,
 } from './native-pipeline.js';
+import { inspectTemplateStyle } from './template-style.js';
 
 export const WORKER_RPC_PROTOCOL_VERSION = 1;
 export const WORKER_NAME = 'digital-twin-workflow-worker';
@@ -155,6 +156,21 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
         requireString(input.projectId, 'projectId'),
         action,
       );
+    }
+    case 'ppt.template.inspect': {
+      const input = requireRecord(params);
+      if (Object.keys(input).length !== 1 || !('contentsBase64' in input)) {
+        throw new InvalidParams('Template inspection requires only contentsBase64');
+      }
+      try {
+        return await inspectTemplateStyle(
+          requireString(input.contentsBase64, 'contentsBase64'),
+        );
+      } catch (error) {
+        throw new InvalidParams(
+          error instanceof Error ? error.message : 'Template PPTX is invalid',
+        );
+      }
     }
     case 'test.crash':
       if (process.env.DIGITAL_TWIN_SIDECAR_TEST_MODE !== '1') {

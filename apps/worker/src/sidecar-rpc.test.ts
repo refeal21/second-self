@@ -1,3 +1,4 @@
+import JSZip from 'jszip';
 import { describe, expect, it } from 'vitest';
 import { handleWorkerRpcLine } from './sidecar-rpc.js';
 
@@ -96,6 +97,51 @@ describe('worker sidecar JSON-RPC boundary', () => {
           billedApiFallback: false,
         },
       },
+    });
+  });
+
+  it('inspects an in-memory PPTX palette through the template RPC', async () => {
+    const zip = new JSZip();
+    zip.file('ppt/presentation.xml', `
+      <p:presentation xmlns:p="urn:p" xmlns:r="urn:r">
+        <p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>
+      </p:presentation>`);
+    zip.file('ppt/_rels/presentation.xml.rels', `
+      <Relationships><Relationship Id="rId1" Type="urn/slide" Target="slides/slide1.xml"/></Relationships>`);
+    zip.file('ppt/slides/slide1.xml', `
+      <p:sld xmlns:p="urn:p" xmlns:a="urn:a"><p:cSld><p:spTree><p:sp><p:spPr>
+        <a:solidFill><a:srgbClr val="112233"/></a:solidFill>
+      </p:spPr></p:sp></p:spTree></p:cSld></p:sld>`);
+    const contentsBase64 = await zip.generateAsync({ type: 'base64' });
+
+    const response = await handleWorkerRpcLine(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 42,
+      method: 'ppt.template.inspect',
+      params: { contentsBase64 },
+    }));
+
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 42,
+      result: {
+        colors: [{ color: '#112233', count: 1 }],
+        slideCount: 1,
+        warnings: [expect.stringMatching(/confirm/i)],
+      },
+    });
+  });
+
+  it('returns invalid params for malformed template inspection input', async () => {
+    const response = await handleWorkerRpcLine(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 43,
+      method: 'ppt.template.inspect',
+      params: { contentsBase64: 'not-base64' },
+    }));
+
+    expect(JSON.parse(response!)).toMatchObject({
+      id: 43,
+      error: { code: -32602, message: expect.stringMatching(/PPTX|base64/i) },
     });
   });
 

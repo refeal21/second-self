@@ -137,9 +137,29 @@ describe('Codex native image turn', () => {
     await expect(Promise.race([generated.then(() => 'resolved'), Promise.resolve('pending')])).resolves.toBe('pending');
     transport.complete();
 
-    await expect(generated).resolves.toEqual({ imageBase64: IMAGE_BASE64 });
+    await expect(generated).resolves.toEqual({
+      imageBase64: IMAGE_BASE64,
+      provider: {
+        threadId: 'thread-image',
+        turnId: 'turn-image',
+        itemId: 'image-1',
+      },
+    });
     expect(progress.length).toBeGreaterThan(1);
     expect(transport.operationListenerCount).toBe(0);
+  });
+
+  it('omits provider itemId when the provider did not return one', async () => {
+    const { transport, runner } = setup();
+    const generated = runner.generate({ cwd: '/project', prompt: 'native ImageGen only' });
+    await started(transport, generated);
+    transport.image(IMAGE_BASE64, { id: undefined });
+    transport.complete();
+
+    await expect(generated).resolves.toEqual({
+      imageBase64: IMAGE_BASE64,
+      provider: { threadId: 'thread-image', turnId: 'turn-image' },
+    });
   });
 
   it('buffers matching notifications emitted before the turn/start response', async () => {
@@ -151,7 +171,7 @@ describe('Codex native image turn', () => {
     });
 
     await expect(runner.generate({ cwd: '/project', prompt: 'native ImageGen only' }))
-      .resolves.toEqual({ imageBase64: IMAGE_BASE64 });
+      .resolves.toMatchObject({ imageBase64: IMAGE_BASE64 });
     expect(transport.operationListenerCount).toBe(0);
   });
 
@@ -176,7 +196,7 @@ describe('Codex native image turn', () => {
     });
 
     await expect(runner.generate({ cwd: '/project', prompt: 'native ImageGen only' }))
-      .resolves.toEqual({ imageBase64: IMAGE_BASE64 });
+      .resolves.toMatchObject({ imageBase64: IMAGE_BASE64 });
     expect(transport.operationListenerCount).toBe(0);
   });
 
@@ -194,7 +214,7 @@ describe('Codex native image turn', () => {
     transport.image();
     transport.complete();
 
-    await expect(generated).resolves.toEqual({ imageBase64: IMAGE_BASE64 });
+    await expect(generated).resolves.toMatchObject({ imageBase64: IMAGE_BASE64 });
   });
 
   it('rejects quota exhaustion without returning its image payload', async () => {
@@ -256,7 +276,7 @@ describe('Codex native image turn', () => {
     await started(transport, generated);
     transport.image(imageBase64);
     transport.complete();
-    await expect(generated).resolves.toEqual({ imageBase64 });
+    await expect(generated).resolves.toMatchObject({ imageBase64 });
   });
 
   it('rejects an app-server exit and cleans operation listeners', async () => {

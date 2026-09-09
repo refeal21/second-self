@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@digital-twin/core": "workspace:*",
+    "fast-xml-parser": "5.11.1",
     "jszip": "3.10.1",
     "pngjs": "7.0.0",
     "pptxgenjs": "4.0.1"

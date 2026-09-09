@@ -8,6 +8,7 @@ export const DETAIL_SPEC_CONTRACT = [
   'shapes 仅用于已确定坐标的基础可编辑形状：{id:string,type:"rect"|"ellipse"|"line",x:number,y:number,w:number,h:number,fill?:string,line?:string,text?:string}；坐标和尺寸为非负英寸，16:9 画布 13.333×7.5。',
   '流程图、架构图、层级图等概念构图的节点、连线、布局与文字写入 imageGenerationBrief，不要将 flowDiagram 等概念类型放进 shapes，也不要虚构坐标；无基础形状时 shapes:[]。',
   'sourceMap 每项仅包含 {sourceId:string,title:string,locator:string,url?:string}；sourceId 和来源标题来自当前分析。来源补充解释写入 imageGenerationBrief。',
+  'imageGenerationBrief 必须描述可直接审核的 16:9 完整成品页构图，并说明如何清晰呈现本页已批准的标题、正文、表格、图表及概念图文字；不得要求仅生成纯背景、无文字底图或省略任何已批准内容。',
   '所有页面与对象 id 必须唯一；不需要的集合填 []，不要缺字段、不要增加未定义字段。',
 ].join('\n');
 

@@ -11,6 +11,11 @@ export interface CodexImageTurnRequest {
 
 export interface CodexImageTurnResult {
   imageBase64: string;
+  provider?: {
+    threadId?: string;
+    turnId?: string;
+    itemId?: string;
+  };
 }
 
 export interface CodexImageTurnOptions {
@@ -106,8 +111,16 @@ export class CodexImageTurnRunner {
       if (images.length === 0) throw new Error('Codex 原生 ImageGen 未返回图片，项目未更改。(did not return an image)');
       if (images.length !== 1) throw new Error('Codex 原生 ImageGen 返回了多张图片，项目未更改。(multiple images)');
       const imageBase64 = validateImageItem(images[0], this.maxImageBytes);
+      const image = record(images[0]);
+      const provider: NonNullable<CodexImageTurnResult['provider']> = {
+        threadId,
+        turnId,
+      };
+      if (typeof image?.id === 'string' && image.id.length > 0) {
+        provider.itemId = image.id;
+      }
       progress(request, 'ImageGen 已返回视觉候选。');
-      return { imageBase64 };
+      return { imageBase64, provider };
     })();
 
     return Promise.race([operation, timeout]).finally(() => {

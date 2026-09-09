@@ -25,6 +25,7 @@ export async function detailTestHarness() {
   const commits: number[] = [];
   const actions: NativePipelineAction[] = [];
   const worker: WorkflowWorkerGateway = {
+    inspectTemplateStyle: async () => { throw new Error('No template inspection in edit tests'); },
     health: async () => ({ protocolVersion: 1, worker: 'digital-twin-workflow-worker', status: 'ready' }),
     createProject: async () => { throw new Error('No project creation in edit tests'); },
     restoreProject: (value) => runtime.restore(value),
@@ -37,6 +38,8 @@ export async function detailTestHarness() {
     onLine: () => () => {}, onExit: () => () => {},
   };
   const adapter = createTauriDesktopAdapter(transport, async (command, args) => {
+    if (command === 'ppt_load_visual_style') return { revision: 0, profile: null, locked: false };
+    if (command === 'ppt_visual_records') return [];
     if (command === 'ppt_load_pipeline') {
       if (controls.failLoad) throw new Error('暂时无法读取检查点');
       return structuredClone(stored);

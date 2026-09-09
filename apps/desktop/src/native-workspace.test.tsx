@@ -334,6 +334,9 @@ describe('native PPT QA workspace', () => {
       naturalHeight: { value: 720, configurable: true },
     });
     fireEvent.load(preview);
+    expect(approve).toBeDisabled();
+    fireEvent.click(screen.getByRole('checkbox', { name: '标题、正文和数据完整，且与已批准细化一致' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: '排版无裁切，配色符合本项目要求' }));
     expect(approve).toBeEnabled();
 
     await user.type(screen.getByRole('textbox', { name: '修改意见' }), '减少装饰，突出数据');
@@ -363,6 +366,23 @@ describe('native PPT QA workspace', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('无法加载当前 PNG');
   });
 
+  it('requires saving palette edits before uploading a replacement image', async () => {
+    const user = userEvent.setup();
+    const initial = visualPipeline();
+    const adapter = {
+      ...createDemoDesktopAdapter(), mode: 'tauri' as const,
+      loadProjectPipeline: vi.fn(async () => initial),
+      readProjectVisual: vi.fn(async () => 'data:image/png;base64,preview'),
+    } satisfies DesktopAdapter;
+    render(<NativeWorkspacePage adapter={adapter} projectId={initial.project.id}
+      projectName={initial.project.name} projectGoal={initial.project.goal} onBack={() => {}} />);
+    await user.click(await screen.findByText('项目配色与模板参考'));
+    const primary = screen.getByRole('textbox', { name: '主色' });
+    await user.clear(primary);
+    await user.type(primary, '#123456');
+    expect(screen.getByLabelText('上传替换 PNG')).toBeDisabled();
+  });
+
   it('exposes reopen for an approved page after sequential visual approval', async () => {
     const user = userEvent.setup();
     const initial = visualPipeline('conversion');
@@ -381,7 +401,7 @@ describe('native PPT QA workspace', () => {
 
     await user.click(await screen.findByRole('button', { name: '重新打开第 1 页' }));
     expect(reopenVisual).toHaveBeenCalledWith(initial.project.id, 'slide-cover');
-    expect(await screen.findByText(/5\. 逐页视觉/)).toBeInTheDocument();
+    expect(await screen.findByText(/5\. 整页 PPT 审核/)).toBeInTheDocument();
   });
 
   it('treats a reopened zero-byte placeholder as waiting for a new visual candidate', async () => {
@@ -476,7 +496,7 @@ describe('native PPT QA workspace', () => {
     await user.click(screen.getByRole('button', { name: '批准全部细化' }));
     expect(h.getStored().slideSpecs!.version.status).toBe('frozen');
     expect(h.commits).toEqual([5, 6]);
-    expect(await screen.findByText(/5\. 逐页视觉/)).toBeInTheDocument();
+    expect(await screen.findByText(/5\. 整页 PPT 审核/)).toBeInTheDocument();
     expect(screen.getByLabelText('第 1 页正文第 1 段')).not.toBeVisible();
     fireEvent.click(screen.getByText('已批准细化（只读）', { selector: 'summary' }));
     expect(screen.getByRole('textbox', { name: '第 1 页正文第 1 段' })).toHaveAttribute('readonly');

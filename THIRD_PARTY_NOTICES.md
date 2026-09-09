@@ -11,7 +11,8 @@ The application links, bundles, or uses the following principal third-party comp
 | React / React DOM | Desktop WebView UI | MIT |
 | PptxGenJS | Editable PPTX generation | MIT |
 | pngjs | Deterministic PNG fixtures and image checks | MIT |
-| JSZip | OOXML test inspection | MIT OR GPL-3.0-or-later; used under MIT |
+| JSZip | Local OOXML template and test inspection | MIT OR GPL-3.0-or-later; used under MIT |
+| fast-xml-parser 5.11.1 | Bounded local PPTX palette XML inspection | MIT |
 | SQLite / rusqlite | Local state store | SQLite public-domain dedication; rusqlite MIT |
 | serde / serde_json | Rust serialization | Apache-2.0 OR MIT |
 | Vite, Vitest, TypeScript, tsx, esbuild | Development, testing and build tooling | MIT |
@@ -27,11 +28,20 @@ Upstream license texts:
 - PptxGenJS: <https://github.com/gitbrent/PptxGenJS/blob/master/LICENSE>
 - pngjs: <https://github.com/pngjs/pngjs/blob/master/LICENSE>
 - JSZip: <https://github.com/Stuk/jszip/blob/main/LICENSE.markdown>
+- fast-xml-parser: <https://github.com/NaturalIntelligence/fast-xml-parser/blob/master/LICENSE>
 - rusqlite: <https://github.com/rusqlite/rusqlite/blob/master/LICENSE>
 - serde: <https://github.com/serde-rs/serde/tree/master#license>
 - LibreOffice: <https://www.libreoffice.org/about-us/licenses>
 
 ## MIT license text
+
+The XML inspection dependency and its bundled MIT-licensed dependency distributions carry these notices (the MIT permission and disclaimer below apply to each):
+
+- fast-xml-parser 5.11.1: Copyright (c) 2017 Amit Kumar Gupta.
+- fast-xml-builder 1.3.1, is-unsafe 2.0.2, xml-naming 0.3.0: Copyright (c) 2026 Natural Intelligence.
+- strnum 2.4.2: Copyright (c) 2021 Natural Intelligence.
+- path-expression-matcher 1.6.2: Copyright (c) 2024 (as supplied in its LICENSE).
+- @nodable/entities 3.0.0: Copyright (c) 2026 Nodable. Its package declares MIT; the upstream [val-parsers license](https://github.com/nodable/val-parsers/blob/main/LICENSE) supplies the copyright notice omitted from the npm archive.
 
 Copyright (c) the respective copyright holders.
 

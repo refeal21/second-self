@@ -1,5 +1,6 @@
 import type { NativePptPipeline, NativePromptContext } from '../../worker/src/native-pipeline.js';
 import { DETAIL_SPEC_CONTRACT } from '../../worker/src/slide-spec-contract.js';
+import type { VisualStyleState } from '../../worker/src/visual-style.js';
 
 export type PptPromptStage = 'analysis' | 'outline' | 'details';
 
@@ -22,7 +23,7 @@ export function promptContextError(pipeline: NativePptPipeline, context: NativeP
 }
 
 /** The preview and the real model request share this builder. No browser-only prompt copy. */
-export function buildPptPrompt(pipeline: NativePptPipeline, stage: PptPromptStage): string {
+export function buildPptPrompt(pipeline: NativePptPipeline, stage: PptPromptStage, style?: VisualStyleState): string {
   const context = getPromptContext(pipeline);
   const input = {
     project: { name: pipeline.project.name, goal: pipeline.project.goal },
@@ -35,7 +36,8 @@ export function buildPptPrompt(pipeline: NativePptPipeline, stage: PptPromptStag
       outlineRequirements: context.outlineRequirements,
       currentAnalysis: pipeline.analysis?.artifactRelativePath ?? null,
     } : {}),
-    ...(stage === 'details' ? { approvedOutline: pipeline.outline?.value ?? null } : {}),
+    ...(stage === 'details' ? { approvedOutline: pipeline.outline?.value ?? null,
+      confirmedVisualStyle: style?.profile ? style : null } : {}),
     approvedPreferences: pipeline.preferenceSnapshot,
   };
   const task = {
@@ -54,6 +56,8 @@ export function buildPptPrompt(pipeline: NativePptPipeline, stage: PptPromptStag
       '只返回严格 JSON 数组，每页：{id,title,body,findingIds,dataPointIds,tables,charts,shapes,sourceMap,imageGenerationBrief}。',
       DETAIL_SPEC_CONTRACT,
       '保持已批准大纲的页序、id、标题和页面目的；补充说明不能覆盖已批准内容。文案和数据必须有 sourceMap。',
+      'imageGenerationBrief 必须描述包含标题、正文、数据图表和布局的整页 PPT，不是无字背景图；不得要求留白后再叠加标题。',
+      'confirmedVisualStyle 仅约束颜色和表达，不是事实来源。若有已确认配色，按标题/图表主色、背景色、文字色、辅助色角色使用，不把整页染成单色；不要沿用旧的科技蓝。没有已确认配色时自行选择合适的商务配色，不固定为蓝色。',
     ],
   }[stage];
   return [

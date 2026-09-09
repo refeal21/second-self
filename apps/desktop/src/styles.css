@@ -2046,6 +2046,16 @@ textarea::placeholder {
 .native-workspace > .workspace-header {
   flex-shrink: 0;
 }
+.native-workspace > .app-notice {
+  position: static;
+  flex-shrink: 0;
+  align-self: stretch;
+  max-width: none;
+  max-height: 120px;
+  overflow-y: auto;
+  margin: 8px 16px;
+  box-shadow: none;
+}
 .native-workspace > .workspace-layout {
   flex: 1;
   height: auto;
@@ -2324,6 +2334,20 @@ textarea::placeholder {
   width: 100%;
   resize: vertical;
 }
+
+.native-visual-checks {
+  display: grid;
+  gap: 12px;
+  margin: 20px 0;
+  padding: 16px;
+  border: 1px solid #d8dde8;
+  border-radius: 12px;
+  font-size: 14px;
+}
+.native-visual-checks legend { padding: 0 6px; color: #505b6e; }
+.native-visual-checks label { display: flex; align-items: flex-start; gap: 9px; line-height: 1.6; }
+.native-visual-checks input { width: 16px; height: 16px; flex: 0 0 auto; margin-top: 3px; }
+.native-visual-record { font-size: 14px; color: #505b6e; overflow-wrap: anywhere; }
 
 .approved-visuals {
   display: flex;

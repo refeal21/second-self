@@ -15,6 +15,9 @@ import type { ProjectEdit } from './project-edits.js';
 import { DetailPageIndex } from './detail-editor.js';
 import { NativeDetailReview, useNativeDetailDraft } from './native-detail-review.js';
 import { OutlineEditor, outlineDraftError } from './outline-editor.js';
+import { VisualStylePanel } from './visual-style-panel.js';
+import type { VisualStyleState, VisualGenerationRecord } from '../../worker/src/visual-style.js';
+import { buildPageVisualPrompt } from '../../worker/src/visual-prompt.js';
 import {
   buildPptPrompt,
   getPromptContext,
@@ -51,6 +54,13 @@ export function NativeWorkspacePage({
   const [visualFeedback, setVisualFeedback] = useState('');
   const [previewSrc, setPreviewSrc] = useState('');
   const [previewState, setPreviewState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [style, setStyle] = useState<VisualStyleState | null>(null);
+  const [styleDirty, setStyleDirty] = useState(false);
+  const [visualRecords, setVisualRecords] = useState<VisualGenerationRecord[]>([]);
+  const [styleError, setStyleError] = useState('');
+  const [styleReady, setStyleReady] = useState(false);
+  const [contentReviewed, setContentReviewed] = useState(false);
+  const [layoutReviewed, setLayoutReviewed] = useState(false);
   const [promptContext, setPromptContext] = useState<NativePromptContext>({
     taskBrief: '', sourceInstructions: {}, outlineRequirements: '',
   });
@@ -195,14 +205,31 @@ export function NativeWorkspacePage({
     setVisualFeedback('');
   }, [pipeline?.currentSlideId]);
 
+  useEffect(() => {
+    let active = true;
+    setStyleReady(false);
+    void Promise.all([adapter.loadVisualStyle(projectId), adapter.loadVisualRecords(projectId)])
+      .then(([nextStyle, records]) => {
+        if (!active) return;
+        setStyle(nextStyle); setVisualRecords(records); setStyleReady(true); setStyleError('');
+      }).catch((reason: unknown) => {
+        if (active) setStyleError(`无法恢复项目配色或生成依据：${reason instanceof Error ? reason.message : String(reason)}`);
+      });
+    return () => { active = false; };
+  }, [adapter, projectId, pipeline?.revision, generation?.status]);
+
+  useEffect(() => {
+    setContentReviewed(false); setLayoutReviewed(false);
+  }, [currentVisual?.sha256, currentVisual?.relativePath, style?.revision]);
+
   const outlineDirty = pipeline?.project.workflowStatus === 'outline_review' &&
     outlineDraft !== null && JSON.stringify(outlineDraft) !== savedOutlineKey;
   const promptContextDirty = pipeline !== null &&
     JSON.stringify(normalizePromptContext(pipeline, promptContext)) !==
     JSON.stringify(normalizePromptContext(pipeline, getPromptContext(pipeline)));
   useEffect(() => {
-    onDirtyChange?.(outlineDirty || promptContextDirty || detailState.dirty);
-  }, [onDirtyChange, outlineDirty, promptContextDirty, detailState.dirty]);
+    onDirtyChange?.(outlineDirty || promptContextDirty || detailState.dirty || styleDirty);
+  }, [onDirtyChange, outlineDirty, promptContextDirty, detailState.dirty, styleDirty]);
   useEffect(() => () => { onDirtyChange?.(false); }, [onDirtyChange]);
 
   const attachFiles = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -240,7 +267,10 @@ export function NativeWorkspacePage({
   const visualGenerationRunning = visualGeneration?.status === 'running' && visualGeneration.kind === 'visual';
   const qaBlocked = status === 'blocked' && pipeline.blockedCondition?.resumeStage === 'qa';
   const hasInspectableVisual = Boolean(currentVisual?.relativePath.trim() && currentVisual.byteLength > 0);
-  const canApproveCurrent = hasInspectableVisual && currentVisual?.version.status === 'draft' && previewState === 'ready';
+  const currentRecord = visualRecords.find(({ receipt }) => receipt?.relativePath === currentVisual?.relativePath && receipt?.sha256 === currentVisual?.sha256);
+  const styleMismatch = Boolean(style?.profile && currentVisual && currentRecord?.styleRevision !== style.revision);
+  const canApproveCurrent = hasInspectableVisual && currentVisual?.version.status === 'draft' && previewState === 'ready'
+    && contentReviewed && layoutReviewed && styleReady && !styleMismatch && !styleDirty;
   const savedPromptContext = normalizePromptContext(pipeline, getPromptContext(pipeline));
   const normalizedPromptContext = normalizePromptContext(pipeline, promptContext);
   const outlineValidationError = outlineDraft ? outlineDraftError(outlineDraft) : '尚无可审核的大纲。';
@@ -274,8 +304,8 @@ export function NativeWorkspacePage({
   const backToProjects = () => {
     // App handles sidebar/history navigation too; standalone consumers still
     // get a local guard without displaying a second confirmation in App.
-    if (!onDirtyChange && (promptContextDirty || outlineDirty || detailState.dirty) &&
-      !window.confirm('大纲、逐页细化、结构修订或生成说明尚未保存。返回 PPT 项目将丢弃这些修改，是否继续？')) return;
+    if (!onDirtyChange && (promptContextDirty || outlineDirty || detailState.dirty || styleDirty) &&
+      !window.confirm('大纲、逐页细化、结构修订、配色或生成说明尚未保存。返回 PPT 项目将丢弃这些修改，是否继续？')) return;
     onBack();
   };
 
@@ -335,6 +365,11 @@ export function NativeWorkspacePage({
         </aside>
 
         <section className="canvas-area" aria-label="PPT 阶段内容" tabIndex={0} aria-live="polite">
+          {style && <VisualStylePanel style={style} busy={busy || !styleReady || editUncertain}
+            inspectTemplate={(input) => adapter.inspectTemplateStyle(input)}
+            onSave={(profile, templateBase64) => adapter.saveVisualStyle(projectId, profile, pipeline.revision, style.revision, templateBase64)}
+            onStyleChange={setStyle} onDirtyChange={setStyleDirty} />}
+          {styleError && <p role="alert" className="capability-note">{styleError}</p>}
           <details className="native-prompt-context" open={promptContextExpanded}
             onToggle={(event) => setPromptContextExpanded(event.currentTarget.open)}>
             <summary><strong>项目说明与提示词</strong><span>{status === 'intake' ? '填写并保存本次生成说明' : contextEditable ? '展开可编辑本次说明与大纲要求' : '展开查看已保存说明'}</span></summary>
@@ -382,7 +417,7 @@ export function NativeWorkspacePage({
               {showPromptPreview && <details className="native-prompt-preview">
                 <summary>{promptPreviewLabel(promptStage)}</summary>
                 {promptContextDirty && <p>提示词预览只使用已保存的说明。</p>}
-                <pre data-testid="native-prompt-preview">{buildPptPrompt(pipeline, promptStage)}</pre>
+                <pre data-testid="native-prompt-preview">{buildPptPrompt(pipeline, promptStage, style ?? undefined)}</pre>
               </details>}
             </div>
           </details>
@@ -417,7 +452,7 @@ export function NativeWorkspacePage({
             </details>}
           {status === 'detail_review' && !pipeline.slideSpecs && <StageCard title="4. 生成全部页面细化">
             <p>已批准大纲不会被后续操作覆盖。</p>
-            <button className="button button-primary" disabled={busy} onClick={() => void update(() => adapter.generateDetails(projectId), '全部页面细化已生成。')}>{generationActionLabel('details', generation, '生成逐页细化')}</button>
+            <button className="button button-primary" disabled={busy || styleDirty || !styleReady} onClick={() => void update(() => adapter.generateDetails(projectId), '全部页面细化已生成。')}>{generationActionLabel('details', generation, '生成逐页细化')}</button>
           </StageCard>}
           {status === 'detail_review' && pipeline.slideSpecs && <NativeDetailReview pipeline={pipeline} adapter={adapter} state={detailState}
             busy={busy || editUncertain} promptContextDirty={promptContextDirty} run={update} onReload={applyPipeline} />}
@@ -426,13 +461,14 @@ export function NativeWorkspacePage({
             <NativeDetailReview pipeline={pipeline} adapter={adapter} state={detailState}
               busy={busy || editUncertain} promptContextDirty={promptContextDirty} run={update} onReload={applyPipeline} />
           </details>}
-          {(status === 'visual_review' || visualBlocked) && <StageCard title={`5. 逐页视觉·${currentSpec?.title ?? pipeline.currentSlideId}`}>
+          {(status === 'visual_review' || visualBlocked) && <StageCard title={`5. 整页 PPT 审核·${currentSpec?.title ?? pipeline.currentSlideId}`}>
             {!hasInspectableVisual && !visualGenerationRunning && <p className="native-outline-save-state">
               当前阶段正在等待生成视觉候选。批准前必须检查完整的 PNG；仅有提示词或任务完成状态不能批准。
             </p>}
             {currentSpec?.imageGenerationBrief && <details className="native-prompt-preview native-visual-prompt">
               <summary>查看完整技术提示词</summary>
-              <pre>{currentSpec.imageGenerationBrief}</pre>
+              <p>下次请求预览：整页包含已批准标题、正文和图表；不是仅生成背景。修改意见只能调整排版与风格。</p>
+              <pre>{buildPageVisualPrompt({ slideId: currentSpec.id, spec: currentSpec, style: style ?? undefined }, visualFeedback)}</pre>
             </details>}
             {pipeline.blockedCondition && <p className="capability-note">{pipeline.blockedCondition.message}不会切换到收费 API。</p>}
             {currentVisual?.relativePath && <dl><dt>当前候选</dt><dd>{currentVisual.relativePath}</dd><dt>SHA-256</dt><dd>{currentVisual.sha256}</dd></dl>}
@@ -449,21 +485,38 @@ export function NativeWorkspacePage({
               <figcaption>{previewState === 'loading' ? '正在安全读取完整 PNG…' : '完整 PNG 预览（16:9）'}</figcaption>
             </figure>}
             {currentVisual && !previewSrc && previewState === 'loading' && <p role="status">正在安全读取完整 PNG…</p>}
+            {currentVisual && styleReady && <section className="native-visual-record" aria-label="本页生成依据">
+              {currentRecord ? <>
+                <p>{currentRecord.kind === 'upload' ? '手动上传' : 'AI 生成'} · 配色版本 {currentRecord.styleRevision || '未设置'} · 提示词版本 {currentRecord.promptVersion}</p>
+                {currentRecord.feedback && <p><strong>本次修改意见：</strong>{currentRecord.feedback}</p>}
+                <details className="native-prompt-preview"><summary>查看本次实际发送的提示词与记录</summary>
+                  <p>这是工作台发给 Codex 的请求，不代表图片模型内部改写的提示词。</p>
+                  <pre>{currentRecord.prompt || '手动上传，未调用 AI。'}</pre>
+                  <p>请求编号：{currentRecord.id} · {currentRecord.createdAt}</p>
+                </details>
+              </> : <p>旧版本未记录生成依据，无法确认当时发送的提示词和修改意见。</p>}
+              {styleMismatch && <p className="capability-note">当前图片未使用已确认的配色版本，请按当前配色重新生成，或上传匹配配色的整页 PNG 后再审核。</p>}
+            </section>}
             <label className="native-feedback">修改意见
               <textarea aria-label="修改意见" rows={3} value={visualFeedback}
-                disabled={busy} onChange={(event) => setVisualFeedback(event.target.value)}
-                placeholder="例如：减少装饰，突出数据；不要在图中生成标题文字。" />
+                maxLength={4000} disabled={busy} onChange={(event) => setVisualFeedback(event.target.value)}
+                placeholder="例如：保留全部标题与正文，减少装饰，图表使用项目主色。" />
             </label>
+            {hasInspectableVisual && <fieldset className="native-visual-checks" disabled={busy || previewState !== 'ready' || !styleReady || styleMismatch}>
+              <legend>整页人工检查（系统不会代你确认内容完整）</legend>
+              <label><input type="checkbox" checked={contentReviewed} onChange={(event) => setContentReviewed(event.target.checked)} />标题、正文和数据完整，且与已批准细化一致</label>
+              <label><input type="checkbox" checked={layoutReviewed} onChange={(event) => setLayoutReviewed(event.target.checked)} />排版无裁切，配色符合本项目要求</label>
+            </fieldset>}
             <div className="review-actions">
-              {!hasInspectableVisual && <button className="button button-secondary" disabled={busy} onClick={() => void update(
+              {!hasInspectableVisual && <button className="button button-secondary" disabled={busy || !styleReady || styleDirty} onClick={() => void update(
                 () => adapter.requestVisual(projectId, pipeline.currentSlideId!),
                 '视觉候选已生成并保存，请检查完整 PNG。',
               )}>{visualActionLabel(visualGeneration, false)}</button>}
-              {hasInspectableVisual && <button className="button button-secondary" disabled={busy || !visualFeedback.trim()} onClick={() => void update(
-                () => adapter.requestVisual(projectId, pipeline.currentSlideId!, visualFeedback),
+              {hasInspectableVisual && <button className="button button-secondary" disabled={busy || !styleReady || styleDirty || (!visualFeedback.trim() && !styleMismatch)} onClick={() => void update(
+                () => adapter.requestVisual(projectId, pipeline.currentSlideId!, visualFeedback || '按本项目已确认配色生成完整 PPT 页面，保留全部已批准内容。'),
                 '视觉候选已生成并保存，请重新检查完整 PNG。',
               )}>{visualActionLabel(visualGeneration, true)}</button>}
-              <label className={`button button-secondary${busy ? ' is-disabled' : ''}`} aria-disabled={busy}>上传替换 PNG<input hidden type="file" accept="image/png" disabled={busy} onChange={(event) => void replaceVisual(event)} /></label>
+              <label className={`button button-secondary${busy || styleDirty || !styleReady ? ' is-disabled' : ''}`} aria-disabled={busy || styleDirty || !styleReady}>上传替换 PNG<input hidden type="file" accept="image/png" disabled={busy || styleDirty || !styleReady} onChange={(event) => void replaceVisual(event)} /></label>
               <button className="button button-primary" disabled={busy || !canApproveCurrent} onClick={() => void update(() => adapter.approveVisual(projectId, pipeline.currentSlideId!), '当前页已批准，检查点已保存。')}>批准当前页</button>
             </div>
           </StageCard>}
@@ -574,20 +627,20 @@ function promptPreviewLabel(stage: PptPromptStage): string {
 
 function stageLabel(stage: string): string {
   return ({ intake: '材料', source_analysis: '材料分析', outline_review: '大纲审批',
-    detail_review: '逐页细化', visual_review: '视觉审批', blocked: '可恢复阻塞',
+    detail_review: '逐页细化', visual_review: '整页 PPT 审核', blocked: '可恢复阻塞',
     conversion: '可编辑转换', qa: '质量检查', completed: '已完成' } as Record<string, string>)[stage] ?? stage;
 }
 
 function generationRunningLabel(generation: ProjectGeneration | null): string {
   if (generation?.status !== 'running') return '';
   return ({ analysis: '正在分析材料', outline: '正在生成整份大纲', details: '正在生成逐页细化',
-    visual: '正在生成当前页视觉候选', memory: '正在提议可复用偏好' } as Record<string, string>)[generation.kind] ?? '正在生成';
+    visual: '正在生成当前页视觉候选', memory: '正在提议可复用偏好', style: '正在保存项目配色' } as Record<string, string>)[generation.kind] ?? '正在生成';
 }
 
 function generationSuccessLabel(kind: ProjectGeneration['kind']): string {
   return ({ analysis: '材料分析已保存。', outline: '整份大纲已生成，等待你审核。',
     details: '全部页面细化已生成。', visual: '视觉候选已生成并保存，请检查完整 PNG。',
-    memory: '偏好建议已提交。' } as Record<string, string>)[kind] ?? '生成结果已保存。';
+    memory: '偏好建议已提交。', style: '项目配色已保存。' } as Record<string, string>)[kind] ?? '生成结果已保存。';
 }
 
 function generationActionLabel(
@@ -597,9 +650,9 @@ function generationActionLabel(
 ): string {
   if (generation?.kind !== kind) return idle;
   if (generation.status === 'running') return ({ analysis: '正在分析材料…', outline: '正在生成整份大纲…',
-    details: '正在生成逐页细化…', visual: '正在生成当前页…', memory: '正在提议可复用偏好…' })[kind];
+    details: '正在生成逐页细化…', visual: '正在生成当前页…', memory: '正在提议可复用偏好…', style: '正在保存配色…' })[kind];
   if (generation.status === 'failed') return ({ analysis: '重试分析材料', outline: '重试生成整份大纲',
-    details: '重试生成逐页细化', visual: '重试生成当前页', memory: '重试提议可复用偏好' })[kind];
+    details: '重试生成逐页细化', visual: '重试生成当前页', memory: '重试提议可复用偏好', style: '重试保存配色' })[kind];
   return idle;
 }
 
@@ -636,7 +689,7 @@ function generationMatchesPipeline(
   pipeline: NativePptPipeline | null,
 ): boolean {
   if (!generation || !pipeline) return Boolean(generation);
-  if (generation.kind === 'memory') return true;
+  if (generation.kind === 'memory' || generation.kind === 'style') return true;
   if (generation.kind === 'visual') {
     const atVisualStage = pipeline.project.workflowStatus === 'visual_review' ||
       (pipeline.project.workflowStatus === 'blocked' &&

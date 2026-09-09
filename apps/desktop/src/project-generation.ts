@@ -1,6 +1,6 @@
 import type { NativePptPipeline } from '../../worker/src/native-pipeline.js';
 
-export type ProjectGenerationKind = 'analysis' | 'outline' | 'details' | 'visual' | 'memory';
+export type ProjectGenerationKind = 'analysis' | 'outline' | 'details' | 'visual' | 'memory' | 'style';
 export interface ProjectMemoryProposalResult { status: string }
 export interface ProjectVisualGenerationContext { slideId: string; baseRevision: number }
 export type ProjectGenerationResult = NativePptPipeline | ProjectMemoryProposalResult;

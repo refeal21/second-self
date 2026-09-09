@@ -134,6 +134,20 @@ function harness(projectIds = ['project-a']) {
 }
 
 describe('native generation lifecycle review', () => {
+  it('requires human whole-slide content and palette review, and labels legacy provenance honestly', async () => {
+    const test = visualHarness({ candidate: true });
+    test.mount();
+    const preview = await screen.findByRole('img', { name: '第 1 页视觉候选' });
+    Object.defineProperties(preview, { naturalWidth: { value: 1920 }, naturalHeight: { value: 1080 } });
+    fireEvent.load(preview);
+    expect(screen.getByRole('button', { name: '批准当前页' })).toBeDisabled();
+    expect(await screen.findByText(/旧版本未记录生成依据/)).toBeVisible();
+    fireEvent.click(screen.getByRole('checkbox', { name: '标题、正文和数据完整，且与已批准细化一致' }));
+    expect(screen.getByRole('button', { name: '批准当前页' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('checkbox', { name: '排版无裁切，配色符合本项目要求' }));
+    expect(screen.getByRole('button', { name: '批准当前页' })).toBeEnabled();
+  });
+
   it('keeps visual generation visible and single-flight across navigation, then reads the persisted candidate', async () => {
     const test = visualHarness();
     const first = test.mount();
@@ -221,7 +235,7 @@ describe('native generation lifecycle review', () => {
     test.saved.set('project-visual', nextSlidePipeline('project-visual', 2));
 
     test.mount();
-    expect(await screen.findByRole('heading', { name: '5. 逐页视觉·结论' })).toBeVisible();
+    expect(await screen.findByRole('heading', { name: '5. 整页 PPT 审核·结论' })).toBeVisible();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '生成当前页' })).toBeEnabled();
   });

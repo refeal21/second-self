@@ -122,6 +122,9 @@ class JsonLineProcess {
 }
 
 class PackagedWorkerGateway implements WorkflowWorkerGateway {
+  inspectTemplateStyle(contentsBase64: string): Promise<import('../../worker/src/visual-style.js').TemplateStyleInspection> {
+    return this.call('ppt.template.inspect', { contentsBase64 });
+  }
   private child: ChildProcessWithoutNullStreams | null = null;
   private lines: AsyncIterator<string> | null = null;
   private requestId = 1;
@@ -218,6 +221,10 @@ class ScriptedCodexTransport implements AppServerTransport {
         account: { type: 'chatgpt', email: 'production-harness@example.test', planType: 'plus' },
         requiresOpenaiAuth: false,
       } });
+      return;
+    }
+    if (request.method === 'modelProvider/capabilities/read') {
+      this.emit({ id: request.id, result: { namespaceTools: true, imageGeneration: false, webSearch: true } });
       return;
     }
     if (request.method === 'thread/start') {
@@ -528,14 +535,21 @@ async function main(): Promise<void> {
     }
     record('reopen-project-after-restart', pipeline);
 
+    const confirmedStyle = await adapter.saveVisualStyle(project.id, {
+      primaryColor: '#9B1C31', backgroundColor: '#FFFFFF', textColor: '#222222',
+      accentColors: ['#EEEEEE'], instructions: 'Synthetic palette for production boundary verification', template: null,
+    }, pipeline.revision, 0);
+    assert.equal(confirmedStyle.revision, 1);
+    assert.equal(confirmedStyle.locked, false);
+
     const background = new Uint8Array(await readFile(join(fixtureRoot, 'market-background.png')));
     const distinctHashes = new Set<string>();
     for (const [index, spec] of pipeline.slideSpecs!.value.entries()) {
-      pipeline = await adapter.requestVisual(project.id, spec.id);
-      if (pipeline.project.workflowStatus !== 'blocked'
-        || pipeline.blockedCondition?.capability !== 'image_gen.imagegen') {
-        throw new Error(`Unavailable ImageGen was not represented honestly for ${spec.id}`);
-      }
+      const beforeUnavailable: NativePptPipeline = structuredClone(pipeline);
+      await assert.rejects(adapter.requestVisual(project.id, spec.id), /ImageGen capability unavailable/);
+      assert.equal(adapter.getProjectGeneration(project.id)?.status, 'failed');
+      assert.deepEqual(await adapter.loadProjectPipeline(project.id), beforeUnavailable,
+        'unavailable ImageGen must not mutate a completed checkpoint');
       const visual = createDistinctApprovedVisual(background, index);
       distinctHashes.add(createHash('sha256').update(visual).digest('hex'));
       pipeline = await adapter.replaceVisual(
@@ -544,7 +558,13 @@ async function main(): Promise<void> {
         Buffer.from(visual).toString('base64'),
         `用户上传的第 ${index + 1} 页完整视觉`,
       );
+      const uploadRecord = (await adapter.loadVisualRecords(project.id)).find((entry) =>
+        entry.slideId === spec.id && entry.kind === 'upload' && entry.receipt !== null);
+      assert.ok(uploadRecord, 'manual upload provenance must survive native/parser roundtrip');
+      assert.equal(uploadRecord.prompt, '');
+      assert.equal(uploadRecord.styleRevision, 1);
       pipeline = await adapter.approveVisual(project.id, spec.id);
+      assert.equal((await adapter.loadVisualStyle(project.id)).locked, true);
       record(`visual-${index + 1}-blocked-replace-approve`, pipeline);
     }
     if (distinctHashes.size !== 5 || pipeline.project.workflowStatus !== 'conversion') {

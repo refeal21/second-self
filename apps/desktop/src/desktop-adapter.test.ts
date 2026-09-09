@@ -423,6 +423,7 @@ describe('native desktop general-task bridge', () => {
       throw new Error(`Unexpected native command: ${command}`);
     });
     const worker: WorkflowWorkerGateway = {
+      inspectTemplateStyle: vi.fn(async () => { throw new Error('Unexpected template inspection'); }),
       health: vi.fn(async () => ({
         protocolVersion: 1 as const,
         worker: 'digital-twin-workflow-worker' as const,
@@ -459,6 +460,7 @@ describe('native desktop general-task bridge', () => {
         throw new Error(`Unexpected native command: ${command}`);
       });
       const worker: WorkflowWorkerGateway = {
+        inspectTemplateStyle: vi.fn(async () => { throw new Error('Unexpected template inspection'); }),
         health: vi.fn(async () => ({ protocolVersion: 1 as const, worker: 'digital-twin-workflow-worker' as const, status: 'ready' as const })),
         createProject: vi.fn(async () => ({} as never)),
         restoreProject: vi.fn(async (value) => value),
@@ -552,6 +554,7 @@ describe('native desktop general-task bridge', () => {
       throw new Error(`Unexpected native command: ${command}`);
     });
     const worker: WorkflowWorkerGateway = {
+      inspectTemplateStyle: vi.fn(async () => { throw new Error('Unexpected template inspection'); }),
       health: vi.fn(async () => ({
         protocolVersion: 1 as const, worker: 'digital-twin-workflow-worker' as const,
         status: 'ready' as const,
@@ -623,6 +626,7 @@ describe('native desktop general-task bridge', () => {
       return {};
     });
     const worker: WorkflowWorkerGateway = {
+      inspectTemplateStyle: vi.fn(async () => { throw new Error('Unexpected template inspection'); }),
       health: vi.fn(async () => ({
         protocolVersion: 1 as const,
         worker: 'digital-twin-workflow-worker' as const,

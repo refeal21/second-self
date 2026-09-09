@@ -2,6 +2,8 @@
 
 Status: implementation authorized by the user's 2026-09-09 request to continue yesterday's unfinished work and match the 北投 template colors.
 
+Implementation and scoped verification completed 2026-09-09. See `docs/verification-2026-09-09-full-slide-template-style.md` for commands, real/synthetic boundaries, samples, and remaining template-insertion work. Delivery is on `codex/full-slide-template-style`; no main-branch merge.
+
 ## Goal
 
 Generate complete slide PNGs containing approved text and data; stop generating background-only artwork. Let the user select a local PPTX as a palette reference, confirm/edit project colors, and inspect the app prompt and feedback used for a new candidate. Preserve frozen content, previous images, approvals, and route-safe operations.

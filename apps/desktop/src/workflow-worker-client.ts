@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import type { TemplateStyleInspection } from '../../worker/src/visual-style.js';
 import type {
   NativePipelineAction,
   NativePipelineResult,
@@ -14,6 +15,7 @@ export interface WorkflowWorkerHealth {
 }
 
 export interface WorkflowWorkerGateway {
+  inspectTemplateStyle(contentsBase64: string): Promise<TemplateStyleInspection>;
   health(): Promise<WorkflowWorkerHealth>;
   createProject(input: {
     id: string;
@@ -80,6 +82,10 @@ export class TauriWorkflowWorkerClient implements WorkflowWorkerGateway {
       throw new Error('Workflow worker returned an incompatible health response');
     }
     return result;
+  }
+
+  inspectTemplateStyle(contentsBase64: string): Promise<TemplateStyleInspection> {
+    return this.request('ppt.template.inspect', { contentsBase64 }) as Promise<TemplateStyleInspection>;
   }
 
   createProject(input: {

@@ -5,7 +5,9 @@ import {
   type JsonRpcMessage,
 } from '../../worker/src/app-server.js';
 import { CodexImageTurnRunner } from '../../worker/src/codex-image-turn.js';
-import { buildPageVisualPrompt } from '../../worker/src/visual-prompt.js';
+import { buildPageVisualPrompt, VISUAL_PROMPT_VERSION } from '../../worker/src/visual-prompt.js';
+import type { VisualStyleProfile, VisualStyleState, TemplateStyleInspection, VisualGenerationRecord } from '../../worker/src/visual-style.js';
+import { parseVisualStyleState, parseVisualGenerationRecord } from '../../worker/src/visual-style.js';
 import { GeneralTaskManager, type GeneralTask } from '../../worker/src/general-tasks.js';
 import type {
   NativePipelineAction,
@@ -162,6 +164,10 @@ export interface DesktopAdapter {
   approveOutlineRevision(projectId: string, revisionId: string, baseOutlineVersionId: string, expectedRevision: number): Promise<NativePptPipeline>;
   cancelOutlineRevision(projectId: string, revisionId: string, baseOutlineVersionId: string, expectedRevision: number): Promise<NativePptPipeline>;
   requestVisual(projectId: string, slideId: string, feedback?: string): Promise<NativePptPipeline>;
+  loadVisualStyle(projectId: string): Promise<VisualStyleState>;
+  inspectTemplateStyle(input: Pick<SourceFileInput, 'fileName' | 'contentsBase64'>): Promise<TemplateStyleInspection>;
+  saveVisualStyle(projectId: string, profile: VisualStyleProfile, expectedRevision: number, expectedStyleRevision: number, templateBase64?: string): Promise<VisualStyleState>;
+  loadVisualRecords(projectId: string): Promise<VisualGenerationRecord[]>;
   readProjectVisual(projectId: string, relativePath: string): Promise<string>;
   replaceVisual(projectId: string, slideId: string, imageBase64: string, altText: string): Promise<NativePptPipeline>;
   approveVisual(projectId: string, slideId: string): Promise<NativePptPipeline>;
@@ -343,6 +349,10 @@ export function createDemoDesktopAdapter(options: DemoAdapterOptions = {}): Desk
     async approveOutlineRevision() { throw new Error('演示模式不会批准生产修订。'); },
     async cancelOutlineRevision() { throw new Error('演示模式不会取消生产修订。'); },
     async requestVisual() { throw new Error('演示模式不会请求 ImageGen。'); },
+    async loadVisualStyle() { return { revision: 0, profile: null, locked: false }; },
+    async inspectTemplateStyle() { throw new Error('演示模式不会读取生产模板。'); },
+    async saveVisualStyle() { throw new Error('演示模式不会保存生产配色。'); },
+    async loadVisualRecords() { return []; },
     async readProjectVisual() { throw new Error('演示模式没有生产视觉文件。'); },
     async replaceVisual() { throw new Error('演示模式不会写入视觉文件。'); },
     async approveVisual() { throw new Error('演示模式不会保存生产审批。'); },
@@ -630,9 +640,10 @@ class TauriDesktopAdapter implements DesktopAdapter {
         throw new Error('请先批准整份大纲，并在逐页细化阶段生成内容。');
       }
       if (pipeline.slideSpecs) throw new Error('已有逐页细化，请审核或保存修改，不要重复生成。');
-      const output = await this.runStructured<unknown>(projectId, buildPptPrompt(pipeline, 'details'));
+      const style = await this.loadVisualStyle(projectId);
+      const output = await this.runStructured<unknown>(projectId, buildPptPrompt(pipeline, 'details', style));
       const specs = normalizeGeneratedSlideSpecs(output, pipeline.outline.value, pipeline.analysis!.output);
-      return this.applyPipeline(projectId, pipeline, { kind: 'details.submit', at: new Date().toISOString(), specs });
+      return this.applyPipeline(projectId, pipeline, { kind: 'details.submit', at: new Date().toISOString(), specs }, style.revision);
     });
   }
   approveDetails(projectId: string, expectedRevision: number): Promise<NativePptPipeline> {
@@ -674,9 +685,15 @@ class TauriDesktopAdapter implements DesktopAdapter {
       );
       const cwd = await this.callNative<string>('ppt_project_directory', { projectId });
       if (!isCanonicalAbsolutePath(cwd)) throw new Error('Rust 未返回合法的项目绝对路径。');
+      const style = await this.loadVisualStyle(projectId);
+      const prompt = buildPageVisualPrompt({ slideId, spec: structuredClone(spec), style }, feedback);
+      const request = await this.callNative<VisualGenerationRecord>('ppt_begin_visual_request', { input: {
+        id: crypto.randomUUID(), projectId, expectedRevision: pipeline.revision, styleRevision: style.revision,
+        slideId, kind: 'imagegen', prompt, feedback: feedback?.trim() ?? '', promptVersion: VISUAL_PROMPT_VERSION,
+      } });
       const generated = await this.imageTurns.generate({
         cwd,
-        prompt: buildPageVisualPrompt({ slideId, spec: structuredClone(spec) }, feedback),
+        prompt,
         onProgress: (message) => this.generations.updateProgress(projectId, message, operationId),
       });
       this.generations.updateProgress(projectId, '正在校验并保存视觉候选…', operationId);
@@ -685,15 +702,56 @@ class TauriDesktopAdapter implements DesktopAdapter {
         at: new Date().toISOString(),
         slideId,
         imageBase64: generated.imageBase64,
-        altText: `ImageGen 生成的“${spec.title}”视觉候选`,
-      });
+        altText: `ImageGen 生成的“${spec.title}”整页 PPT 候选`,
+      }, request.id, generated.provider);
     }, slideId);
   }
   readProjectVisual(projectId: string, relativePath: string): Promise<string> {
     return this.callNative('ppt_read_artifact', { projectId, relativePath });
   }
+  async loadVisualStyle(projectId: string): Promise<VisualStyleState> {
+    return parseVisualStyleState(await this.callNative('ppt_load_visual_style', { projectId }));
+  }
+  async loadVisualRecords(projectId: string): Promise<VisualGenerationRecord[]> {
+    const records = await this.callNative<unknown>('ppt_visual_records', { projectId });
+    if (!Array.isArray(records)) throw new Error('生成依据记录格式无效。');
+    return records.map(parseVisualGenerationRecord);
+  }
+  inspectTemplateStyle(input: Pick<SourceFileInput, 'fileName' | 'contentsBase64'>): Promise<TemplateStyleInspection> {
+    if (!/\.pptx$/i.test(input.fileName)) return Promise.reject(new Error('请选择 .pptx 模板。'));
+    return this.worker.inspectTemplateStyle(input.contentsBase64);
+  }
+  saveVisualStyle(projectId: string, profile: VisualStyleProfile, expectedRevision: number,
+    expectedStyleRevision: number, templateBase64?: string): Promise<VisualStyleState> {
+    if (this.editBlocksGeneration(projectId)) return Promise.reject(new Error('当前项目已有编辑操作，请稍后保存配色。'));
+    if (this.generations.get(projectId)?.status === 'running') return Promise.reject(new Error('当前项目已有任务，请等待完成后再保存配色。'));
+    return this.generations.run(projectId, 'style', async () => {
+      try {
+        await this.callNative('ppt_save_visual_style', { input: { projectId, expectedRevision,
+          expectedStyleRevision, profile, ...(templateBase64 ? { templateBase64 } : {}) } });
+      } catch (reason) {
+        // A lost response must not append another palette version automatically.
+        let persisted: VisualStyleState;
+        try { persisted = await this.loadVisualStyle(projectId); }
+        catch { throw new Error('配色保存结果尚未核实，请重新打开项目检查；不会自动覆盖或重新生成。'); }
+        if (persisted.revision !== expectedStyleRevision + 1 || !sameJson(persisted.profile, profile)) throw reason;
+      }
+      return this.callNative<NativePptPipeline>('ppt_load_pipeline', { projectId });
+    }).then(() => this.loadVisualStyle(projectId));
+  }
   async replaceVisual(projectId: string, slideId: string, imageBase64: string, altText: string): Promise<NativePptPipeline> {
-    return this.applyCurrent(projectId, { kind: 'visual.replace', at: new Date().toISOString(), slideId, imageBase64, altText });
+    if (this.editBlocksGeneration(projectId)) throw new Error('当前项目已有编辑操作，请稍后上传。');
+    if (this.generations.get(projectId)?.status === 'running') throw new Error('当前项目已有任务，请等待完成后再上传图片。');
+    return this.generations.run(projectId, 'visual', async () => {
+      const pipeline = await this.loadProjectPipeline(projectId);
+      const style = await this.loadVisualStyle(projectId);
+      const request = await this.callNative<VisualGenerationRecord>('ppt_begin_visual_request', { input: {
+        id: crypto.randomUUID(), projectId, expectedRevision: pipeline.revision, styleRevision: style.revision,
+        slideId, kind: 'upload', prompt: '', feedback: '', promptVersion: 'upload-v1',
+      } });
+      return this.applyGeneratedVisual(projectId, pipeline,
+        { kind: 'visual.replace', at: new Date().toISOString(), slideId, imageBase64, altText }, request.id);
+    }, slideId);
   }
   async approveVisual(projectId: string, slideId: string): Promise<NativePptPipeline> {
     return this.applyCurrent(projectId, { kind: 'visual.approve', at: new Date().toISOString(), slideId });
@@ -831,23 +889,27 @@ class TauriDesktopAdapter implements DesktopAdapter {
     const pipeline = await this.loadProjectPipeline(projectId);
     return this.applyPipeline(projectId, pipeline, action);
   }
-  private async applyPipeline(projectId: string, current: NativePptPipeline, action: NativePipelineAction): Promise<NativePptPipeline> {
+  private async applyPipeline(projectId: string, current: NativePptPipeline, action: NativePipelineAction, expectedStyleRevision?: number): Promise<NativePptPipeline> {
     await this.worker.restoreProject(current);
     const result: NativePipelineResult = await this.worker.executeProject(projectId, action);
     return this.callNative<NativePptPipeline>('ppt_commit_pipeline', {
-      input: { projectId, expectedRevision: current.revision, pipeline: result.pipeline, writes: result.writes },
+      input: { projectId, expectedRevision: current.revision, pipeline: result.pipeline, writes: result.writes,
+        ...(expectedStyleRevision === undefined ? {} : { expectedStyleRevision }) },
     });
   }
   private async applyGeneratedVisual(
     projectId: string,
     current: NativePptPipeline,
     action: Extract<NativePipelineAction, { kind: 'visual.replace' }>,
+    visualRequestId: string,
+    visualProvider?: { threadId?: string; turnId?: string; itemId?: string },
   ): Promise<NativePptPipeline> {
     await this.worker.restoreProject(current);
     const result = await this.worker.executeProject(projectId, action);
     try {
       return await this.callNative<NativePptPipeline>('ppt_commit_pipeline', {
-        input: { projectId, expectedRevision: current.revision, pipeline: result.pipeline, writes: result.writes },
+        input: { projectId, expectedRevision: current.revision, pipeline: result.pipeline, writes: result.writes,
+          visualRequestId, ...(visualProvider ? { visualProvider } : {}) },
       });
     } catch (reason) {
       let persisted: NativePptPipeline;
@@ -1023,7 +1085,10 @@ function memoryProposalPrompt(pipeline: NativePptPipeline): string {
 // Rust JSON objects may return keys in a different order. Arrays, strings and
 // numeric values must still match exactly before acknowledging a lost response.
 function sameCheckpoint(left: NativePptPipeline, right: NativePptPipeline): boolean {
-  const canonical = (value: NativePptPipeline) => JSON.stringify(value, (_key, entry: unknown) =>
+  return sameJson(left, right);
+}
+function sameJson(left: unknown, right: unknown): boolean {
+  const canonical = (value: unknown) => JSON.stringify(value, (_key, entry: unknown) =>
     entry !== null && typeof entry === 'object' && !Array.isArray(entry)
       ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => a.localeCompare(b)))
       : entry);

@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import {
   createTauriDesktopAdapter,
@@ -97,6 +98,10 @@ class ScriptedPptAppServer implements NativeAppServerTransport {
 }
 
 class DirectWorker implements WorkflowWorkerGateway {
+  async inspectTemplateStyle(contentsBase64: string) {
+    const { inspectTemplateStyle } = await import('../../worker/src/template-style.js');
+    return inspectTemplateStyle(contentsBase64);
+  }
   readonly runtime = new NativePptRpcRuntime({ imageGenAvailable: false });
   async health(): Promise<WorkflowWorkerHealth> { return { protocolVersion: 1, worker: 'digital-twin-workflow-worker', status: 'ready' }; }
   async createProject(input: Parameters<WorkflowWorkerGateway['createProject']>[0]) {
@@ -122,14 +127,42 @@ function nativePersistenceHarness() {
     id: id!, fileName: fileName!, mediaType: mediaType!, relativePath: `sources/${fileName}`,
     sha256: 'a'.repeat(64), byteLength: 1,
   }));
-  const state = { pipeline, files: new Map<string, string>() };
+  const state = { pipeline, files: new Map<string, string>(),
+    style: { revision: 0, profile: null, locked: false } as import('../../worker/src/visual-style.js').VisualStyleState,
+    records: [] as import('../../worker/src/visual-style.js').VisualGenerationRecord[] };
   const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
     if (command === 'ppt_load_pipeline') return structuredClone(state.pipeline);
+    if (command === 'ppt_load_visual_style') return structuredClone(state.style);
+    if (command === 'ppt_visual_records') return structuredClone(state.records);
+    if (command === 'ppt_save_visual_style') {
+      const input = args!.input as { expectedRevision: number; expectedStyleRevision: number; profile: typeof state.style.profile };
+      if (input.expectedRevision !== state.pipeline.revision || input.expectedStyleRevision !== state.style.revision) throw new Error('stale style');
+      if (state.style.locked) throw new Error('style locked');
+      state.style = { revision: state.style.revision + 1, profile: input.profile, locked: false };
+      return structuredClone(state.style);
+    }
+    if (command === 'ppt_begin_visual_request') {
+      const input = args!.input as import('../../worker/src/visual-style.js').VisualGenerationRequest;
+      if (input.expectedRevision !== state.pipeline.revision || input.styleRevision !== state.style.revision) throw new Error('stale request');
+      const record = { ...input, createdAt: new Date().toISOString(), style: structuredClone(state.style), receipt: null,
+        promptSha256: createHash('sha256').update(input.prompt).digest('hex'),
+        specSha256: createHash('sha256').update(JSON.stringify(state.pipeline.slideSpecs)).digest('hex') };
+      state.records.push(record);
+      return structuredClone(record);
+    }
     if (command === 'ppt_project_directory') return resolve('../..', 'fixtures/golden-project');
     if (command === 'ppt_commit_pipeline') {
-      const input = args?.input as { expectedRevision: number; pipeline: NativePptPipeline; writes: Array<{ relativePath: string; contentsBase64: string }> };
+      const input = args?.input as { expectedRevision: number; pipeline: NativePptPipeline; writes: Array<{ relativePath: string; contentsBase64: string }>;
+        visualRequestId?: string; visualProvider?: { threadId?: string; turnId?: string; itemId?: string } };
       // Match the real Rust optimistic-concurrency gate before any file/state writes.
       if (input.expectedRevision !== state.pipeline.revision) throw new Error('stale pipeline revision');
+      if (input.visualRequestId) {
+        const record = state.records.find(({ id }) => id === input.visualRequestId);
+        if (!record || record.styleRevision !== state.style.revision || record.expectedRevision !== input.expectedRevision) throw new Error('stale request');
+        const visual = input.pipeline.visuals[record.slideId]!.at(-1)!;
+        record.receipt = { relativePath: visual.relativePath, sha256: visual.sha256,
+          committedRevision: input.pipeline.revision, createdAt: new Date().toISOString(), provider: input.visualProvider ?? {} };
+      }
       validateNativePipelineCheckpoint(input.pipeline);
       for (const write of input.writes) state.files.set(write.relativePath, write.contentsBase64);
       state.pipeline = structuredClone(input.pipeline);
@@ -634,6 +667,8 @@ describe('production-equivalent UI adapter → App Server → Worker → Rust pe
     expect(server.prompts[3]).toContain('2026 年经营复盘与增长计划');
     expect(server.prompts[3]).toContain('增加左侧留白，但不要改写任何正文');
     expect(server.prompts[3]).not.toContain('重复点击不应再次生成');
+    expect(native.state.records).toHaveLength(1);
+    expect(native.state.records[0]).toMatchObject({ prompt: server.prompts[3], feedback: '增加左侧留白，但不要改写任何正文', receipt: null });
 
     server.completeImage();
     const [saved, shared] = await Promise.all([first, duplicate]);
@@ -647,6 +682,10 @@ describe('production-equivalent UI adapter → App Server → Worker → Rust pe
       visualContext: { slideId: 'slide-cover', baseRevision: details.revision + 1 },
     });
     expect(server.prompts).toHaveLength(4);
+    expect((await adapter.loadVisualRecords('project-e2e'))[0]?.receipt).toMatchObject({
+      relativePath: saved.visuals['slide-cover']!.at(-1)!.relativePath,
+      provider: { threadId: 'thread-4', turnId: 'turn-4', itemId: 'image-4' },
+    });
   });
 
   it('validates visual stage, frozen spec, and current slide before starting native ImageGen', async () => {

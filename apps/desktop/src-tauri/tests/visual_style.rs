@@ -4,15 +4,34 @@ use digital_twin_desktop_lib::{
 };
 use serde_json::json;
 
+fn test_directory(parent: &std::path::Path, timestamp: u128) -> std::path::PathBuf {
+    // Clock timestamps can repeat across parallel tests. Atomic mkdir, rather
+    // than create_dir_all, owns the directory before any SQLite file is opened.
+    for attempt in 0u64.. {
+        let root = parent.join(format!(
+            "visual-style-{}-{timestamp}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&root) {
+            Ok(()) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!(
+                "Cannot allocate isolated test directory {}: {error}",
+                root.display()
+            ),
+        }
+    }
+    unreachable!("test directory collision counter exhausted")
+}
+
 fn setup() -> (std::path::PathBuf, WorkbenchService, String) {
-    let root = std::env::temp_dir().join(format!(
-        "visual-style-{}",
+    let root = test_directory(
+        &std::env::temp_dir(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+            .as_nanos(),
+    );
     let service =
         WorkbenchService::open(root.join("state.sqlite"), root.join("workspace")).unwrap();
     let id = service
@@ -23,6 +42,30 @@ fn setup() -> (std::path::PathBuf, WorkbenchService, String) {
         .unwrap()
         .id;
     (root, service, id)
+}
+
+#[test]
+fn fixture_directories_are_exclusive_when_concurrent_tests_share_a_timestamp() {
+    let parent =
+        std::env::temp_dir().join(format!("visual-style-isolation-{}", std::process::id()));
+    std::fs::create_dir_all(&parent).unwrap();
+    let directories = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|_| scope.spawn(|| test_directory(&parent, 42)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<std::collections::HashSet<_>>()
+    });
+    assert_eq!(
+        directories.len(),
+        16,
+        "each fixture must claim its own directory even when every timestamp is identical"
+    );
+    for directory in directories {
+        assert!(directory.is_dir());
+    }
 }
 fn save(id: &str, revision: i64) -> SaveVisualStyleInput {
     serde_json::from_value(json!({"projectId":id,"expectedRevision":1,"expectedStyleRevision":revision,"profile":{"primaryColor":"#9B1C31","backgroundColor":"#FFFFFF","textColor":"#222222","accentColors":["#C8A45C"],"instructions":"Warm brand palette","template":null}})).unwrap()

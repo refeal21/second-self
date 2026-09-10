@@ -14,21 +14,38 @@ const MAX_VERSION_BYTES: usize = 128;
 const MAX_PROMPT_BYTES: usize = 65_536;
 const MAX_FEEDBACK_BYTES: usize = 16_384;
 
-const SCHEMA: &str = r#"
-CREATE TABLE queue_settings (
+#[derive(Clone, Copy)]
+struct SchemaObject {
+    kind: &'static str,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const SCHEMA_OBJECTS: [SchemaObject; 7] = [
+    SchemaObject {
+        kind: "table",
+        name: "queue_settings",
+        sql: r#"CREATE TABLE queue_settings (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     concurrency INTEGER NOT NULL CHECK (concurrency BETWEEN 1 AND 4),
     paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
     epoch INTEGER NOT NULL
-);
-INSERT INTO queue_settings (singleton, concurrency, paused, epoch) VALUES (1, 4, 0, 0);
-CREATE TABLE queue_batches (
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "queue_batches",
+        sql: r#"CREATE TABLE queue_batches (
     batch_id TEXT PRIMARY KEY,
     input_json TEXT NOT NULL,
     paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
     created_at_ms INTEGER NOT NULL
-);
-CREATE TABLE queue_jobs (
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "queue_jobs",
+        sql: r#"CREATE TABLE queue_jobs (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES queue_batches(batch_id),
     request_id TEXT NOT NULL UNIQUE,
@@ -44,20 +61,32 @@ CREATE TABLE queue_jobs (
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
     dispatched_at_ms INTEGER
-);
-CREATE UNIQUE INDEX queue_jobs_active_page
+)"#,
+    },
+    SchemaObject {
+        kind: "index",
+        name: "queue_jobs_active_page",
+        sql: r#"CREATE UNIQUE INDEX queue_jobs_active_page
 ON queue_jobs(project_id, slide_id)
 WHERE status IN (
     'queued', 'dispatching', 'running', 'result_ready', 'committing',
     'cancel_requested', 'outcome_unknown'
-);
-CREATE TABLE queue_attempts (
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "queue_attempts",
+        sql: r#"CREATE TABLE queue_attempts (
     attempt_id TEXT PRIMARY KEY,
     request_id TEXT NOT NULL UNIQUE REFERENCES queue_jobs(request_id),
     target_json TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL
-);
-CREATE TABLE queue_batch_entries (
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "queue_batch_entries",
+        sql: r#"CREATE TABLE queue_batch_entries (
     batch_id TEXT NOT NULL REFERENCES queue_batches(batch_id),
     ordinal INTEGER NOT NULL,
     submitted_request_id TEXT NOT NULL UNIQUE,
@@ -65,24 +94,20 @@ CREATE TABLE queue_batch_entries (
     resolved_request_id TEXT NOT NULL REFERENCES queue_jobs(request_id),
     reused INTEGER NOT NULL CHECK (reused IN (0, 1)),
     PRIMARY KEY (batch_id, ordinal)
-);
-CREATE TABLE queue_transition_events (
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "queue_transition_events",
+        sql: r#"CREATE TABLE queue_transition_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id TEXT NOT NULL REFERENCES queue_jobs(request_id),
     from_status TEXT,
     to_status TEXT NOT NULL,
     epoch INTEGER,
     created_at_ms INTEGER NOT NULL
-);
-"#;
-
-const EXPECTED_TABLES: [&str; 6] = [
-    "queue_attempts",
-    "queue_batch_entries",
-    "queue_batches",
-    "queue_jobs",
-    "queue_settings",
-    "queue_transition_events",
+)"#,
+    },
 ];
 
 pub struct QueueStore {
@@ -134,7 +159,16 @@ impl QueueStore {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(message)?;
-            transaction.execute_batch(SCHEMA).map_err(message)?;
+            for object in SCHEMA_OBJECTS {
+                transaction.execute(object.sql, []).map_err(message)?;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO queue_settings (singleton, concurrency, paused, epoch)
+                     VALUES (1, 4, 0, 0)",
+                    [],
+                )
+                .map_err(message)?;
             transaction
                 .pragma_update(None, "application_id", APPLICATION_ID)
                 .map_err(message)?;
@@ -418,7 +452,7 @@ fn user_tables(connection: &Connection) -> Result<Vec<String>, String> {
     let mut statement = connection
         .prepare(
             "SELECT name FROM sqlite_master
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+             WHERE type = 'table' AND lower(substr(name, 1, 7)) <> 'sqlite_' ORDER BY name",
         )
         .map_err(message)?;
     let tables = statement
@@ -430,50 +464,50 @@ fn user_tables(connection: &Connection) -> Result<Vec<String>, String> {
 }
 
 fn verify_schema(connection: &Connection, tables: &[String]) -> Result<(), String> {
-    if tables != EXPECTED_TABLES {
+    let actual_tables: HashSet<&str> = tables.iter().map(String::as_str).collect();
+    let expected_tables: HashSet<&str> = SCHEMA_OBJECTS
+        .iter()
+        .filter(|object| object.kind == "table")
+        .map(|object| object.name)
+        .collect();
+    if actual_tables != expected_tables {
         return Err("durable queue schema does not match user_version 1".into());
     }
-    for query in [
-        "SELECT singleton, concurrency, paused, epoch FROM queue_settings LIMIT 0",
-        "SELECT batch_id, input_json, paused, created_at_ms FROM queue_batches LIMIT 0",
-        "SELECT sequence, batch_id, request_id, attempt_id, project_id, slide_id, target_json,
-                status, epoch, provider_json, result_json, error, created_at_ms, updated_at_ms,
-                dispatched_at_ms FROM queue_jobs LIMIT 0",
-        "SELECT attempt_id, request_id, target_json, created_at_ms FROM queue_attempts LIMIT 0",
-        "SELECT batch_id, ordinal, submitted_request_id, submitted_attempt_id,
-                resolved_request_id, reused FROM queue_batch_entries LIMIT 0",
-        "SELECT id, request_id, from_status, to_status, epoch, created_at_ms
-         FROM queue_transition_events LIMIT 0",
-    ] {
-        connection.prepare(query).map_err(message)?;
-    }
-    let active_index: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master
-             WHERE type = 'index' AND name = 'queue_jobs_active_page'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(message)?;
-    let expected_index = "CREATE UNIQUE INDEX queue_jobs_active_page
-        ON queue_jobs(project_id, slide_id)
-        WHERE status IN ('queued', 'dispatching', 'running', 'result_ready', 'committing',
-                         'cancel_requested', 'outcome_unknown')";
-    if active_index.as_deref().map(normalized_sql).as_deref()
-        != Some(&normalized_sql(expected_index))
-    {
-        return Err("durable queue admission index does not match user_version 1".into());
+    for object in SCHEMA_OBJECTS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                params![object.kind, object.name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(message)?;
+        if actual.as_deref().map(normalized_schema_sql).as_deref()
+            != Some(&normalized_schema_sql(object.sql))
+        {
+            return Err(format!(
+                "durable queue {} {} does not match user_version 1",
+                object.kind, object.name
+            ));
+        }
     }
     Ok(())
 }
 
-fn normalized_sql(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase()
+fn normalized_schema_sql(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut in_string_literal = false;
+    for character in value.chars() {
+        if character == '\'' {
+            in_string_literal = !in_string_literal;
+            normalized.push(character);
+        } else if in_string_literal {
+            normalized.push(character);
+        } else if !character.is_whitespace() {
+            normalized.push(character.to_ascii_lowercase());
+        }
+    }
+    normalized
 }
 
 fn read_settings(connection: &Connection) -> Result<QueueSettings, String> {

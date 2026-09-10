@@ -189,3 +189,59 @@ PID 5194 and its `presales_queue` child PID 5234, both rooted in this exact work
 sent targeted `SIGTERM` and a subsequent `ps` check returned no matching processes. No user app
 or unrelated process was stopped. The later focused 15/15 and full 119/119 results documented
 above were separate completed runs and remain valid.
+
+## Review fix round 1: schema ownership preservation
+
+The two Important review findings reproduced against `b112f56`:
+
+1. `NOT LIKE 'sqlite_%'` treated `_` as a wildcard and hid a foreign table named
+   `sqliteXlegacy`, allowing the queue to claim and mutate that database.
+2. Recognized databases with the expected names/columns but missing PK, UNIQUE, FK, or CHECK
+   constraints were accepted; lowercasing the whole index DDL also accepted `'QUEUED'` as if it
+   were the required lowercase status literal.
+
+Three real-SQLite preservation regressions were added before production changes. They snapshot
+markers, journal mode, and schema objects and verify that rejection makes no changes. The
+constraint test independently removes one required primary key, unique constraint, foreign key,
+and check constraint from otherwise matching marked schemas.
+
+RED command:
+
+```text
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue
+```
+
+RED result: exit 101, no warnings.
+
+```text
+running 18 tests
+test marked_databases_missing_required_constraints_are_rejected_without_mutation ... FAILED
+test marked_database_with_uppercase_status_predicate_is_rejected_without_mutation ... FAILED
+test sqlite_prefix_lookalike_table_is_preserved_as_foreign ... FAILED
+test result: FAILED. 15 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+The fix now detects user tables with a literal, case-insensitive `sqlite_` prefix comparison.
+Seven canonical DDL definitions are the single source for both initialization and verification.
+Schema comparison removes insignificant whitespace and folds SQL syntax/identifier case only
+outside string literals, preserving the exact lowercase status predicate semantics.
+
+Final GREEN/check command:
+
+```text
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+git diff --check
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue
+```
+
+GREEN result: exit 0, no warnings.
+
+```text
+running 18 tests
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+A post-run process check found no lingering cargo or `presales_queue` test process from this
+worktree. The earlier PIDs 5194/5234 cleanup remains fully documented in the preceding section;
+this fix round introduced no additional leak.

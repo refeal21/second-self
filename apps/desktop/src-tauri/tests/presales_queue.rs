@@ -434,3 +434,188 @@ fn identified_database_missing_the_admission_index_is_rejected() {
     assert!(QueueStore::open(&path).is_err());
     std::fs::remove_file(path).unwrap();
 }
+
+fn schema_snapshot(connection: &Connection) -> (i64, i64, String, Vec<(String, String, String)>) {
+    let application_id = connection
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .unwrap();
+    let user_version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let journal_mode = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, coalesce(sql, '') FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name",
+        )
+        .unwrap();
+    let objects = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    (application_id, user_version, journal_mode, objects)
+}
+
+#[test]
+fn sqlite_prefix_lookalike_table_is_preserved_as_foreign() {
+    let path = temporary_database("sqlite-prefix-lookalike");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute("CREATE TABLE sqliteXlegacy (value TEXT NOT NULL)", [])
+        .unwrap();
+    connection
+        .execute("INSERT INTO sqliteXlegacy VALUES ('keep-me')", [])
+        .unwrap();
+    let before = schema_snapshot(&connection);
+    drop(connection);
+
+    assert!(QueueStore::open(&path).is_err());
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(schema_snapshot(&connection), before);
+    assert_eq!(
+        connection
+            .query_row("SELECT value FROM sqliteXlegacy", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "keep-me"
+    );
+    drop(connection);
+    std::fs::remove_file(path).unwrap();
+}
+
+const TEST_QUEUE_SCHEMA: &str = r#"
+CREATE TABLE queue_settings (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    concurrency INTEGER NOT NULL CHECK (concurrency BETWEEN 1 AND 4),
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    epoch INTEGER NOT NULL
+);
+CREATE TABLE queue_batches (
+    batch_id TEXT PRIMARY KEY,
+    input_json TEXT NOT NULL,
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE queue_jobs (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL REFERENCES queue_batches(batch_id),
+    request_id TEXT NOT NULL UNIQUE,
+    attempt_id TEXT NOT NULL UNIQUE,
+    project_id TEXT NOT NULL,
+    slide_id TEXT NOT NULL,
+    target_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    epoch INTEGER,
+    provider_json TEXT,
+    result_json TEXT,
+    error TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    dispatched_at_ms INTEGER
+);
+CREATE UNIQUE INDEX queue_jobs_active_page
+ON queue_jobs(project_id, slide_id)
+WHERE status IN (
+    'queued', 'dispatching', 'running', 'result_ready', 'committing',
+    'cancel_requested', 'outcome_unknown'
+);
+CREATE TABLE queue_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE REFERENCES queue_jobs(request_id),
+    target_json TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE queue_batch_entries (
+    batch_id TEXT NOT NULL REFERENCES queue_batches(batch_id),
+    ordinal INTEGER NOT NULL,
+    submitted_request_id TEXT NOT NULL UNIQUE,
+    submitted_attempt_id TEXT NOT NULL UNIQUE,
+    resolved_request_id TEXT NOT NULL REFERENCES queue_jobs(request_id),
+    reused INTEGER NOT NULL CHECK (reused IN (0, 1)),
+    PRIMARY KEY (batch_id, ordinal)
+);
+CREATE TABLE queue_transition_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL REFERENCES queue_jobs(request_id),
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    epoch INTEGER,
+    created_at_ms INTEGER NOT NULL
+);
+"#;
+
+fn create_marked_schema(
+    path: &std::path::Path,
+    schema: &str,
+) -> (i64, i64, String, Vec<(String, String, String)>) {
+    let connection = Connection::open(path).unwrap();
+    connection.execute_batch(schema).unwrap();
+    connection
+        .execute(
+            "INSERT INTO queue_settings (singleton, concurrency, paused, epoch)
+             VALUES (1, 4, 0, 0)",
+            [],
+        )
+        .unwrap();
+    connection
+        .pragma_update(None, "application_id", QUEUE_APPLICATION_ID)
+        .unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
+    let snapshot = schema_snapshot(&connection);
+    drop(connection);
+    snapshot
+}
+
+fn assert_marked_schema_rejected_without_mutation(name: &str, schema: &str) {
+    let path = temporary_database(name);
+    let before = create_marked_schema(&path, schema);
+    assert!(
+        QueueStore::open(&path).is_err(),
+        "mutation {name} was accepted"
+    );
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(schema_snapshot(&connection), before, "mutation {name}");
+    drop(connection);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn marked_databases_missing_required_constraints_are_rejected_without_mutation() {
+    let cases = [
+        (
+            "missing-primary-key",
+            "singleton INTEGER PRIMARY KEY CHECK (singleton = 1)",
+            "singleton INTEGER",
+        ),
+        (
+            "missing-unique",
+            "attempt_id TEXT NOT NULL UNIQUE,",
+            "attempt_id TEXT NOT NULL,",
+        ),
+        (
+            "missing-foreign-key",
+            "batch_id TEXT NOT NULL REFERENCES queue_batches(batch_id),",
+            "batch_id TEXT NOT NULL,",
+        ),
+        (
+            "missing-check",
+            "paused INTEGER NOT NULL CHECK (paused IN (0, 1)),",
+            "paused INTEGER NOT NULL,",
+        ),
+    ];
+    for (name, expected, malformed) in cases {
+        let schema = TEST_QUEUE_SCHEMA.replacen(expected, malformed, 1);
+        assert_ne!(schema, TEST_QUEUE_SCHEMA, "test mutation {name} must apply");
+        assert_marked_schema_rejected_without_mutation(name, &schema);
+    }
+}
+
+#[test]
+fn marked_database_with_uppercase_status_predicate_is_rejected_without_mutation() {
+    let schema = TEST_QUEUE_SCHEMA.replacen("'queued'", "'QUEUED'", 1);
+    assert_marked_schema_rejected_without_mutation("uppercase-status-literal", &schema);
+}

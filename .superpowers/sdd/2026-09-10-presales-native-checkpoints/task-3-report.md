@@ -83,3 +83,9 @@ Focused commands:
 - Current Worker v1 actions still emit fixed legacy filenames. A later paired editor/adapter must intentionally construct the new revisioned caller intents; this task does not silently rewrite a submitted pipeline or write set.
 - Structural revision companions, live paired editors/prompt routing, isolated v3 catalog, adjustable queue, gallery/history UI, design-aware image receipts/reference edits, and export snapshot integration remain pending.
 - The focused production harness uses the real Rust JSONL process and persistence but not the packaged desktop app or packaged Worker; no model or application launch occurred.
+
+## Independent review fix — load response project identity
+
+- RED: `pnpm --filter @digital-twin/desktop exec vitest run src/presales-checkpoint.test.ts -t "rejects a .* checkpoint returned for another project without fallback"` — 2 failed because structurally valid paired and legacy-null checkpoints for project B resolved successfully when project A was requested.
+- GREEN: the same focused command — 2 passed, 12 skipped. Both response shapes now require `pipeline.project.id` to equal the requested project ID, and each test confirms exactly one `ppt_load_checkpoint` invocation with no fallback.
+- Final verification: full `src/presales-checkpoint.test.ts` 14 passed; desktop typecheck, zero-warning lint, production build (66 modules), and `git diff --check` all exited 0.

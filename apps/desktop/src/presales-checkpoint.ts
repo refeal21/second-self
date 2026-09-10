@@ -72,7 +72,11 @@ export async function loadPresalesCheckpoint(
   projectId: string,
 ): Promise<ProjectCheckpoint> {
   if (!projectId.trim()) throw new Error('Presales checkpoint projectId is required');
-  return parseProjectCheckpoint(await invoke('ppt_load_checkpoint', { projectId }));
+  const checkpoint = parseProjectCheckpoint(await invoke('ppt_load_checkpoint', { projectId }));
+  if (checkpoint.pipeline.project.id !== projectId) {
+    throw new Error('Presales checkpoint project identity is inconsistent');
+  }
+  return checkpoint;
 }
 
 export async function commitPresalesCheckpoint(

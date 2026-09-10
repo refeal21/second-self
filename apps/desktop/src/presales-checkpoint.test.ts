@@ -117,6 +117,26 @@ describe('presales checkpoint transport', () => {
     await expect(loadPresalesCheckpoint(async () => legacy, 'project-client-paired')).resolves.toEqual(legacy);
   });
 
+  it.each(['paired', 'legacy-null'])('rejects a %s checkpoint returned for another project without fallback', async (kind) => {
+    const returned = checkpoint();
+    returned.pipeline.project.id = 'project-response-b';
+    if (kind === 'legacy-null') {
+      returned.pipeline.analysis = null;
+      returned.pipeline.outline = null;
+      returned.pipeline.project.workflowStatus = 'intake';
+      returned.presales = null;
+    } else {
+      returned.pipeline.outline!.version.id = 'project-response-b-outline-v1';
+      returned.pipeline.outline!.version.projectId = 'project-response-b';
+      returned.presales!.basis.outline.versionId = 'project-response-b-outline-v1';
+    }
+    const invoke = vi.fn(async () => structuredClone(returned));
+
+    await expect(loadPresalesCheckpoint(invoke, 'project-request-a')).rejects.toThrow(/project identity/i);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith('ppt_load_checkpoint', { projectId: 'project-request-a' });
+  });
+
   it('snapshots the validated request before await and validates a direct success against it', async () => {
     const input = request();
     const expected = checkpoint(input);

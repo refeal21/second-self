@@ -23,7 +23,17 @@
 - 默认 Rust 全套 exit 0。各 target 原始计数：lib 9、main 0、codex_process 7、database 6、opener_acl 3、paths 7、presales_contracts 13、presales_queue 24、presales_queue_lifecycle 20、presales_queue_process 0、presales_result_staging 10、presales_result_vault 14、presales_storage 16、presales_workbench 11、visual_style 21、workbench 14、doc-tests 0；每项均 0 failed。
 - `cargo fmt --check` 与 `git diff --check` 均 exit 0、无输出。
 
+父代理在 `b039f9b` 独立复跑：vault 14、staging 10、lifecycle 20、feature-only process 8，以及私有目录持久化单元测试 3，合计 55 项全部通过；格式和 diff 检查也通过。实现者的默认 Rust 全套原始计数合计为 175 项，不将独立重复运行累加成新的测试数量。
+
 覆盖行为包括：先落文件再重启恢复；SQLite 触发器故意拒绝记录后保留 PNG/manifest 并在移除触发器后恢复；缺失、损坏、错误绑定及错误 ready manifest 不改变队列；旧 epoch、错误 attempt、queued 输入不创建目录；多页跨真实连接乱序暂存与精确重放各只有一条 result 事件；取消/结果两种先后顺序；放弃后的迟到文件不影响同页新请求。
+
+## 逐任务复查
+
+文件 vault 的首次复查发现 PNG 解码器默认未严格校验部分校验和、目录链接持久化检查不完整。两项均先以失败测试复现，再在 `cdcdfaf` 修复：显式开启 Adler32/所有块 CRC 校验；文件按 PNG 在前、manifest 在后确认持久化，并同步所持目录链。14 项 vault 与 3 项私有持久化测试通过，定向复查关闭两项问题。
+
+暂存桥 `b039f9b` 通过独立规格及质量复查，无新问题。取消意图跨重启的缺陷也以 `ResultReady` 与期望 `Cancelled` 不一致的失败测试复现后修复。完整分支复查尚待完成。
+
+新增直接依赖 png 0.18.1 的 MIT 归属已依据本地 crate 的完整许可证补充到 `THIRD_PARTY_NOTICES.md`。再次只读确认系统输出音量 0、提醒音量 0、输出静音开启；没有播放测试音，也未修改输入音量。
 
 ## 未完成且不能宣称
 

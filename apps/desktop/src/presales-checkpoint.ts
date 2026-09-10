@@ -481,6 +481,7 @@ function safeInteger(value: unknown, path: string, minimum: number): number {
 
 function rfc3339(value: unknown, path: string): string {
   const result = string(value, path);
+  // Mirror Chrono's fully consumed spelling domain without normalizing proof evidence.
   const parts = /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|(?:\+|-|−)(\d{2}):(\d{2}))$/u
     .exec(result);
   if (!parts) throw new Error(`${path} must be RFC3339`);

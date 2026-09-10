@@ -6,7 +6,7 @@ import {
 } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, URL } from 'node:url';
 import { TextDecoder } from 'node:util';
 
 const PACKAGE_ID = 'presales-ppt';
@@ -145,12 +145,22 @@ function hasExactKeys(value, keys) {
 function validateReferencePath(value) {
   if (
     typeof value !== 'string' ||
-    !value ||
+    !value.trim() ||
     value.startsWith('/') ||
     value.includes('\\') ||
     value.split('/').some((segment) => segment === '' || segment === '.' || segment === '..')
   ) {
     fail(`Unsafe source reference path: ${String(value)}`);
+  }
+}
+
+function isHttpsRepository(value) {
+  if (typeof value !== 'string') return false;
+  try {
+    const repository = new URL(value);
+    return repository.protocol === 'https:' && Boolean(repository.hostname);
+  } catch {
+    return false;
   }
 }
 
@@ -180,7 +190,7 @@ function validateSourceMetadata(source) {
       fail('Source names must be non-empty and unique');
     }
     seenNames.add(entry.name);
-    if (typeof entry.repository !== 'string' || !entry.repository.startsWith('https://')) {
+    if (!isHttpsRepository(entry.repository)) {
       fail(`Source repository must be an HTTPS URL: ${entry.name}`);
     }
     if (typeof entry.commit !== 'string' || !/^[0-9a-f]{40}$/u.test(entry.commit)) {

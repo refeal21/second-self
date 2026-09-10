@@ -258,6 +258,54 @@ describe('presales skill compiler', () => {
     expect(existsSync(resolve(fixture, GENERATED_PATH))).toBe(false);
   });
 
+  it('rejects a whitespace-only source reference', () => {
+    const fixture = createFixture();
+    writeFixtureFile(
+      fixture,
+      `${SKILL_ROOT}/sources.json`,
+      `${JSON.stringify({
+        sources: [
+          {
+            name: 'Synthetic upstream',
+            repository: 'https://example.invalid/synthetic',
+            commit: '0123456789abcdef0123456789abcdef01234567',
+            license: 'MIT',
+            references: ['   '],
+          },
+        ],
+      })}\n`,
+    );
+
+    const result = runCompiler(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(existsSync(resolve(fixture, GENERATED_PATH))).toBe(false);
+  });
+
+  it('rejects an HTTPS repository value without a hostname', () => {
+    const fixture = createFixture();
+    writeFixtureFile(
+      fixture,
+      `${SKILL_ROOT}/sources.json`,
+      `${JSON.stringify({
+        sources: [
+          {
+            name: 'Synthetic upstream',
+            repository: 'https://',
+            commit: '0123456789abcdef0123456789abcdef01234567',
+            license: 'MIT',
+            references: ['guide.md'],
+          },
+        ],
+      })}\n`,
+    );
+
+    const result = runCompiler(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(existsSync(resolve(fixture, GENERATED_PATH))).toBe(false);
+  });
+
   it('combines shared instructions with each stage reference', () => {
     const fixture = createFixture();
 

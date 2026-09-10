@@ -740,6 +740,7 @@ dependencies = [
  "chrono",
  "glob",
  "libc",
+ "png 0.18.1",
  "rusqlite",
  "serde",
  "serde_json",

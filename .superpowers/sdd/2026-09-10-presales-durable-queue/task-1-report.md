@@ -175,3 +175,17 @@ Task 2 must remain responsible for epoch establishment and lifecycle transitions
 Dispatching. It may extend the v1 schema and its verification list in the same future-v3 module,
 and must update job/event timestamps atomically. This task intentionally provides no generic
 status setter and no completion, publication, approval, filesystem-staging, or provider API.
+
+## Abandoned RED-process cleanup
+
+One pre-fix focused run timed out while the barrier race test was active. The new schema-index
+check initially rejected a worker connection before that worker reached the barrier, so the cargo
+process and remaining test participants continued waiting after the command harness returned.
+This was a test-harness defect, not a successful run: the race test was changed to open all four
+connections before spawning or entering the barrier, so setup failures now fail promptly.
+
+After the final verification, a read-only process check found the abandoned processes as cargo
+PID 5194 and its `presales_queue` child PID 5234, both rooted in this exact worktree. Both were
+sent targeted `SIGTERM` and a subsequent `ps` check returned no matching processes. No user app
+or unrelated process was stopped. The later focused 15/15 and full 119/119 results documented
+above were separate completed runs and remain valid.

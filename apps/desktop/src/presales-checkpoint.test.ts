@@ -2,6 +2,7 @@ import { build } from 'esbuild';
 import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import fixture from '../../../fixtures/presales/native-contract.json';
+import timestampSpellings from '../../../fixtures/presales/rfc3339-spellings.json';
 import {
   commitPresalesCheckpoint,
   loadPresalesCheckpoint,
@@ -207,6 +208,30 @@ describe('presales checkpoint transport', () => {
     invalid.pipeline.approvals[0]!.decidedAt = 'not-a-timestamp';
     invalid.pipeline.outline!.version.frozenAt = 'not-a-timestamp';
     invalid.presales!.approvalBindings[0]!.decidedAt = 'not-a-timestamp';
+    await expect(loadPresalesCheckpoint(async () => invalid, invalid.pipeline.project.id)).rejects.toThrow(/RFC3339/i);
+  });
+
+  it.each(timestampSpellings.accepted)('preserves the native-accepted approval timestamp %s', async (timestamp) => {
+    const valid = outlineApprovedCheckpoint();
+    valid.pipeline.project.updatedAt = timestamp;
+    valid.pipeline.outline!.version.frozenAt = timestamp;
+    valid.pipeline.approvals[0]!.decidedAt = timestamp;
+    valid.presales!.approvalBindings[0]!.decidedAt = timestamp;
+
+    const loaded = await loadPresalesCheckpoint(async () => structuredClone(valid), valid.pipeline.project.id);
+    expect(loaded.pipeline.project.updatedAt).toBe(timestamp);
+    expect(loaded.pipeline.outline!.version.frozenAt).toBe(timestamp);
+    expect(loaded.pipeline.approvals[0]!.decidedAt).toBe(timestamp);
+    expect(loaded.presales!.approvalBindings[0]!.decidedAt).toBe(timestamp);
+  });
+
+  it.each(timestampSpellings.rejected)('rejects the native-rejected approval timestamp %s', async (timestamp) => {
+    const invalid = outlineApprovedCheckpoint();
+    invalid.pipeline.project.updatedAt = timestamp;
+    invalid.pipeline.outline!.version.frozenAt = timestamp;
+    invalid.pipeline.approvals[0]!.decidedAt = timestamp;
+    invalid.presales!.approvalBindings[0]!.decidedAt = timestamp;
+
     await expect(loadPresalesCheckpoint(async () => invalid, invalid.pipeline.project.id)).rejects.toThrow(/RFC3339/i);
   });
 

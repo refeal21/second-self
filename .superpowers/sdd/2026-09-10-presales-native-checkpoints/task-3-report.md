@@ -96,3 +96,13 @@ Focused commands:
 - RED: with `loadVisualStyle` held behind a controlled deferred promise, the old sequence failed deterministically at `attempts.get(projectId)![0]` with no generation attempt.
 - GREEN: the test now proves the visible button is initially disabled, releases the style-load gate, waits for the actual enabled condition, clicks, and asserts `generateDetails` ran before resolving the attempt. No sleep, timeout increase, or production change was added.
 - Final verification: the exact test passed 1/1; the full desktop suite passed 326/326; desktop typecheck, zero-warning lint, and `git diff --check` exited 0.
+
+## Cross-boundary RFC3339 spelling alignment
+
+- Native authority check: Chrono 0.4.45 accepts `T`/`t`/space separators, `Z`/`z`, ASCII or U+2212 signed offsets through 23:59, arbitrary fractional precision, and second 60; it rejects invalid calendar dates, hour/minute/second overflow, offset 24:00, and an empty fraction.
+- Shared cases: `fixtures/presales/rfc3339-spellings.json` drives both the native persistence characterization and TypeScript transport tests.
+- RED: the transport matrix had 6 failures—lowercase/space/leap-second inputs were rejected while February 30 and 24:00 were accepted. The added U+2212 case then failed independently before its offset spelling was enabled.
+- GREEN: native characterization passed 1/1 across 8 accepted and 6 rejected values; the corresponding transport matrix passed 14/14. Accepted proof strings remain byte-for-byte unchanged in project update, version freeze, pipeline approval, and saved companion approval fields.
+- Implementation remains local to `rfc3339`: explicit Gregorian calendar and time/offset range checks replace `Date.parse`, without normalizing evidence or changing unrelated project timestamp handling.
+- Final affected verification: `src/presales-checkpoint.test.ts` passed 28/28; full Rust passed 104/104 (including `presales_storage` 16/16); desktop typecheck, zero-warning lint, production build (66 modules), Rust format, and diff checks exited 0.
+- Full desktop attempt 1 ran concurrently with the other full/static checks and passed 339/340; the existing structural-revision export e2e exceeded its 5-second limit, then passed alone 1/1 in 1.17 seconds. A serial full desktop retry passed that e2e but exposed the adjacent pre-existing details-generation style-readiness race (339/340); its exact retry passed 1/1 and an authorized separate test-only fix follows this timestamp commit.

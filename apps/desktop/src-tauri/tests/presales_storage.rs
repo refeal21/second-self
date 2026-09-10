@@ -115,9 +115,12 @@ fn save_first_pair(database: &Database, id: &str) -> (Value, PresalesDraftPair) 
 }
 
 fn outline_approval(current: &Value) -> Value {
+    outline_approval_at(current, "2026-09-10T00:03:00Z")
+}
+
+fn outline_approval_at(current: &Value, at: &str) -> Value {
     let mut next = current.clone();
     let id = current["project"]["id"].as_str().unwrap();
-    let at = "2026-09-10T00:03:00Z";
     next["revision"] = json!(current["revision"].as_i64().unwrap() + 1);
     next["project"]["updatedAt"] = json!(at);
     next["project"]["workflowStatus"] = json!("detail_review");
@@ -129,6 +132,66 @@ fn outline_approval(current: &Value) -> Value {
         "stage": "outline_review", "status": "approved", "decidedAt": at
     }));
     next
+}
+
+#[test]
+fn native_rfc3339_approval_spellings_define_the_transport_contract() {
+    let cases: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/presales/rfc3339-spellings.json"
+    ))
+    .unwrap();
+    for (index, timestamp) in cases["accepted"].as_array().unwrap().iter().enumerate() {
+        let timestamp = timestamp.as_str().unwrap();
+        let path = temporary_database(&format!("accepted-time-{index}"));
+        let id = format!("project-accepted-time-{index}");
+        let database = create_database(&path, &id);
+        let (outline, pair) = save_first_pair(&database, &id);
+        let approved = outline_approval_at(&outline, timestamp);
+
+        let saved = database
+            .replace_checkpoint_with_artifacts(
+                &id,
+                3,
+                &approved,
+                &pair,
+                &[],
+                VisualCommitContext::default(),
+                || Ok(()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.pipeline["project"]["updatedAt"], timestamp);
+        assert_eq!(saved.pipeline["outline"]["version"]["frozenAt"], timestamp);
+        assert_eq!(saved.pipeline["approvals"][0]["decidedAt"], timestamp);
+        assert_eq!(
+            saved.presales.unwrap().approval_bindings[0].decided_at,
+            timestamp
+        );
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+    for (index, timestamp) in cases["rejected"].as_array().unwrap().iter().enumerate() {
+        let timestamp = timestamp.as_str().unwrap();
+        let path = temporary_database(&format!("rejected-time-{index}"));
+        let id = format!("project-rejected-time-{index}");
+        let database = create_database(&path, &id);
+        let (outline, pair) = save_first_pair(&database, &id);
+        let rejected = outline_approval_at(&outline, timestamp);
+
+        assert!(database
+            .replace_checkpoint_with_artifacts(
+                &id,
+                3,
+                &rejected,
+                &pair,
+                &[],
+                VisualCommitContext::default(),
+                || Ok(()),
+            )
+            .is_err());
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 fn details_draft(current: &Value, pair: &PresalesDraftPair) -> Value {

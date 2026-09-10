@@ -107,3 +107,10 @@ Focused commands:
 - Final affected verification: `src/presales-checkpoint.test.ts` passed 28/28; full Rust passed 104/104 (including `presales_storage` 16/16); desktop typecheck, zero-warning lint, production build (66 modules), Rust format, and diff checks exited 0.
 - Full desktop attempt 1 ran concurrently with the other full/static checks and passed 339/340; the existing structural-revision export e2e exceeded its 5-second limit, then passed alone 1/1 in 1.17 seconds. A serial full desktop retry passed that e2e but exposed the adjacent pre-existing details-generation style-readiness race (339/340); its exact retry passed 1/1 and an authorized separate test-only fix follows this timestamp commit.
 - Follow-up full-consumption characterization: a shared terminal-newline value was already rejected by the current non-multiline JavaScript regex (there was no RED; `/...$/u` does not match before a final newline in this runtime). No redundant consumption guard was added; native 1/1, transport matrix 15/15, typecheck, and lint passed.
+
+## Deterministic remounted-running lifecycle test fix
+
+- The sibling running/remount test had the same initial style-readiness race as the mounted/off-page test: it waited for a visible details-generation button, clicked while the button could still be disabled, and immediately expected the running label.
+- Controlled RED: holding `loadVisualStyle` behind a deferred promise made the old sequence fail 1/1 with `Unable to find ... "正在生成逐页细化…"`; the rendered `生成逐页细化` button remained disabled.
+- GREEN: the test now asserts that initial disabled state, releases a valid style response, waits for the button to become enabled, clicks, and verifies `generateDetails` was called before checking running/remount state. No production code, sleep, or timeout changed.
+- Final verification: exact test passed 1/1 and a non-concurrent full desktop run passed 341/341, including both previously observed full-suite failure sites.

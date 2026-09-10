@@ -302,6 +302,141 @@ fn draft_checkpoint_is_exact(current: &Value, next: &Value, pair: &PresalesDraft
     expected == *next
 }
 
+fn version_state<'a>(pipeline: &'a Value, pointer: &str) -> Result<(&'a str, Option<&'a str>)> {
+    let version = required(pipeline, pointer)?
+        .as_object()
+        .ok_or_else(|| invalid(format!("pipeline field {pointer} must be an object")))?;
+    let status = version
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid(format!("pipeline field {pointer}/status must be a string")))?;
+    let frozen_at = match version.get("frozenAt") {
+        Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        _ => {
+            return Err(invalid(format!(
+                "pipeline field {pointer}/frozenAt must be null or a string"
+            )))
+        }
+    };
+    Ok((status, frozen_at))
+}
+
+fn validate_lifecycle(pipeline: &Value, checkpoint: &PresalesCheckpoint) -> Result<()> {
+    let object = pipeline
+        .as_object()
+        .ok_or_else(|| invalid("paired pipeline must be an object"))?;
+    if !object.contains_key("outline") || !object.contains_key("slideSpecs") {
+        return Err(invalid(
+            "paired pipeline requires explicit outline and slideSpecs slots",
+        ));
+    }
+    let approvals = required(pipeline, "/approvals")?
+        .as_array()
+        .ok_or_else(|| invalid("pipeline approvals must be an array"))?;
+    let bindings = &checkpoint.approval_bindings;
+    if approvals.len() != bindings.len() || bindings.len() > 2 {
+        return Err(invalid("paired approval proof set is incomplete"));
+    }
+    let project_id = string(pipeline, "/project/id")?;
+    let workflow = string(pipeline, "/project/workflowStatus")?;
+    let current_slide = pipeline.get("currentSlideId").ok_or_else(|| {
+        invalid("paired pipeline requires an explicit currentSlideId lifecycle slot")
+    })?;
+    let (outline_status, outline_frozen_at) = version_state(pipeline, "/outline/version")?;
+    let details_present = !pipeline["slideSpecs"].is_null();
+    if details_present != checkpoint.draft.details.is_some()
+        || details_present != checkpoint.basis.details.is_some()
+    {
+        return Err(invalid("paired details slot and companion must agree"));
+    }
+    let details_state = if details_present {
+        Some(version_state(pipeline, "/slideSpecs/version")?)
+    } else {
+        None
+    };
+
+    for (index, binding) in bindings.iter().enumerate() {
+        let expected_stage = if index == 0 {
+            "outline_review"
+        } else {
+            "detail_review"
+        };
+        if binding.stage != expected_stage || binding.skill != checkpoint.skill {
+            return Err(invalid(
+                "paired approval proof order or skill identity is invalid",
+            ));
+        }
+        exact_approval(
+            &approvals[index],
+            &project_id,
+            expected_stage,
+            &binding.version_id,
+            &binding.decided_at,
+        )?;
+        let hashes_match = if index == 0 {
+            binding.version_id == checkpoint.basis.outline.version_id
+                && binding.content_hash == checkpoint.basis.outline.content_hash
+                && binding.companion_hash == checkpoint.basis.outline.plan_hash
+        } else {
+            checkpoint.basis.details.as_ref().is_some_and(|details| {
+                binding.version_id == details.version_id
+                    && binding.content_hash == details.content_hash
+                    && binding.companion_hash == details.design_hash
+            })
+        };
+        if !hashes_match {
+            return Err(invalid("paired approval proof hashes are invalid"));
+        }
+    }
+
+    match bindings.as_slice() {
+        [] => {
+            if workflow != "outline_review"
+                || outline_status != "draft"
+                || outline_frozen_at.is_some()
+                || details_present
+                || !current_slide.is_null()
+            {
+                return Err(invalid(
+                    "unapproved paired state requires only an unfrozen outline draft",
+                ));
+            }
+        }
+        [outline] => {
+            if workflow != "detail_review"
+                || outline_status != "frozen"
+                || outline_frozen_at != Some(outline.decided_at.as_str())
+                || !current_slide.is_null()
+                || details_state
+                    .is_some_and(|(status, frozen_at)| status != "draft" || frozen_at.is_some())
+            {
+                return Err(invalid(
+                    "outline-approved paired state is inconsistent with its proof",
+                ));
+            }
+        }
+        [outline, details] => {
+            let Some((details_status, details_frozen_at)) = details_state else {
+                return Err(invalid("detail approval requires paired details"));
+            };
+            if workflow != "visual_review"
+                || outline_status != "frozen"
+                || outline_frozen_at != Some(outline.decided_at.as_str())
+                || details_status != "frozen"
+                || details_frozen_at != Some(details.decided_at.as_str())
+                || pipeline.pointer("/slideSpecs/value/0/id") != Some(current_slide)
+            {
+                return Err(invalid(
+                    "detail-approved paired state is inconsistent with its proofs",
+                ));
+            }
+        }
+        _ => return Err(invalid("unsupported paired approval proof set")),
+    }
+    Ok(())
+}
+
 fn first_enable(
     connection: &Connection,
     project_id: &str,
@@ -309,6 +444,30 @@ fn first_enable(
     next: &Value,
     pair: &PresalesDraftPair,
 ) -> Result<PresalesCheckpoint> {
+    let current_object = current
+        .as_object()
+        .ok_or_else(|| invalid("current pipeline must be an object"))?;
+    if !current_object.contains_key("outline") || !current_object.contains_key("slideSpecs") {
+        return Err(invalid(
+            "presales opt-in requires explicit outline and slideSpecs slots",
+        ));
+    }
+    if !current["slideSpecs"].is_null() {
+        return Err(invalid(
+            "presales opt-in cannot adopt details before joint outline approval",
+        ));
+    }
+    if !current["outline"].is_null() {
+        let (status, frozen_at) = version_state(current, "/outline/version")?;
+        if status != "draft" || frozen_at.is_some() {
+            return Err(invalid("presales opt-in cannot replace a frozen outline"));
+        }
+        if current["outline"] != next["outline"] {
+            return Err(invalid(
+                "presales opt-in must preserve an existing unfrozen outline",
+            ));
+        }
+    }
     if current["analysis"] != next["analysis"]
         || current["sources"] != next["sources"]
         || current["promptContext"] != next["promptContext"]
@@ -340,18 +499,14 @@ fn first_enable(
             "presales opt-in requires an unfrozen outline draft without approvals or downstream state",
         ));
     }
-    if pair.details.is_some()
-        && (next
-            .pointer("/slideSpecs/version/status")
-            .and_then(Value::as_str)
-            != Some("draft")
-            || next
-                .pointer("/slideSpecs/version/frozenAt")
-                .is_some_and(|value| !value.is_null()))
-    {
+    if pair.details.is_some() || !next["slideSpecs"].is_null() {
         return Err(invalid(
-            "presales opt-in details must remain an unfrozen draft",
+            "presales opt-in cannot contain details before joint outline approval",
         ));
+    }
+    let (submitted_status, submitted_frozen_at) = version_state(next, "/outline/version")?;
+    if submitted_status != "draft" || submitted_frozen_at.is_some() {
+        return Err(invalid("presales opt-in outline must be an unfrozen draft"));
     }
     if !current["approvals"].as_array().is_some_and(Vec::is_empty)
         || !current["visuals"]
@@ -373,6 +528,19 @@ fn first_enable(
             "presales opt-in cannot adopt visual generation history",
         ));
     }
+    let content_approval_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM approvals
+            WHERE project_id=?1 AND stage IN ('outline_review','detail_review')
+        )",
+        [project_id],
+        |row| row.get(0),
+    )?;
+    if content_approval_exists {
+        return Err(invalid(
+            "presales opt-in cannot adopt relational content approval history",
+        ));
+    }
     let mut expected = current.clone();
     expected["revision"] = next["revision"].clone();
     expected["project"]["updatedAt"] = next["project"]["updatedAt"].clone();
@@ -387,14 +555,16 @@ fn first_enable(
         ));
     }
     let basis = derive_basis(next, pair)?;
-    Ok(PresalesCheckpoint {
+    let checkpoint = PresalesCheckpoint {
         schema_version: 1,
         hash_algorithm: NATIVE_VALUE_HASH_ALGORITHM.into(),
         skill: skill_identity()?,
         draft: pair.clone(),
         basis,
         approval_bindings: Vec::new(),
-    })
+    };
+    validate_lifecycle(next, &checkpoint)?;
+    Ok(checkpoint)
 }
 
 pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
@@ -477,42 +647,7 @@ fn validate_loaded(pipeline: &Value, checkpoint: &PresalesCheckpoint) -> Result<
     {
         return Err(invalid("stored presales checkpoint identity is invalid"));
     }
-    let approvals = required(pipeline, "/approvals")?
-        .as_array()
-        .ok_or_else(|| invalid("persisted approvals must be an array"))?;
-    if approvals.len() != checkpoint.approval_bindings.len() {
-        return Err(invalid("stored presales approval evidence is incomplete"));
-    }
-    for binding in &checkpoint.approval_bindings {
-        let proof = approvals
-            .iter()
-            .find(|proof| proof["id"] == binding.approval_id)
-            .ok_or_else(|| invalid("stored approval binding has no pipeline proof"))?;
-        exact_approval(
-            proof,
-            &string(pipeline, "/project/id")?,
-            &binding.stage,
-            &binding.version_id,
-            &binding.decided_at,
-        )?;
-        let hashes_match = match binding.stage.as_str() {
-            "outline_review" => {
-                binding.version_id == checkpoint.basis.outline.version_id
-                    && binding.content_hash == checkpoint.basis.outline.content_hash
-                    && binding.companion_hash == checkpoint.basis.outline.plan_hash
-            }
-            "detail_review" => checkpoint.basis.details.as_ref().is_some_and(|details| {
-                binding.version_id == details.version_id
-                    && binding.content_hash == details.content_hash
-                    && binding.companion_hash == details.design_hash
-            }),
-            _ => false,
-        };
-        if binding.skill != checkpoint.skill || !hashes_match {
-            return Err(invalid("stored approval binding identity is invalid"));
-        }
-    }
-    Ok(())
+    validate_lifecycle(pipeline, checkpoint)
 }
 
 pub(crate) fn load_on(connection: &Connection, project_id: &str) -> Result<ProjectCheckpoint> {
@@ -673,14 +808,16 @@ pub(crate) fn prepare(
                     ));
                 }
             }
-            Ok(Some(PresalesCheckpoint {
+            let checkpoint = PresalesCheckpoint {
                 schema_version: 1,
                 hash_algorithm: NATIVE_VALUE_HASH_ALGORITHM.into(),
                 skill: prior.skill,
                 draft: pair.clone(),
                 basis,
                 approval_bindings,
-            }))
+            };
+            validate_lifecycle(next, &checkpoint)?;
+            Ok(Some(checkpoint))
         }
     }
 }

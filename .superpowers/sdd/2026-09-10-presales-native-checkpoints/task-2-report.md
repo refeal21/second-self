@@ -42,3 +42,13 @@
 - Enabled projects intentionally reject structural revision, downstream visual/export mutation and visual request start until later increments add paired receipts.
 - There is no skill-upgrade workflow. Existing projects retain their saved valid skill identity.
 - Direct out-of-process SQLite writes are outside the API guard boundary.
+
+## Review fix after `2b4cf2f`
+
+- RED: the focused `presales_storage` run reported four new failing regressions covering inconsistent first-enable freeze metadata, relational content-approval history, persisted lifecycle corruption and reordered proofs. One relational test initially duplicated its analysis setup and was corrected before production changes.
+- Added one paired lifecycle validator used on every accepted next checkpoint and every exact-revision reload. It requires explicit `outline`/`slideSpecs` slots and bidirectionally binds workflow, draft/frozen status, freeze time, detail availability, proof count/order, hashes and saved skill identity.
+- First enable now rejects prior frozen/inconsistent outlines, preserves an existing unfrozen outline, requires the submitted outline to be draft with null `frozenAt`, and forbids details before saved joint outline approval.
+- First enable now checks relational `outline_review`/`detail_review` history inside the immediate replacement transaction, so public approval inserts cannot be silently deleted during opt-in.
+- Added corrupt slot/status/time/workflow/order reload cases and a next-commit case proving corrupt prior state fails closed.
+- Focused GREEN: `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_storage` passed 14/14 tests.
+- Final formatting check passed. Final `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` passed 91/91 tests with no doc-test failures.

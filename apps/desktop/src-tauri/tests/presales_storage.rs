@@ -73,8 +73,18 @@ fn outline_pair() -> PresalesDraftPair {
 fn first_paired_checkpoint(database: &Database, id: &str) -> (Value, PresalesDraftPair) {
     let current = analysis_checkpoint(database, id);
     let pair = outline_pair();
-    let mut next = current;
-    next["revision"] = json!(3);
+    let next = first_paired_checkpoint_from(&current, id, &pair, 3);
+    (next, pair)
+}
+
+fn first_paired_checkpoint_from(
+    current: &Value,
+    id: &str,
+    pair: &PresalesDraftPair,
+    revision: i64,
+) -> Value {
+    let mut next = current.clone();
+    next["revision"] = json!(revision);
     next["project"]["workflowStatus"] = json!("outline_review");
     next["project"]["updatedAt"] = json!("2026-09-10T00:02:00Z");
     next["outline"] = json!({
@@ -84,7 +94,7 @@ fn first_paired_checkpoint(database: &Database, id: &str) -> (Value, PresalesDra
         },
         "value": pair.outline["outline"]
     });
-    (next, pair)
+    next
 }
 
 fn save_first_pair(database: &Database, id: &str) -> (Value, PresalesDraftPair) {
@@ -152,6 +162,15 @@ fn detail_approval(current: &Value) -> Value {
         "stage": "detail_review", "status": "approved", "decidedAt": at
     }));
     next
+}
+
+fn replace_raw_pipeline(path: &std::path::Path, id: &str, pipeline: &Value) {
+    let raw = Connection::open(path).unwrap();
+    raw.execute(
+        "UPDATE projects SET pipeline_json=?2 WHERE id=?1",
+        rusqlite::params![id, serde_json::to_string(pipeline).unwrap()],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -278,6 +297,212 @@ fn checkpoint_reload_preserves_a_valid_saved_skill_identity() {
     assert_eq!(skill.version, "0.9.0");
     assert_eq!(skill.sha256, "0".repeat(64));
     drop(reopened);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn first_enable_rejects_prior_freeze_and_inconsistent_submitted_draft_metadata() {
+    let path = temporary_database("first-enable-freeze");
+    let id = "project-first-enable-freeze";
+    let database = create_database(&path, id);
+    let current = analysis_checkpoint(&database, id);
+    let pair = outline_pair();
+
+    let mut inconsistent = first_paired_checkpoint_from(&current, id, &pair, 3);
+    inconsistent["outline"]["version"]["frozenAt"] = json!("2026-09-10T00:02:00Z");
+    assert!(database
+        .replace_checkpoint_with_artifacts(
+            id,
+            2,
+            &inconsistent,
+            &pair,
+            &[],
+            VisualCommitContext::default(),
+            || Ok(()),
+        )
+        .is_err());
+
+    let mut frozen = first_paired_checkpoint_from(&current, id, &pair, 3);
+    frozen["outline"]["version"]["status"] = json!("frozen");
+    frozen["outline"]["version"]["frozenAt"] = json!("2026-09-10T00:02:00Z");
+    assert!(database.replace_pipeline(id, 2, &frozen, &[]).unwrap());
+    let mut attempted = frozen.clone();
+    attempted["revision"] = json!(4);
+    attempted["project"]["updatedAt"] = json!("2026-09-10T00:03:00Z");
+    attempted["outline"]["version"]["status"] = json!("draft");
+    attempted["outline"]["version"]["frozenAt"] = Value::Null;
+    assert!(database
+        .replace_checkpoint_with_artifacts(
+            id,
+            3,
+            &attempted,
+            &pair,
+            &[],
+            VisualCommitContext::default(),
+            || Ok(()),
+        )
+        .is_err());
+    drop(database);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn first_enable_rejects_relational_content_approval_history_atomically() {
+    let path = temporary_database("relational-approval");
+    let id = "project-relational-approval";
+    let database = create_database(&path, id);
+    let current = analysis_checkpoint(&database, id);
+    database
+        .insert_approval(&StoredApproval {
+            id: "prior-content-approval".into(),
+            project_id: id.into(),
+            version_id: "legacy-outline".into(),
+            stage: "outline_review".into(),
+            slide_id: None,
+            status: "pending".into(),
+            title: "Prior content approval".into(),
+            detail: "Must block opt-in".into(),
+            author: "local".into(),
+            created_at: "2026-09-10T00:01:30Z".into(),
+            decided_at: None,
+        })
+        .unwrap();
+    let pair = outline_pair();
+    let next = first_paired_checkpoint_from(&current, id, &pair, 3);
+    assert!(database
+        .replace_checkpoint_with_artifacts(
+            id,
+            2,
+            &next,
+            &pair,
+            &[],
+            VisualCommitContext::default(),
+            || Ok(()),
+        )
+        .is_err());
+    assert_eq!(database.list_pending_approvals().unwrap().len(), 1);
+    let raw = Connection::open(&path).unwrap();
+    let markers: i64 = raw
+        .query_row("SELECT COUNT(*) FROM presales_projects", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(markers, 0);
+    drop(raw);
+    drop(database);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn reload_and_next_commit_reject_divergent_paired_lifecycle_state() {
+    let path = temporary_database("lifecycle-corruption");
+    let id = "project-lifecycle-corruption";
+    let database = create_database(&path, id);
+    let (draft, pair) = save_first_pair(&database, id);
+
+    let mut missing_slot = draft.clone();
+    missing_slot.as_object_mut().unwrap().remove("slideSpecs");
+    replace_raw_pipeline(&path, id, &missing_slot);
+    assert!(database.load_project_checkpoint(id).is_err());
+
+    let mut frozen_without_proof = draft.clone();
+    frozen_without_proof["outline"]["version"]["status"] = json!("frozen");
+    frozen_without_proof["outline"]["version"]["frozenAt"] = json!("2026-09-10T00:03:00Z");
+    replace_raw_pipeline(&path, id, &frozen_without_proof);
+    assert!(database.load_project_checkpoint(id).is_err());
+
+    let mut wrong_workflow = draft.clone();
+    wrong_workflow["project"]["workflowStatus"] = json!("detail_review");
+    replace_raw_pipeline(&path, id, &wrong_workflow);
+    assert!(database.load_project_checkpoint(id).is_err());
+    replace_raw_pipeline(&path, id, &draft);
+
+    let approved = outline_approval(&draft);
+    database
+        .replace_checkpoint_with_artifacts(
+            id,
+            3,
+            &approved,
+            &pair,
+            &[],
+            VisualCommitContext::default(),
+            || Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+    let mut wrong_time = approved.clone();
+    wrong_time["outline"]["version"]["frozenAt"] = json!("2026-09-10T00:03:01Z");
+    replace_raw_pipeline(&path, id, &wrong_time);
+    assert!(database.load_project_checkpoint(id).is_err());
+    let mut next = wrong_time.clone();
+    next["revision"] = json!(5);
+    next["project"]["updatedAt"] = json!("2026-09-10T00:04:00Z");
+    assert!(database
+        .replace_checkpoint_with_artifacts(
+            id,
+            4,
+            &next,
+            &pair,
+            &[],
+            VisualCommitContext::default(),
+            || Ok(()),
+        )
+        .is_err());
+    drop(database);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn reload_rejects_reordered_joint_approval_proofs() {
+    let path = temporary_database("approval-order");
+    let id = "project-approval-order";
+    let database = create_database(&path, id);
+    let (outline, outline_pair) = save_first_pair(&database, id);
+    let approved_outline = outline_approval(&outline);
+    database
+        .replace_checkpoint_with_artifacts(
+            id,
+            3,
+            &approved_outline,
+            &outline_pair,
+            &[],
+            VisualCommitContext::default(),
+            || Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+    let full_pair: PresalesDraftPair = serde_json::from_value(fixture()["pair"].clone()).unwrap();
+    let details = details_draft(&approved_outline, &full_pair);
+    database
+        .replace_checkpoint_with_artifacts(
+            id,
+            4,
+            &details,
+            &full_pair,
+            &[],
+            VisualCommitContext::default(),
+            || Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+    let approved_details = detail_approval(&details);
+    database
+        .replace_checkpoint_with_artifacts(
+            id,
+            5,
+            &approved_details,
+            &full_pair,
+            &[],
+            VisualCommitContext::default(),
+            || Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+    let mut reordered = approved_details;
+    reordered["approvals"].as_array_mut().unwrap().reverse();
+    replace_raw_pipeline(&path, id, &reordered);
+    assert!(database.load_project_checkpoint(id).is_err());
+    drop(database);
     std::fs::remove_file(path).unwrap();
 }
 

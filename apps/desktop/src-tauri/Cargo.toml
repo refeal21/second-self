@@ -19,6 +19,11 @@ path = "src/bin/production-harness.rs"
 required-features = ["acceptance-harness"]
 
 [[bin]]
+name = "queue-harness"
+path = "src/bin/queue-harness.rs"
+required-features = ["acceptance-harness"]
+
+[[bin]]
 name = "process-rss-sampler"
 path = "src/bin/process-rss-sampler.rs"
 required-features = ["acceptance-harness"]

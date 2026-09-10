@@ -90,7 +90,7 @@ impl QueueStore {
 
 The above structs derive Clone/Debug/PartialEq, Serialize and Deserialize. Small leaf structs/enums may derive Eq. `QueueStore` is not Clone. Shared transaction-local read helpers can be `pub(super)` for Task 2.
 
-- [ ] **Step 1: Write behavioral admission tests first.** An empty store starts at epoch 0; future supervisor will establish each subsequent epoch via Task 2. Enqueue five literal synthetic jobs across two projects. Claim four, require FIFO request IDs `r1,r2,r3,r4`, fifth claim is None. Require persisted Dispatching and unchanged target. Verify separate connections racing claims never admit more than the global limit; use a Barrier and real file DB, not sleeps or mock counts.
+- [x] **Step 1: Write behavioral admission tests first.** An empty store starts at epoch 0; future supervisor will establish each subsequent epoch via Task 2. Enqueue five literal synthetic jobs across two projects. Claim four, require FIFO request IDs `r1,r2,r3,r4`, fifth claim is None. Require persisted Dispatching and unchanged target. Verify separate connections racing claims never admit more than the global limit; use a Barrier and real file DB, not sleeps or mock counts.
 
 ```rust
 let mut store = QueueStore::open_in_memory().unwrap();
@@ -105,9 +105,9 @@ assert!(store.claim_next(0).unwrap().is_none());
 
 Fixture helpers construct explicit synthetic `QueueTarget` values with literal version IDs and 64-character lowercase hex hashes; no real files or accounts. Additional tests cover limits 1/2/4, lower-to-1 holding all running slots, raising-to-4 allowing next queued jobs, persisted settings/batch pauses, exact batch replay, different-page progress during same-page dedup, transactional rollback for invalid second input, globally reused request/attempt IDs and changed batch replay rejection.
 
-- [ ] **Step 2: Run the RED tests.** `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue`. Record the missing-module/API diagnostic if the new module does not yet exist; after minimal declarations ensure new behavior assertions fail before filling implementations.
+- [x] **Step 2: Run the RED tests.** `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue`. Record the missing-module/API diagnostic if the new module does not yet exist; after minimal declarations ensure new behavior assertions fail before filling implementations.
 
-- [ ] **Step 3: Implement typed validation and dedicated schema/admission.** Identity strings use existing lowercase identifier semantics (`^[a-z0-9][a-z0-9_-]{0,63}$`). Version strings and prompt_version are nonblank <=128 UTF-8 bytes; hashes exactly 64 lowercase hex; prompt 1..65536 bytes, feedback <=16384, references <=32 with unique asset IDs; batch size 1..100, no duplicate pages/requests/attempts within a batch. Reject NUL in all free text. Bound stored target JSON to 128 KiB. Parent reference optional and separate in meaning from scene references.
+- [x] **Step 3: Implement typed validation and dedicated schema/admission.** Identity strings use existing lowercase identifier semantics (`^[a-z0-9][a-z0-9_-]{0,63}$`). Version strings and prompt_version are nonblank <=128 UTF-8 bytes; hashes exactly 64 lowercase hex; prompt 1..65536 bytes, feedback <=16384, references <=32 with unique asset IDs; batch size 1..100, no duplicate pages/requests/attempts within a batch. Reject NUL in all free text. Bound stored target JSON to 128 KiB. Parent reference optional and separate in meaning from scene references.
 
 Use SQLite `application_id = 0x44545133` (DTQ3), `user_version = 1`; initialize only an empty unowned database. Inspect both markers and existing user tables **before** WAL/schema mutation; reject foreign DBs and unknown versions without changing them. Existing identified DB must have the expected schema. Enable foreign_keys, busy_timeout 5000 ms, WAL for file-backed DBs, synchronous FULL. Persist settings, batches, jobs, attempts and transition events; reserve result/audit schema for Task 2 as needed without fake completion APIs.
 
@@ -115,12 +115,14 @@ Each manual generation is a new Job and a single immutable attempt; retry never 
 
 Claim one eligible job in global sequence order inside `TransactionBehavior::Immediate`, verify expected epoch matches settings, honor global and batch pauses, and count dispatching/running/cancel_requested/outcome_unknown as occupying provider slots. Set Dispatching + epoch + persisted transition before returning it. result_ready/committing retain same-page lock but not long-call slots. No call to any provider. Native epoch-millisecond clock supplies created_at_ms/updated_at_ms on insertion, dispatched_at_ms/updated_at_ms on claim, and event timestamps. Exact replay preserves all timestamps. Sequence, not wall clock, is the FIFO authority; test persisted real timestamps and the absent-before/present-after dispatch boundary without sleeps.
 
-- [ ] **Step 4: Verify and self-review.** Run focused tests, then default complete Rust suite once; run cargo fmt check and git diff --check. Verify an unrelated/legacy-looking DB retains tables/data/markers after failed open, and reopen preserves request snapshots/settings/dispatching (open alone does not decide recovery).
-- [ ] **Step 5: Commit.** Stage only Task 1 files and commit `feat: add isolated durable generation queue admission`. Report exact RED/GREEN commands/results and interfaces.
+- [x] **Step 4: Verify and self-review.** Run focused tests, then default complete Rust suite once; run cargo fmt check and git diff --check. Verify an unrelated/legacy-looking DB retains tables/data/markers after failed open, and reopen preserves request snapshots/settings/dispatching (open alone does not decide recovery).
+- [x] **Step 5: Commit.** Stage only Task 1 files and commit `feat: add isolated durable generation queue admission`. Report exact RED/GREEN commands/results and interfaces.
 
 ### Task 2: Durable attempt transitions, cancellation and conservative recovery
 
-**Files:** Create `presales_queue/lifecycle.rs`, `tests/presales_queue_lifecycle.rs`; extend `mod.rs`, `contracts.rs`, `store.rs` only for lifecycle shared schema/helpers.
+**Files:** Create `presales_queue/lifecycle.rs`, `tests/presales_queue_lifecycle.rs`; extend `mod.rs`, `contracts.rs`, `store.rs` only for lifecycle shared schema/helpers. Update `tests/presales_queue.rs` for the new schema version and rejection-without-mutation regression.
+
+Lifecycle storage advances `user_version` from 1 to 2. Initialize new empty databases at 2; reject existing v1 databases without mutation, with no migration in this isolated increment. V1 databases are synthetic/unreleased, not customer project data. Preserve Task 1 transition audit and use a focused lifecycle event table for evidence. This supersedes Task 1's initial version for the final increment.
 
 **Interfaces:** Consumes Task 1 public contracts, atomic store and state predicates. Produces:
 
@@ -153,7 +155,7 @@ impl QueueStore {
 }
 ```
 
-- [ ] **Step 1: Write lifecycle RED tests.** Show pending cancel/unknown retain a slot, ordinary result_ready releases only the provider slot, queued cancel never dispatches, failed one page does not block other pages, immutable provider identity (thread learned before optional turn) persists immediately, valid duplicate event is idempotent and conflicting duplicate rejected. Begin-runtime once, claim, reopen without changing status, begin-runtime again, require unknown, retained ID/target, changed epoch; old callbacks fail and no automatic requeue.
+- [x] **Step 1: Write lifecycle RED tests.** Show pending cancel/unknown retain a slot, ordinary result_ready releases only the provider slot, queued cancel never dispatches, failed one page does not block other pages, immutable provider identity (thread learned before optional turn) persists immediately, valid duplicate event is idempotent and conflicting duplicate rejected. Begin-runtime once, claim, reopen without changing status, begin-runtime again, require unknown, retained ID/target, changed epoch; old callbacks fail and no automatic requeue.
 
 ```rust
 let first = store.begin_runtime().unwrap().settings.epoch;
@@ -166,14 +168,14 @@ assert_eq!(restarted.unresolved_remote_count, 1);
 assert!(store.confirm_cancelled(first, &claim.request_id, &claim.attempt_id).is_err());
 ```
 
-- [ ] **Step 2: Run RED.** `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue_lifecycle`; retain failing evidence before adding lifecycle code.
-- [ ] **Step 3: Implement transactionally guarded transitions.** Epoch is a monotonic native counter; checked increment, never caller-selected. `begin_runtime` is supervisor-only: increment epoch, move Dispatching/Running/CancelRequested to OutcomeUnknown, preserve their identities/snapshots and record recovery events; assign the new epoch to these unresolved attempts so verified recovery can later resolve them. Already OutcomeUnknown also acquires new epoch. Queued is untouched, ResultReady and terminal rows untouched. Old-epoch provider/terminal/result callbacks cannot mutate current state. Opening a second DB connection does not start a new runtime.
+- [x] **Step 2: Run RED.** `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue_lifecycle`; retain failing evidence before adding lifecycle code.
+- [x] **Step 3: Implement transactionally guarded transitions.** Epoch is a monotonic native counter; checked increment, never caller-selected. `begin_runtime` is supervisor-only: increment epoch, move Dispatching/Running/CancelRequested to OutcomeUnknown, preserve their identities/snapshots and record recovery events; assign the new epoch to these unresolved attempts so verified recovery can later resolve them. Already OutcomeUnknown also acquires new epoch. Queued is untouched, ResultReady and terminal rows untouched. Old-epoch provider/terminal/result callbacks cannot mutate current state. Opening a second DB connection does not start a new runtime.
 
 Record_provider permits Dispatching/Running/CancelRequested/OutcomeUnknown; it can fill thread first then turn, never change either known identity. Move Dispatching to Running only on observed identity, not dispatch request alone. Retain CancelRequested/OutcomeUnknown states during identity fill. Provider thread/turn are nonblank <=256 bytes, no control characters; errors/reasons nonblank <=4096 bytes.
 
 Every actual lifecycle change updates native updated_at_ms and creates a native-timestamped QueueEvent in the same transaction. Preserve created/dispatched timestamps and do not reset elapsed time on recovery or idempotent replay.
 
-Transition table (exact replay of the same evidence returns current value without duplicate history; differing evidence fails):
+Transition table (exact replay of the same provider/terminal/result evidence returns current value without duplicate history; differing evidence fails). `request_cancel` is a current control intent: after recovery or ambiguity changes the job to OutcomeUnknown, calling it may re-enter CancelRequested as shown below. It retains the same slot and generation identity; repeating it in CancelRequested/Cancelled is a no-op. This does not dispatch another generation or imply automatic provider retry:
 
 | Operation | Allowed source | Destination |
 |---|---|---|
@@ -191,8 +193,8 @@ Abandon false fails without mutation. Abandoned attempts retain unresolved-remot
 
 StagedResult is only an internal manifest declaration: relative path must be exactly `queue-results/{request_id}/{attempt_id}.png`, SHA-256 valid, byte_length 1..52428800. No URLs, absolute/traversal/backslash paths or raw PNG/base64. This store must document that only the future trusted file stager may call record_result_ready; the harness is synthetic, not that stager. Metadata duplicates are exact; different hash/size/path rejected. Record events and status change in one transaction; preserve immutable original feedback and content/design/palette references in every branch.
 
-- [ ] **Step 4: Verify.** Test cancellation/result order races over separate real connections, unknown restart, confirmed terminal release, explicit abandonment + fresh same-page request + stale result audit, repeated same-page manual requests >=5 with no revision limit after each confirmed terminal, malformed manifests/identities, and all illegal transitions leave durable state unchanged. Run both queue test files plus default full Rust suite and formatting/diff check.
-- [ ] **Step 5: Commit.** `feat: persist queue attempt recovery and cancellation`; report test evidence and staging boundary limitations.
+- [x] **Step 4: Verify.** Test cancellation/result order races over separate real connections, unknown restart, confirmed terminal release, explicit abandonment + fresh same-page request + stale result audit, repeated same-page manual requests >=5 with no revision limit after each confirmed terminal, malformed manifests/identities, and all illegal transitions leave durable state unchanged. Run both queue test files plus default full Rust suite and formatting/diff check.
+- [x] **Step 5: Commit.** `feat: persist queue attempt recovery and cancellation`; report test evidence and staging boundary limitations.
 
 ### Task 3: Feature-only queue JSONL transport and actual process restart
 
@@ -225,7 +227,7 @@ harness.close              {}
 
 Do not call begin_runtime implicitly on process start: tests/read-only inspection may open additional connections without stealing ownership. Future supervisor is its only production owner. No succeeded or arbitrary SQL command.
 
-- [ ] **Step 1: Write process RED tests behind `cfg(feature = "acceptance-harness")`.** Spawn actual `CARGO_BIN_EXE_queue-harness` with a unique test-created temp directory; send serialized lines over stdin, collect correlated responses with a bounded test watchdog (kill only owned test child on failure). Enqueue across two projects, beginRuntime, claim with cap1, save provider thread then turn, request cancellation and close actual child. Spawn a new child with same DB, snapshot unchanged, beginRuntime becomes unknown retaining provider IDs; queued second page remains blocked until explicit terminal or risk acknowledgment. Assert no duplicate jobs and original feedback remains. A separate test records ResultReady manifest, restarts, and proves no new claim of that page and no candidate/approval/succeeded fabricated.
+- [x] **Step 1: Write process RED tests behind `cfg(feature = "acceptance-harness")`.** Spawn actual `CARGO_BIN_EXE_queue-harness` with a unique test-created temp directory; send serialized lines over stdin, collect correlated responses with a bounded test watchdog (kill only owned test child on failure). Enqueue across two projects, beginRuntime, claim with cap1, save provider thread then turn, request cancellation and close actual child. Spawn a new child with same DB, snapshot unchanged, beginRuntime becomes unknown retaining provider IDs; queued second page remains blocked until explicit terminal or risk acknowledgment. Assert no duplicate jobs and original feedback remains. A separate test records ResultReady manifest, restarts, and proves no new claim of that page and no candidate/approval/succeeded fabricated.
 
 ```rust
 let mut first = Harness::spawn(&database);
@@ -241,10 +243,10 @@ assert_eq!(recovered["result"]["jobs"][0]["status"], "outcome_unknown");
 
 Fixtures enqueue `r1` before the code above. Child/test helpers live only in tests and always reap child processes. Also test malformed/unknown command/invalid arguments followed by successful settings request, failed foreign-DB startup without mutation, and no implicit recovery simply by spawning another read-only child.
 
-- [ ] **Step 2: Run RED.** `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features acceptance-harness --test presales_queue_process`; record missing binary/behavior diagnostics.
-- [ ] **Step 3: Implement short synchronous command dispatch.** Strictly decode command-specific params (deny unknown fields), forward only typed queue operations, flush one line per response, no raw secrets in error formatting. Large transport lines >262144 bytes rejected; bounded read prevents unbounded allocation before rejection and drains to the next newline so the next request succeeds. Handle byte-fragmented UTF-8 only after a complete line is assembled. Existing production-harness unchanged. The shared dispatcher has no generic SQL/Tauri method routing. Queue state requests are short; this binary does not perform long image calls or prove the future Worker async scheduler. Process tests send fragmented/coalesced input, include Chinese feedback, reject reserved-ID/method/params misuse and prove recovery after oversized lines.
-- [ ] **Step 4: Verify increment.** Run feature process tests and all queue tests, `pnpm test`, `pnpm typecheck`, `pnpm lint`, `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check`, and `git diff --check`. Record synthetic coverage distinctly from actual account/PNG/UI acceptance. No application build/installation, customer-data migration or live provider calls.
-- [ ] **Step 5: Commit.** `test: exercise durable queue through native process transport`. Parent writes `docs/verification-2026-09-10-presales-durable-queue.md` after independent review and marks completed plan steps. Preserve the ongoing feature branch; no merge or push of an unfinished user-facing feature.
+- [x] **Step 2: Run RED.** `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features acceptance-harness --test presales_queue_process`; record missing binary/behavior diagnostics.
+- [x] **Step 3: Implement short synchronous command dispatch.** Strictly decode command-specific params (deny unknown fields), forward only typed queue operations, flush one line per response, no raw secrets in error formatting. Large transport lines >262144 bytes rejected; bounded read prevents unbounded allocation before rejection and drains to the next newline so the next request succeeds. Handle byte-fragmented UTF-8 only after a complete line is assembled. Existing production-harness unchanged. The shared dispatcher has no generic SQL/Tauri method routing. Queue state requests are short; this binary does not perform long image calls or prove the future Worker async scheduler. Process tests send fragmented/coalesced input, include Chinese feedback, reject reserved-ID/method/params misuse and prove recovery after oversized lines.
+- [x] **Step 4: Verify increment.** Run feature process tests and all queue tests, `pnpm test`, `pnpm typecheck`, `pnpm lint`, `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check`, and `git diff --check`. Record synthetic coverage distinctly from actual account/PNG/UI acceptance. No application build/installation, customer-data migration or live provider calls.
+- [x] **Step 5: Commit.** `test: exercise durable queue through native process transport`. Parent writes `docs/verification-2026-09-10-presales-durable-queue.md` after independent review and marks completed plan steps. Preserve the ongoing feature branch; no merge or push of an unfinished user-facing feature.
 
 ## Plan self-review
 

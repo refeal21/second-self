@@ -42,7 +42,7 @@ tauri-utils = "2.9.3"
 
 [dependencies]
 libc = "0.2"
-png = "0.18.1"
+png = "=0.18.1"
 base64 = "0.22"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }

@@ -10,6 +10,8 @@
 
 **Spec:** ../specs/2026-09-09-presales-batch-visual-design.md
 
+**Foundation status (2026-09-10):** implemented and independently reviewed at `6bd962a`; 674 TypeScript tests, typecheck, lint, desktop build and generated-rule check pass. See [verification record](../../verification-2026-09-10-presales-foundation.md). Live native/UI integration and the overall multi-page feature remain pending.
+
 ## Global Constraints
 
 - 不增加按量计费 API、API Key 配置、本地 HTTP 服务或新的渲染平台。
@@ -50,7 +52,7 @@ No scope is removed. A foundation test pass must not be reported as concurrent g
 - Bundler CLI: `node scripts/compile-presales-skill.mjs [--check] [--root absolute-repo-path]`. Default repo root is resolved from script location, not process cwd. Check mode is strictly read-only; missing/stale output exits nonzero.
 - No browser or Worker runtime filesystem reads; no remote updates.
 
-- [ ] **Step 1: Write tests before the compiler.**
+- [x] **Step 1: Write tests before the compiler.**
 
 ```ts
 it('check detects a changed skill without updating generated output', async () => {
@@ -66,8 +68,8 @@ it('check detects a changed skill without updating generated output', async () =
 
 The helpers are test-local fs/child_process operations, not production test hooks. Also test byte-identical two builds, invocation from another cwd, missing required reference, source metadata hash change, and malformed manifest. Do not test skill quality by grepping prose.
 
-- [ ] **Step 2: Run `pnpm --filter @digital-twin/worker exec vitest run src/presales/skill-build.test.ts`; record the expected preimplementation failure.**
-- [ ] **Step 3: Implement compiler and minimal stage references.**
+- [x] **Step 2: Run `pnpm --filter @digital-twin/worker exec vitest run src/presales/skill-build.test.ts`; record the expected preimplementation failure.**
+- [x] **Step 3: Implement compiler and minimal stage references.**
 
 Use node:crypto SHA-256 of exact UTF-8 source bytes, deterministic ordered file paths, no time/env in output. Manifest fixed source paths: SKILL.md, references/outline.md, references/details.md, references/visual.md and sources.json. Validate package id/version and source metadata; reject path traversal and missing files. Output a TypeScript const via JSON.stringify, with no runtime node imports. Every stage combines the shared entrypoint body with its stage reference.
 
@@ -79,8 +81,8 @@ Sources.json records these exact upstream pins and consulted references (rules a
 
 Skill covers goals → architecture OR overview → mapped function pages → role/scenario steps. Teach relational forms rather than equal cards everywhere. All visible text has one authority; scene design references approved text once, not a second paraphrase. Fixed palette comes from project, no hardcoded corporate blue/red and no invented interfaces or benefits. Missing evidence can be a visible question, not an unqualified assertion. Long notes remain separate and never silently replace frozen text. Explain full-slide output, not background-only output. No automatic API fallback, no automatic approvals.
 
-- [ ] **Step 4: Run focused tests, `node scripts/compile-presales-skill.mjs --check`, worker typecheck and skill quick_validate. Record behavior baseline and forward validation separately; structural tests do not prove visual quality.**
-- [ ] **Step 5: Commit only task-owned files after diff check.**
+- [x] **Step 4: Run focused tests, `node scripts/compile-presales-skill.mjs --check`, worker typecheck and skill quick_validate. Record behavior baseline and forward validation separately; structural tests do not prove visual quality.**
+- [x] **Step 5: Commit only task-owned files after diff check.**
 
 ### Task 2: Joint model-envelope and semantic-reference validation
 
@@ -111,7 +113,7 @@ function parseDetailsEnvelope(raw: unknown, outline: OutlineEnvelope, analysis: 
 
 These are model draft envelopes: no model-computed hashes or claims of approval. Runtime-derived binding text hashes and native authority snapshots belong to the next persistence increment. Inputs are cloned; no mutation or frozen approval metadata is returned. Stage rules must not ask the model for unsupported fields.
 
-- [ ] **Step 1: Write regression tests with literal synthetic fixtures.**
+- [x] **Step 1: Write regression tests with literal synthetic fixtures.**
 
 ```ts
 it('rejects a scene referencing an absent binding instead of silently dropping it', () => {
@@ -130,14 +132,14 @@ it('rejects notes as a visible text binding', () => {
 
 Also test full valid roundtrip, input immutability, extra fields, duplicate IDs, mismatched page order/title/count, dangling modules, architecture/overview missing a module, module never covered by a later module/scenario page, invalid source findings, unsupported scene edges/self edge, scene module outside page membership, numeric/negative/out-of-range paths, unknown source IDs, body strings vs arrays, NaN/chart/table width, too many pages and excessive payload. Empty optional collections allowed; architecture and overview both allowed when explicitly present in approved outline. No speculative semantic guessing from text.
 
-- [ ] **Step 2: Run focused tests and verify missing implementation fails.**
-- [ ] **Step 3: Implement strict bounded validation.**
+- [x] **Step 2: Run focused tests and verify missing implementation fails.**
+- [x] **Step 3: Implement strict bounded validation.**
 
 Object keys allowlisted with prototype-safe lookups. Maximum 100 pages, 100 modules, 100 text bindings/scene steps per page, 400 scene edges; max envelope UTF-8 bytes 2 MiB; individual descriptive string 20,000 chars. IDs use existing strict identifier validation. Title/body/table/header/row/chart category/series name and numeric value/shape text paths only, using exact index syntax without leading zero/negative/escaped prototype segments. Every scene reference resolves to one binding whose path points to a supported visible leaf. Every visible leaf has exactly one binding (including numeric chart values), with stable IDs local to the page; no path duplication. Scene roles/location are illustrative design data; no additional text is implied on screen. Validation checks existing strict SlideSpec shapes, numbers, sources and exact outline agreement without legacy normalization that could hide defects.
 
 Keep helpers private unless another production module consumes them. `resolveVisibleBindings(spec, design)` may be public only for Task 3 consumption and returns `{id,path,text}[]`, where chart numbers are formatted with String without changing the source number.
 
-- [ ] **Step 4: Run focused tests, worker typecheck/lint, then commit task files.**
+- [x] **Step 4: Run focused tests, worker typecheck/lint, then commit task files.**
 
 ### Task 3: Explicit opt-in planning prompts and approved-scene rendering
 
@@ -156,7 +158,7 @@ buildPptPrompt(pipeline, stage, style?, presales?: PresalesPromptOptions): strin
 
 DesignPlan here is validated data supplied by the later trusted native loader; builder validation is defense-in-depth, not approval authorization. No live adapter opt-in before native snapshot/approval integration. The actual shared builders, not disconnected previews, implement the new branch so future callers cannot duplicate instructions.
 
-- [ ] **Step 1: Write tests exercising output payloads from the real builders.**
+- [x] **Step 1: Write tests exercising output payloads from the real builders.**
 
 ```ts
 it('keeps speaker notes out of the image request and resolves approved scene text once', () => {
@@ -172,13 +174,13 @@ it('keeps speaker notes out of the image request and resolves approved scene tex
 
 Test details opt-in rejects missing/mismatched approved outline context, analysis remains unchanged and contains no presales instructions, correct schema/stage only, legacy requests omit new metadata, two callers with same inputs yield identical request, no source/pipeline mutation, invalid binding fails before output, palette precedence preserved, and malicious notes/brief cannot introduce second on-screen copy in the opt-in branch.
 
-- [ ] **Step 2: Run focused tests and verify desired behavior fails before code.**
-- [ ] **Step 3: Build contracts and data sections explicitly.**
+- [x] **Step 2: Run focused tests and verify desired behavior fails before code.**
+- [x] **Step 3: Build contracts and data sections explicitly.**
 
 The outline branch requests OutlineEnvelope; details requests DetailsEnvelope and includes validated PresalesPlan, not the shared legacy ARRAY contract. Reuse existing project input and source security instructions. Render schema examples as text, not extra unvalidated fields. Include skill id/version/hash in the actual request. Visual opt-in uses the existing exact approved content JSON, a reference-only scene graph, layout/visual-focus and instruction snapshot; omit speaker notes and historical recovery supplement from the model payload. Keep legacy visual builder byte behavior for absent designPlan. In presales details do not inject the legacy rule that asks for concept labels to be repeated inside brief.
 
-- [ ] **Step 4: Run worker and desktop focused tests, all TS suites, typecheck/lint, desktop build. Forward-evaluate synthetic goals/architecture/scene requests with and without rules; report structure and semantic issues, not an unrendered claim of beauty.**
-- [ ] **Step 5: Commit and record this increment as foundation complete, live native/UI integration still pending.**
+- [x] **Step 4: Run worker and desktop focused tests, all TS suites, typecheck/lint, desktop build. Forward-evaluate synthetic goals/architecture/scene requests with and without rules; report structure and semantic issues, not an unrendered claim of beauty.**
+- [x] **Step 5: Commit and record this increment as foundation complete, live native/UI integration still pending.**
 
 ## Self-review and verification record
 

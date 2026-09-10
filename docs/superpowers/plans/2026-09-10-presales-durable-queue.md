@@ -34,6 +34,7 @@ Files by responsibility:
 - `apps/desktop/src-tauri/src/presales_queue/contracts.rs`: serde contracts, bounded validation, status predicates.
 - `apps/desktop/src-tauri/src/presales_queue/store.rs`: own schema, reads, batch enqueue, settings, FIFO admission.
 - `apps/desktop/src-tauri/src/presales_queue/lifecycle.rs`: guarded transitions, provider identity, result manifests, recovery and audit.
+- `apps/desktop/src-tauri/src/presales_queue/rpc.rs`: reusable strict native.queue JSON-RPC dispatcher; not registered with the app yet.
 - `apps/desktop/src-tauri/tests/presales_queue.rs`: real SQLite admission tests.
 - `apps/desktop/src-tauri/tests/presales_queue_lifecycle.rs`: real SQLite lifecycle/restart tests.
 - `apps/desktop/src-tauri/src/bin/queue-harness.rs`: feature-only queue JSONL adapter, no legacy service.
@@ -66,6 +67,7 @@ pub struct QueueSettings { pub concurrency: u8, pub paused: bool, pub epoch: i64
 pub struct QueueJob {
   pub sequence: i64, pub batch_id: String, pub request_id: String,
   pub attempt_id: String, pub target: QueueTarget, pub status: JobStatus,
+  pub created_at_ms: i64, pub updated_at_ms: i64, pub dispatched_at_ms: Option<i64>,
   pub epoch: Option<i64>, pub provider: Option<ProviderIdentity>,
   pub result: Option<StagedResult>, pub error: Option<String>,
 }
@@ -109,9 +111,9 @@ Fixture helpers construct explicit synthetic `QueueTarget` values with literal v
 
 Use SQLite `application_id = 0x44545133` (DTQ3), `user_version = 1`; initialize only an empty unowned database. Inspect both markers and existing user tables **before** WAL/schema mutation; reject foreign DBs and unknown versions without changing them. Existing identified DB must have the expected schema. Enable foreign_keys, busy_timeout 5000 ms, WAL for file-backed DBs, synchronous FULL. Persist settings, batches, jobs, attempts and transition events; reserve result/audit schema for Task 2 as needed without fake completion APIs.
 
-Each manual generation is a new Job and a single immutable attempt; retry never updates old attempt identity. Jobs' request_id and attempts' attempt_id are globally unique. A partial unique index on `(project_id, slide_id)` covers queued/dispatching/running/result_ready/committing/cancel_requested/outcome_unknown. Batch ID replay requires exact original EnqueueBatch (including order and feedback); return its original outcome, not a new job. Same-page busy on a new valid batch returns the existing job and its request ID in reused_request_ids; its target is never rewritten. Validate identifier collisions before dedup so forged identity reuse cannot hide behind a busy page. No partial batch creation on errors.
+Each manual generation is a new Job and a single immutable attempt; retry never updates old attempt identity. Jobs' request_id and attempts' attempt_id are globally unique. A partial unique index on `(project_id, slide_id)` covers queued/dispatching/running/result_ready/committing/cancel_requested/outcome_unknown. Batch ID replay requires exact original EnqueueBatch (including order and feedback); return the original request-ID mapping and reused_request_ids, hydrating jobs from their current persisted rows, not stale queued snapshots or new jobs. Same-page busy on a new valid batch returns the existing job and its request ID in reused_request_ids; its target is never rewritten. Validate identifier collisions before dedup so forged identity reuse cannot hide behind a busy page. No partial batch creation on errors.
 
-Claim one eligible job in global sequence order inside `TransactionBehavior::Immediate`, verify expected epoch matches settings, honor global and batch pauses, and count dispatching/running/cancel_requested/outcome_unknown as occupying provider slots. Set Dispatching + epoch + persisted transition before returning it. result_ready/committing retain same-page lock but not long-call slots. No call to any provider.
+Claim one eligible job in global sequence order inside `TransactionBehavior::Immediate`, verify expected epoch matches settings, honor global and batch pauses, and count dispatching/running/cancel_requested/outcome_unknown as occupying provider slots. Set Dispatching + epoch + persisted transition before returning it. result_ready/committing retain same-page lock but not long-call slots. No call to any provider. Native epoch-millisecond clock supplies created_at_ms/updated_at_ms on insertion, dispatched_at_ms/updated_at_ms on claim, and event timestamps. Exact replay preserves all timestamps. Sequence, not wall clock, is the FIFO authority; test persisted real timestamps and the absent-before/present-after dispatch boundary without sleeps.
 
 - [ ] **Step 4: Verify and self-review.** Run focused tests, then default complete Rust suite once; run cargo fmt check and git diff --check. Verify an unrelated/legacy-looking DB retains tables/data/markers after failed open, and reopen preserves request snapshots/settings/dispatching (open alone does not decide recovery).
 - [ ] **Step 5: Commit.** Stage only Task 1 files and commit `feat: add isolated durable generation queue admission`. Report exact RED/GREEN commands/results and interfaces.
@@ -125,7 +127,7 @@ Claim one eligible job in global sequence order inside `TransactionBehavior::Imm
 ```rust
 pub struct QueueEvent {
   pub sequence: i64, pub request_id: String, pub attempt_id: String,
-  pub kind: String, pub detail: serde_json::Value,
+  pub kind: String, pub detail: serde_json::Value, pub created_at_ms: i64,
 }
 pub struct RecoverySnapshot { pub settings: QueueSettings, pub jobs: Vec<QueueJob>,
   pub unresolved_remote_count: usize }
@@ -169,6 +171,8 @@ assert!(store.confirm_cancelled(first, &claim.request_id, &claim.attempt_id).is_
 
 Record_provider permits Dispatching/Running/CancelRequested/OutcomeUnknown; it can fill thread first then turn, never change either known identity. Move Dispatching to Running only on observed identity, not dispatch request alone. Retain CancelRequested/OutcomeUnknown states during identity fill. Provider thread/turn are nonblank <=256 bytes, no control characters; errors/reasons nonblank <=4096 bytes.
 
+Every actual lifecycle change updates native updated_at_ms and creates a native-timestamped QueueEvent in the same transaction. Preserve created/dispatched timestamps and do not reset elapsed time on recovery or idempotent replay.
+
 Transition table (exact replay of the same evidence returns current value without duplicate history; differing evidence fails):
 
 | Operation | Allowed source | Destination |
@@ -192,11 +196,11 @@ StagedResult is only an internal manifest declaration: relative path must be exa
 
 ### Task 3: Feature-only queue JSONL transport and actual process restart
 
-**Files:** Create `src/bin/queue-harness.rs`, `tests/presales_queue_process.rs`; register `queue-harness` in `apps/desktop/src-tauri/Cargo.toml` with `required-features = ["acceptance-harness"]`.
+**Files:** Create `presales_queue/rpc.rs`, `src/bin/queue-harness.rs`, `tests/presales_queue_process.rs`; export `handle_queue_rpc_line` from `presales_queue/mod.rs`; register `queue-harness` in `apps/desktop/src-tauri/Cargo.toml` with `required-features = ["acceptance-harness"]`.
 
-**Interfaces:** Consumes QueueStore from Tasks 1–2. Produces an independent binary requiring `--database <explicit-path>` and JSONL `{id,command,args}` requests. Output `{id,result}` or `{id,error}`; malformed JSON returns id:null error and loop continues. It must not open WorkbenchService, legacy DB, Codex, HTTP or desktop windows.
+**Interfaces:** Consumes QueueStore from Tasks 1–2. Produces `handle_queue_rpc_line(store: &mut QueueStore, line: &str) -> String`, a reusable dispatcher for newline JSON-RPC, and an independent harness requiring `--database <explicit-path>`. Requests are `{jsonrpc:"2.0",id:"native:<unique-id>",method:"native.queue.<operation>",params:{...}}`. Require bounded nonblank string IDs (<=128 bytes, prefix `native:`); reject notifications, numeric/UI IDs, unknown envelope fields and non-object params. Responses are `{jsonrpc:"2.0",id,result}` or `{jsonrpc:"2.0",id,error:{code,message}}`; malformed JSON returns id:null error and loop continues. Use standard parse/invalid-request/method-not-found/invalid-params codes and -32000 for store rejection. It must not open WorkbenchService, legacy DB, Codex, HTTP or desktop windows. This shared dispatcher can be used by the future native host router; the harness itself must never become a production daemon.
 
-Commands and args:
+Methods and params (all listed queue names gain prefix `native.` on the wire; `harness.close` is harness-only, not a QueueStore operation):
 
 ```text
 queue.enqueue              {input: EnqueueBatch}
@@ -225,20 +229,20 @@ Do not call begin_runtime implicitly on process start: tests/read-only inspectio
 
 ```rust
 let mut first = Harness::spawn(&database);
-let initial = first.call("queue.beginRuntime", serde_json::json!({}));
+let initial = first.call("native.queue.beginRuntime", serde_json::json!({}));
 let epoch = initial["result"]["settings"]["epoch"].as_i64().unwrap();
-let claimed = first.call("queue.claim", serde_json::json!({"epoch": epoch}));
+let claimed = first.call("native.queue.claim", serde_json::json!({"epoch": epoch}));
 assert_eq!(claimed["result"]["requestId"], "r1");
 first.close_and_wait();
 let mut second = Harness::spawn(&database);
-let recovered = second.call("queue.beginRuntime", serde_json::json!({}));
+let recovered = second.call("native.queue.beginRuntime", serde_json::json!({}));
 assert_eq!(recovered["result"]["jobs"][0]["status"], "outcome_unknown");
 ```
 
 Fixtures enqueue `r1` before the code above. Child/test helpers live only in tests and always reap child processes. Also test malformed/unknown command/invalid arguments followed by successful settings request, failed foreign-DB startup without mutation, and no implicit recovery simply by spawning another read-only child.
 
 - [ ] **Step 2: Run RED.** `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features acceptance-harness --test presales_queue_process`; record missing binary/behavior diagnostics.
-- [ ] **Step 3: Implement short synchronous command dispatch.** Strictly decode command-specific args, forward only typed queue operations, flush one line per response, no raw secrets in error formatting. Large transport lines >262144 bytes rejected; bounded read prevents unbounded allocation before rejection. Existing production-harness unchanged. Queue state requests are short; this binary does not perform long image calls or prove the future Worker async scheduler.
+- [ ] **Step 3: Implement short synchronous command dispatch.** Strictly decode command-specific params (deny unknown fields), forward only typed queue operations, flush one line per response, no raw secrets in error formatting. Large transport lines >262144 bytes rejected; bounded read prevents unbounded allocation before rejection and drains to the next newline so the next request succeeds. Handle byte-fragmented UTF-8 only after a complete line is assembled. Existing production-harness unchanged. The shared dispatcher has no generic SQL/Tauri method routing. Queue state requests are short; this binary does not perform long image calls or prove the future Worker async scheduler. Process tests send fragmented/coalesced input, include Chinese feedback, reject reserved-ID/method/params misuse and prove recovery after oversized lines.
 - [ ] **Step 4: Verify increment.** Run feature process tests and all queue tests, `pnpm test`, `pnpm typecheck`, `pnpm lint`, `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check`, and `git diff --check`. Record synthetic coverage distinctly from actual account/PNG/UI acceptance. No application build/installation, customer-data migration or live provider calls.
 - [ ] **Step 5: Commit.** `test: exercise durable queue through native process transport`. Parent writes `docs/verification-2026-09-10-presales-durable-queue.md` after independent review and marks completed plan steps. Preserve the ongoing feature branch; no merge or push of an unfinished user-facing feature.
 

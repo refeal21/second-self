@@ -262,6 +262,30 @@ fn reopen_does_not_restart_but_supervisor_recovery_fences_all_old_callbacks() {
 }
 
 #[test]
+fn recovered_result_preserves_durable_cancel_intent() {
+    let (mut store, first_epoch, job) = fixture();
+    store.request_cancel(&job.request_id).unwrap();
+
+    let second_epoch = store.begin_runtime().unwrap().settings.epoch;
+    assert_eq!(second_epoch, first_epoch + 1);
+    assert_eq!(
+        store.get_job(&job.request_id).unwrap().unwrap().status,
+        JobStatus::OutcomeUnknown
+    );
+
+    let cancelled = store
+        .record_result_ready(
+            second_epoch,
+            &job.request_id,
+            &job.attempt_id,
+            manifest(&job),
+        )
+        .unwrap();
+    assert_eq!(cancelled.status, JobStatus::Cancelled);
+    assert_eq!(cancelled.result, None);
+}
+
+#[test]
 fn recovery_leaves_queued_ready_and_terminal_rows_untouched_and_overflow_is_atomic() {
     let db = path("epoch");
     let mut store = QueueStore::open(&db).unwrap();

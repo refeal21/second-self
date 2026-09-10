@@ -1,6 +1,6 @@
-//! Durable attempt lifecycle only. A result is a manifest declaration, not proof
-//! of a file or permission to publish a candidate. The future trusted file stager
-//! must verify and secure PNG bytes before calling `record_result_ready`.
+//! Durable attempt lifecycle. `record_result_ready` remains a metadata declaration,
+//! not proof of a file or permission to publish a candidate; the native staging
+//! bridge uses a separate verified, transaction-fenced path below.
 
 use super::store::{
     epoch_milliseconds, message, read_job, read_jobs, read_settings, validate_hash,
@@ -167,9 +167,9 @@ impl QueueStore {
         )
     }
 
-    /// Internal manifest boundary for the future trusted file stager. This method
-    /// does not read, create, validate, or publish a PNG. Synthetic harness callers
-    /// do not constitute that stager. Cancellation wins if durably recorded first.
+    /// Metadata-only manifest boundary retained for the existing native queue RPC.
+    /// This method does not read, create, validate, or publish a PNG. Cancellation
+    /// wins if durably recorded first, including across runtime recovery.
     pub fn record_result_ready(
         &mut self,
         epoch: i64,
@@ -281,6 +281,14 @@ impl QueueStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(message)?;
         let mut job = owned_job(&tx, epoch, request_id, attempt_id)?;
+        let evidence = match evidence {
+            Evidence::Result(result) => {
+                let job = record_result_evidence(&tx, job, result)?;
+                tx.commit().map_err(message)?;
+                return Ok(job);
+            }
+            other => other,
+        };
         let (kind, detail) = evidence.event()?;
         // Fence before replay; then return the CURRENT immutable request's job,
         // never an old response snapshot and never a same-page replacement.
@@ -302,19 +310,35 @@ impl QueueStore {
                 job.status = JobStatus::OutcomeUnknown;
                 job.error = Some(reason);
             }
-            Evidence::Result(result) => {
-                if job.status == JobStatus::CancelRequested {
-                    job.status = JobStatus::Cancelled;
-                } else {
-                    job.status = JobStatus::ResultReady;
-                    job.result = Some(result);
-                }
-            }
+            Evidence::Result(_) => unreachable!("result evidence is handled above"),
         }
         persist_change(&tx, &mut job, from, kind, detail)?;
         tx.commit().map_err(message)?;
         Ok(job)
     }
+}
+
+pub(super) fn record_result_evidence(
+    tx: &Transaction<'_>,
+    mut job: QueueJob,
+    result: StagedResult,
+) -> Result<QueueJob, String> {
+    let detail = serde_json::to_value(&result).map_err(message)?;
+    if replay(tx, &job, "result_ready", &detail)? {
+        return Ok(job);
+    }
+    require(remote_active(&job.status))?;
+    let from = job.status.clone();
+    let cancel_was_requested = job.status == JobStatus::CancelRequested
+        || exact_event(tx, &job, "cancel_requested", &json!({}))?;
+    if cancel_was_requested {
+        job.status = JobStatus::Cancelled;
+    } else {
+        job.status = JobStatus::ResultReady;
+        job.result = Some(result);
+    }
+    persist_change(tx, &mut job, from, "result_ready", detail)?;
+    Ok(job)
 }
 
 enum Evidence {

@@ -1,6 +1,7 @@
 mod contracts;
 mod lifecycle;
 mod result_files;
+mod result_staging;
 mod result_vault;
 mod rpc;
 mod store;

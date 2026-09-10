@@ -2,11 +2,12 @@ pub mod codex_process;
 pub mod database;
 mod native_revision_validation;
 pub mod paths;
+pub mod presales;
 pub mod tauri_codex;
 pub mod tauri_workbench;
 pub mod tauri_worker;
-pub mod workbench;
 pub mod visual_style;
+pub mod workbench;
 
 use tauri::Manager;
 

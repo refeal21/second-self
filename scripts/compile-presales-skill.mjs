@@ -13,6 +13,7 @@ const PACKAGE_ID = 'presales-ppt';
 const PACKAGE_VERSION = '1.0.0';
 const SKILL_DIRECTORY = 'apps/worker/skills/presales-ppt';
 const OUTPUT_PATH = 'apps/worker/src/presales/skill.generated.ts';
+const METADATA_OUTPUT_PATH = 'apps/worker/src/presales/skill.metadata.generated.json';
 const SOURCE_PATHS = [
   `${SKILL_DIRECTORY}/SKILL.md`,
   `${SKILL_DIRECTORY}/references/outline.md`,
@@ -253,27 +254,42 @@ function compile(root) {
     sourceHashes: payload.sourceHashes,
     stages: payload.stages,
   };
-  return `export const PRESALES_SKILL = ${JSON.stringify(bundle, null, 2)} as const;\n`;
+  return {
+    bundle: `export const PRESALES_SKILL = ${JSON.stringify(bundle, null, 2)} as const;\n`,
+    metadata: `${JSON.stringify(
+      { id: bundle.id, version: bundle.version, sha256: bundle.sha256 },
+      null,
+      2,
+    )}\n`,
+  };
 }
 
 function main() {
   const { check, root } = parseArguments(process.argv.slice(2));
   const expected = compile(root);
-  const output = resolve(root, OUTPUT_PATH);
+  const outputs = [
+    [OUTPUT_PATH, expected.bundle],
+    [METADATA_OUTPUT_PATH, expected.metadata],
+  ];
 
   if (check) {
-    let current;
-    try {
-      current = readFileSync(output, 'utf8');
-    } catch {
-      fail(`Generated output is missing: ${OUTPUT_PATH}`);
+    for (const [relativePath, contents] of outputs) {
+      let current;
+      try {
+        current = readFileSync(resolve(root, relativePath), 'utf8');
+      } catch {
+        fail(`Generated output is missing: ${relativePath}`);
+      }
+      if (current !== contents) fail(`Generated output is stale: ${relativePath}`);
     }
-    if (current !== expected) fail(`Generated output is stale: ${OUTPUT_PATH}`);
     return;
   }
 
-  mkdirSync(dirname(output), { recursive: true });
-  writeFileSync(output, expected, 'utf8');
+  for (const [relativePath, contents] of outputs) {
+    const output = resolve(root, relativePath);
+    mkdirSync(dirname(output), { recursive: true });
+    writeFileSync(output, contents, 'utf8');
+  }
 }
 
 try {

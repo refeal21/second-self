@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
 const COMPILER_SOURCE = resolve(REPO_ROOT, 'scripts/compile-presales-skill.mjs');
 const GENERATED_PATH = 'apps/worker/src/presales/skill.generated.ts';
+const METADATA_PATH = 'apps/worker/src/presales/skill.metadata.generated.json';
 const SKILL_ROOT = 'apps/worker/skills/presales-ppt';
 
 const fixtureRoots: string[] = [];
@@ -104,6 +105,10 @@ function readGenerated(root: string): string {
   return readFileSync(resolve(root, GENERATED_PATH), 'utf8');
 }
 
+function readMetadata(root: string): string {
+  return readFileSync(resolve(root, METADATA_PATH), 'utf8');
+}
+
 function parseGenerated(root: string): {
   id: string;
   version: string;
@@ -130,9 +135,11 @@ describe('presales skill compiler', () => {
 
     expect(runCompiler(fixture).status).toBe(0);
     const first = readGenerated(fixture);
+    const firstMetadata = readMetadata(fixture);
     expect(runCompiler(fixture).status).toBe(0);
 
     expect(readGenerated(fixture)).toBe(first);
+    expect(readMetadata(fixture)).toBe(firstMetadata);
   });
 
   it('resolves the default repository root from the compiler location', () => {
@@ -144,13 +151,16 @@ describe('presales skill compiler', () => {
 
     expect(result.status, result.stderr).toBe(0);
     expect(existsSync(resolve(fixture, GENERATED_PATH))).toBe(true);
+    expect(existsSync(resolve(fixture, METADATA_PATH))).toBe(true);
     expect(existsSync(resolve(unrelatedCwd, GENERATED_PATH))).toBe(false);
+    expect(existsSync(resolve(unrelatedCwd, METADATA_PATH))).toBe(false);
   });
 
   it('check detects a changed skill without updating generated output', () => {
     const fixture = createFixture();
     expect(runCompiler(fixture).status).toBe(0);
     const before = readGenerated(fixture);
+    const beforeMetadata = readMetadata(fixture);
     writeFixtureFile(
       fixture,
       `${SKILL_ROOT}/references/details.md`,
@@ -161,6 +171,48 @@ describe('presales skill compiler', () => {
 
     expect(checked.status).not.toBe(0);
     expect(readGenerated(fixture)).toBe(before);
+    expect(readMetadata(fixture)).toBe(beforeMetadata);
+  });
+
+  it.each([
+    ['bundle', GENERATED_PATH],
+    ['metadata', METADATA_PATH],
+  ])('check detects missing %s output without recreating files', (_case, path) => {
+    const fixture = createFixture();
+    expect(runCompiler(fixture).status).toBe(0);
+    rmSync(resolve(fixture, path));
+
+    const checked = runCompiler(fixture, ['--check']);
+
+    expect(checked.status).not.toBe(0);
+    expect(existsSync(resolve(fixture, path))).toBe(false);
+  });
+
+  it('emits native metadata with the exact bundle identity', () => {
+    const fixture = createFixture();
+    expect(runCompiler(fixture).status).toBe(0);
+
+    const bundle = parseGenerated(fixture);
+    const metadata = JSON.parse(readMetadata(fixture)) as Record<string, unknown>;
+
+    expect(metadata).toEqual({
+      id: bundle.id,
+      version: bundle.version,
+      sha256: bundle.sha256,
+    });
+  });
+
+  it('check detects stale metadata without rewriting either output', () => {
+    const fixture = createFixture();
+    expect(runCompiler(fixture).status).toBe(0);
+    const bundle = readGenerated(fixture);
+    writeFixtureFile(fixture, METADATA_PATH, '{"stale":true}\n');
+
+    const checked = runCompiler(fixture, ['--check']);
+
+    expect(checked.status).not.toBe(0);
+    expect(readGenerated(fixture)).toBe(bundle);
+    expect(readMetadata(fixture)).toBe('{"stale":true}\n');
   });
 
   it('fails when a required stage reference is missing', () => {

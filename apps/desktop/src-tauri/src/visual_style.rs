@@ -605,7 +605,17 @@ impl WorkbenchService {
             return Err("Invalid or oversized visual generation request".into());
         }
         let db = self.database()?;
-        let tx = db.connection.unchecked_transaction().map_err(err)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &db.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(err)?;
+        if crate::presales::storage::enabled(&tx, &input.project_id).map_err(err)? {
+            return Err(
+                "Presales visual generation requires design-aware receipts unavailable in this increment"
+                    .into(),
+            );
+        }
         let p = db
             .get_project(&input.project_id)
             .map_err(err)?

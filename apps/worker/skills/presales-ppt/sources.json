@@ -1,0 +1,34 @@
+{
+  "sources": [
+    {
+      "name": "PPT Master",
+      "repository": "https://github.com/hugohe3/ppt-master/tree/78fa4eebf67d38f33c51ec457c911d7e05013587/skills/ppt-master",
+      "commit": "78fa4eebf67d38f33c51ec457c911d7e05013587",
+      "license": "MIT",
+      "references": [
+        "plan-core.md",
+        "executor-structure.md",
+        "image-layout-patterns.md"
+      ]
+    },
+    {
+      "name": "slides_maker",
+      "repository": "https://github.com/addsumtech/slides_maker/tree/02ea841a6283f3c262f0ff534d28091a3d9554e1/skills/slide-maker",
+      "commit": "02ea841a6283f3c262f0ff534d28091a3d9554e1",
+      "license": "MIT",
+      "references": [
+        "form-selection.md",
+        "design-principles.md"
+      ]
+    },
+    {
+      "name": "baoyu-skills",
+      "repository": "https://github.com/JimLiu/baoyu-skills/tree/6b7a2e417500561a5ecdd0b168332f4142584617/skills/baoyu-infographic",
+      "commit": "6b7a2e417500561a5ecdd0b168332f4142584617",
+      "license": "MIT",
+      "references": [
+        "baoyu-infographic/SKILL.md"
+      ]
+    }
+  ]
+}

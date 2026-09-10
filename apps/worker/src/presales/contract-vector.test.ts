@@ -24,4 +24,25 @@ describe('shared presales native contract vector', () => {
     expect(details.designs[0]?.scene?.steps).toHaveLength(2);
     expect(resolveVisibleBindings(details.specs[0]!, details.designs[0]!)).toHaveLength(15);
   });
+
+  it.each(['1.0', '1e0'])(
+    'accepts equivalent numeric schema spelling %s',
+    (spelling) => {
+      const draft = structuredClone(vector.pair);
+      const numericVersion = JSON.parse(spelling) as unknown;
+      const outline = draft.outline as {
+        schemaVersion: unknown;
+        plan: { schemaVersion: unknown };
+      };
+      const details = draft.details as { schemaVersion: unknown };
+      outline.schemaVersion = numericVersion;
+      outline.plan.schemaVersion = numericVersion;
+      details.schemaVersion = numericVersion;
+
+      const parsedOutline = parseOutlineEnvelope(draft.outline, vector.analysis as never);
+      expect(
+        parseDetailsEnvelope(draft.details, parsedOutline, vector.analysis as never),
+      ).toEqual(draft.details);
+    },
+  );
 });

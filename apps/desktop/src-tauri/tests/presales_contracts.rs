@@ -19,6 +19,10 @@ fn assert_rejected(pair: &PresalesDraftPair, analysis: &Value) {
     assert!(validate_pair(pair, analysis).is_err());
 }
 
+fn assert_rejected_with(pair: &PresalesDraftPair, analysis: &Value, expected: &str) {
+    assert_eq!(validate_pair(pair, analysis).unwrap_err(), expected);
+}
+
 fn add_second_page(pair: &mut PresalesDraftPair) {
     let outline = pair.outline.as_object_mut().unwrap();
     let slide = outline["outline"]["slides"][0].clone();
@@ -63,6 +67,30 @@ fn accepts_outline_only_and_rich_details_pairs() {
     validate_pair(&draft, &source["analysis"]).expect("outline-only pair is valid");
     draft.details = details;
     validate_pair(&draft, &source["analysis"]).expect("rich pair is valid");
+}
+
+#[test]
+fn accepts_equivalent_numeric_schema_spellings_without_string_coercion() {
+    let source = fixture();
+    for spelling in ["1.0", "1e0"] {
+        let version: Value = serde_json::from_str(spelling).unwrap();
+        let mut raw = fixture()["pair"].clone();
+        raw["outline"]["schemaVersion"] = version.clone();
+        raw["outline"]["plan"]["schemaVersion"] = version.clone();
+        raw["details"]["schemaVersion"] = version;
+        let draft: PresalesDraftPair = serde_json::from_value(raw).unwrap();
+
+        validate_pair(&draft, &source["analysis"])
+            .unwrap_or_else(|error| panic!("schema spelling {spelling} was rejected: {error}"));
+    }
+
+    let mut string_version = pair();
+    string_version.outline["schemaVersion"] = json!("1");
+    assert_rejected_with(
+        &string_version,
+        &source["analysis"],
+        "schemaVersion must be 1",
+    );
 }
 
 #[test]
@@ -297,7 +325,11 @@ fn enforces_depth_string_collection_and_envelope_bounds() {
     let source = fixture();
     let mut long = pair();
     long.details.as_mut().unwrap()["designs"][0]["speakerNotes"] = json!("😀".repeat(10_001));
-    assert_rejected(&long, &source["analysis"]);
+    assert_rejected_with(
+        &long,
+        &source["analysis"],
+        "speakerNotes exceeds 20,000 UTF-16 units",
+    );
 
     let mut many = pair();
     many.outline["plan"]["modules"] = Value::Array(
@@ -309,7 +341,11 @@ fn enforces_depth_string_collection_and_envelope_bounds() {
             })
             .collect(),
     );
-    assert_rejected(&many, &source["analysis"]);
+    assert_rejected_with(
+        &many,
+        &source["analysis"],
+        "At most 100 modules are allowed",
+    );
 
     let mut pages = pair();
     let slide = pages.outline["outline"]["slides"][0].clone();
@@ -322,23 +358,35 @@ fn enforces_depth_string_collection_and_envelope_bounds() {
             })
             .collect(),
     );
-    assert_rejected(&pages, &source["analysis"]);
+    assert_rejected_with(&pages, &source["analysis"], "At most 100 pages are allowed");
 
     let mut bindings = pair();
     let binding = bindings.details.as_ref().unwrap()["designs"][0]["textBindings"][0].clone();
     bindings.details.as_mut().unwrap()["designs"][0]["textBindings"] =
         Value::Array(vec![binding; 101]);
-    assert_rejected(&bindings, &source["analysis"]);
+    assert_rejected_with(
+        &bindings,
+        &source["analysis"],
+        "At most 100 text bindings are allowed",
+    );
 
     let mut steps = pair();
     let step = steps.details.as_ref().unwrap()["designs"][0]["scene"]["steps"][0].clone();
     steps.details.as_mut().unwrap()["designs"][0]["scene"]["steps"] = Value::Array(vec![step; 101]);
-    assert_rejected(&steps, &source["analysis"]);
+    assert_rejected_with(
+        &steps,
+        &source["analysis"],
+        "At most 100 scene steps are allowed",
+    );
 
     let mut edges = pair();
     let edge = edges.details.as_ref().unwrap()["designs"][0]["scene"]["edges"][0].clone();
     edges.details.as_mut().unwrap()["designs"][0]["scene"]["edges"] = Value::Array(vec![edge; 401]);
-    assert_rejected(&edges, &source["analysis"]);
+    assert_rejected_with(
+        &edges,
+        &source["analysis"],
+        "At most 400 scene edges are allowed",
+    );
 
     let mut too_large = pair();
     too_large
@@ -346,7 +394,11 @@ fn enforces_depth_string_collection_and_envelope_bounds() {
         .as_object_mut()
         .unwrap()
         .insert("padding".into(), json!("x".repeat(2 * 1024 * 1024)));
-    assert_rejected(&too_large, &source["analysis"]);
+    assert_rejected_with(
+        &too_large,
+        &source["analysis"],
+        "Outline envelope exceeds 2 MiB",
+    );
 
     let mut nested = json!(null);
     for _ in 0..34 {
@@ -358,7 +410,11 @@ fn enforces_depth_string_collection_and_envelope_bounds() {
         .as_object_mut()
         .unwrap()
         .insert("nested".into(), nested);
-    assert_rejected(&too_deep, &source["analysis"]);
+    assert_rejected_with(
+        &too_deep,
+        &source["analysis"],
+        "Envelope must contain bounded JSON data",
+    );
 }
 
 #[test]

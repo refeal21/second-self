@@ -124,7 +124,7 @@ fn optional_identifiers<'a>(
 }
 
 fn version(value: &Value) -> Check {
-    if value.as_u64() != Some(1) {
+    if !matches!(value, Value::Number(number) if number.as_f64() == Some(1.0)) {
         return Err("schemaVersion must be 1".into());
     }
     Ok(())

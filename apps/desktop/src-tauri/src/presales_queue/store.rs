@@ -138,13 +138,13 @@ impl QueueStore {
     fn initialize(mut connection: Connection, file_backed: bool) -> Result<Self, String> {
         let application_id = pragma_i64(&connection, "application_id")?;
         let user_version = pragma_i64(&connection, "user_version")?;
-        let tables = user_tables(&connection)?;
-        let unowned_empty = application_id == 0 && user_version == 0 && tables.is_empty();
+        let objects = user_schema_objects(&connection)?;
+        let unowned_empty = application_id == 0 && user_version == 0 && objects.is_empty();
         if !unowned_empty && (application_id != APPLICATION_ID || user_version != USER_VERSION) {
             return Err("database is not a compatible durable queue".into());
         }
         if !unowned_empty {
-            verify_schema(&connection, &tables)?;
+            verify_schema(&objects)?;
         }
 
         connection
@@ -451,44 +451,35 @@ fn pragma_i64(connection: &Connection, name: &str) -> Result<i64, String> {
         .map_err(message)
 }
 
-fn user_tables(connection: &Connection) -> Result<Vec<String>, String> {
+fn user_schema_objects(
+    connection: &Connection,
+) -> Result<Vec<(String, String, Option<String>)>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type = 'table' AND lower(substr(name, 1, 7)) <> 'sqlite_' ORDER BY name",
+            "SELECT type, name, sql FROM sqlite_schema
+             WHERE lower(substr(name, 1, 7)) <> 'sqlite_' ORDER BY type, name",
         )
         .map_err(message)?;
-    let tables = statement
-        .query_map([], |row| row.get(0))
+    let objects = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .map_err(message)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(message)?;
-    Ok(tables)
+    Ok(objects)
 }
 
-fn verify_schema(connection: &Connection, tables: &[String]) -> Result<(), String> {
-    let actual_tables: HashSet<&str> = tables.iter().map(String::as_str).collect();
-    let expected_tables: HashSet<&str> = SCHEMA_OBJECTS
-        .iter()
-        .filter(|object| object.kind == "table")
-        .map(|object| object.name)
-        .collect();
-    if actual_tables != expected_tables {
+fn verify_schema(objects: &[(String, String, Option<String>)]) -> Result<(), String> {
+    if objects.len() != SCHEMA_OBJECTS.len() {
         return Err(format!(
             "durable queue schema does not match user_version {USER_VERSION}"
         ));
     }
     for object in SCHEMA_OBJECTS {
-        let actual: Option<String> = connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
-                params![object.kind, object.name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(message)?;
-        if actual.as_deref().map(normalized_schema_sql).as_deref()
-            != Some(&normalized_schema_sql(object.sql))
+        let actual = objects
+            .iter()
+            .find(|(kind, name, _)| kind == object.kind && name == object.name)
+            .and_then(|(_, _, sql)| sql.as_deref());
+        if actual.map(normalized_schema_sql).as_deref() != Some(&normalized_schema_sql(object.sql))
         {
             return Err(format!(
                 "durable queue {} {} does not match user_version {USER_VERSION}",

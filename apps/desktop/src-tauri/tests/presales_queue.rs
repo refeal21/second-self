@@ -487,6 +487,38 @@ fn sqlite_prefix_lookalike_table_is_preserved_as_foreign() {
     std::fs::remove_file(path).unwrap();
 }
 
+#[test]
+fn view_only_foreign_databases_are_rejected_without_mutation() {
+    for name in ["existing_view", "sqliteXlegacy"] {
+        let path = temporary_database(name);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(&format!("CREATE VIEW {name} AS SELECT 42 AS value"), [])
+            .unwrap();
+        let before = schema_snapshot(&connection);
+        assert_eq!((before.0, before.1, before.2.as_str()), (0, 0, "delete"));
+        drop(connection);
+        let bytes_before = std::fs::read(&path).unwrap();
+
+        assert!(QueueStore::open(&path).is_err(), "view {name} was adopted");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+        assert!(!path.with_extension("sqlite3-wal").exists());
+        assert!(!path.with_extension("sqlite3-shm").exists());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(schema_snapshot(&connection), before);
+        assert_eq!(
+            connection
+                .query_row(&format!("SELECT value FROM {name}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            42
+        );
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 const TEST_QUEUE_SCHEMA: &str = r#"
 CREATE TABLE queue_settings (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -581,14 +613,63 @@ fn create_marked_schema(
 fn assert_marked_schema_rejected_without_mutation(name: &str, schema: &str) {
     let path = temporary_database(name);
     let before = create_marked_schema(&path, schema);
+    assert_eq!(
+        (before.0, before.1, before.2.as_str()),
+        (QUEUE_APPLICATION_ID, 2, "delete")
+    );
+    let bytes_before = std::fs::read(&path).unwrap();
     assert!(
         QueueStore::open(&path).is_err(),
         "mutation {name} was accepted"
     );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes_before,
+        "mutation {name}"
+    );
+    assert!(!path.with_extension("sqlite3-wal").exists());
+    assert!(!path.with_extension("sqlite3-shm").exists());
     let connection = Connection::open(&path).unwrap();
     assert_eq!(schema_snapshot(&connection), before, "mutation {name}");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT concurrency, paused, epoch FROM queue_settings WHERE singleton = 1",
+                [],
+                |row| Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?
+                )),
+            )
+            .unwrap(),
+        (4, 0, 0)
+    );
     drop(connection);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn marked_database_with_unexpected_trigger_is_rejected_without_mutation() {
+    let schema = format!(
+        "{TEST_QUEUE_SCHEMA}
+         CREATE TRIGGER reset_dispatch AFTER UPDATE OF status ON queue_jobs
+         WHEN NEW.status = 'dispatching'
+         BEGIN UPDATE queue_jobs SET status = 'queued' WHERE request_id = NEW.request_id; END;"
+    );
+    assert_marked_schema_rejected_without_mutation("unexpected-trigger", &schema);
+}
+
+#[test]
+fn marked_database_with_unexpected_view_is_rejected_without_mutation() {
+    let schema = format!("{TEST_QUEUE_SCHEMA} CREATE VIEW sqliteXlegacy AS SELECT 42 AS value;");
+    assert_marked_schema_rejected_without_mutation("unexpected-view", &schema);
+}
+
+#[test]
+fn marked_database_with_unexpected_index_is_rejected_without_mutation() {
+    let schema = format!("{TEST_QUEUE_SCHEMA} CREATE INDEX sqliteXlegacy ON queue_jobs(status);");
+    assert_marked_schema_rejected_without_mutation("unexpected-index", &schema);
 }
 
 #[test]

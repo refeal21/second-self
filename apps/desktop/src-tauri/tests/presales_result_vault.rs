@@ -91,6 +91,38 @@ fn corrupt_chunk_data(mut png: Vec<u8>, kind: &[u8; 4]) -> Vec<u8> {
     panic!("fixture did not contain requested PNG chunk");
 }
 
+fn with_invalid_ancillary_crc(mut png: Vec<u8>) -> Vec<u8> {
+    let iend = png
+        .windows(4)
+        .position(|window| window == b"IEND")
+        .expect("fixture contains IEND")
+        - 4;
+    let data = b"key\0value";
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    chunk.extend_from_slice(b"tEXt");
+    chunk.extend_from_slice(data);
+    chunk.extend_from_slice(&(crc32(&chunk[4..]) ^ 1).to_be_bytes());
+    png.splice(iend..iend, chunk);
+    png
+}
+
+fn with_invalid_adler32_and_valid_idat_crc(mut png: Vec<u8>) -> Vec<u8> {
+    let mut offset = 8;
+    while offset + 12 <= png.len() {
+        let length = u32::from_be_bytes(png[offset..offset + 4].try_into().unwrap()) as usize;
+        if &png[offset + 4..offset + 8] == b"IDAT" {
+            assert!(length > 4, "fixture IDAT includes an Adler-32 trailer");
+            png[offset + 8 + length - 1] ^= 1;
+            let crc = crc32(&png[offset + 4..offset + 8 + length]);
+            png[offset + 8 + length..offset + 12 + length].copy_from_slice(&crc.to_be_bytes());
+            return png;
+        }
+        offset += 12 + length;
+    }
+    panic!("fixture did not contain IDAT");
+}
+
 fn result_dir(root: &FixtureRoot) -> PathBuf {
     root.path().join("queue-results/r1")
 }
@@ -190,6 +222,30 @@ fn rejects_invalid_png_content_and_all_staging_bounds() {
         assert!(vault.stage(&binding(), &png).is_err());
         assert!(fs::read_dir(root.path()).unwrap().next().is_none());
     }
+}
+
+#[test]
+fn rejects_an_ancillary_chunk_with_an_invalid_crc() {
+    let root = FixtureRoot::new();
+    let png = with_invalid_ancillary_crc(solid_png(2, 2));
+
+    assert!(ResultVault::open(root.path())
+        .unwrap()
+        .stage(&binding(), &png)
+        .is_err());
+    assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn rejects_invalid_adler32_even_when_the_idat_crc_is_valid() {
+    let root = FixtureRoot::new();
+    let png = with_invalid_adler32_and_valid_idat_crc(solid_png(2, 2));
+
+    assert!(ResultVault::open(root.path())
+        .unwrap()
+        .stage(&binding(), &png)
+        .is_err());
+    assert!(fs::read_dir(root.path()).unwrap().next().is_none());
 }
 
 #[test]

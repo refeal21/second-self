@@ -100,6 +100,11 @@ impl ResultVault {
 
     pub fn recover(&self, binding: &ResultBinding) -> Result<VerifiedPngResult, String> {
         validate_binding(binding)?;
+        // Establish PNG durability before the manifest that makes it recovery proof.
+        let png = self.root.read(
+            &["queue-results", &binding.request_id, &png_name(binding)],
+            MAX_PNG_BYTES,
+        )?;
         let sidecar_bytes = self.root.read(
             &[
                 "queue-results",
@@ -123,10 +128,6 @@ impl ResultVault {
         if sidecar.result.byte_length == 0 || sidecar.result.byte_length > MAX_PNG_BYTES as u64 {
             return Err("Result manifest byte length is outside the PNG bounds".into());
         }
-        let png = self.root.read(
-            &["queue-results", &binding.request_id, &png_name(binding)],
-            MAX_PNG_BYTES,
-        )?;
         if sidecar.result.byte_length != png.len() as u64 {
             return Err("Result PNG size does not match its manifest".into());
         }
@@ -174,12 +175,13 @@ fn validate_png(bytes: &[u8]) -> Result<(u32, u32), String> {
     if bytes.is_empty() || bytes.len() > MAX_PNG_BYTES {
         return Err(format!("PNG must contain 1..={MAX_PNG_BYTES} bytes"));
     }
-    let decoder = png::Decoder::new_with_limits(
-        Cursor::new(bytes),
-        png::Limits {
-            bytes: DECODER_ALLOCATION_LIMIT,
-        },
-    );
+    let mut options = png::DecodeOptions::default();
+    options.set_ignore_adler32(false);
+    options.set_skip_ancillary_crc_failures(false);
+    let mut decoder = png::Decoder::new_with_options(Cursor::new(bytes), options);
+    decoder.set_limits(png::Limits {
+        bytes: DECODER_ALLOCATION_LIMIT,
+    });
     let mut reader = decoder
         .read_info()
         .map_err(|error| format!("PNG header is invalid: {error}"))?;
@@ -217,4 +219,121 @@ fn validate_png(bytes: &[u8]) -> Result<(u32, u32), String> {
         .finish()
         .map_err(|error| format!("PNG trailing chunks are invalid: {error}"))?;
     Ok((width, height))
+}
+
+#[cfg(all(test, unix))]
+mod durability_tests {
+    use super::*;
+    use crate::presales_queue::result_files::{clear_sync_failures, inject_sync_failures};
+    use std::{
+        fs,
+        io::Cursor,
+        os::unix::fs::MetadataExt,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct FixtureRoot(PathBuf);
+
+    impl FixtureRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "digital-twin-result-durability-{}-{}",
+                std::process::id(),
+                ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) {
+            clear_sync_failures();
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn binding() -> ResultBinding {
+        ResultBinding {
+            request_id: "r1".into(),
+            attempt_id: "a1".into(),
+            target_sha256: "a".repeat(64),
+        }
+    }
+
+    fn solid_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(Cursor::new(&mut bytes), 2, 2);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[0x5a; 12]).unwrap();
+        writer.finish().unwrap();
+        bytes
+    }
+
+    fn identity(path: &Path) -> (u64, u64) {
+        let metadata = fs::metadata(path).unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    fn staged_fixture() -> (FixtureRoot, ResultVault, ResultBinding, Vec<u8>) {
+        let root = FixtureRoot::new();
+        let vault = ResultVault::open(root.path()).unwrap();
+        let binding = binding();
+        let png = solid_png();
+        vault.stage(&binding, &png).unwrap();
+        (root, vault, binding, png)
+    }
+
+    #[test]
+    fn recovery_requires_png_durability_before_manifest_durability() {
+        let (root, vault, binding, _) = staged_fixture();
+        let result_dir = root.path().join("queue-results/r1");
+        inject_sync_failures(vec![
+            (identity(&result_dir.join("a1.png")), "png"),
+            (identity(&result_dir.join("a1.json")), "manifest"),
+        ]);
+
+        let error = match vault.recover(&binding) {
+            Ok(_) => panic!("recovery unexpectedly ignored injected sync failures"),
+            Err(error) => error,
+        };
+        clear_sync_failures();
+
+        assert!(
+            error.contains("png"),
+            "unexpected first sync failure: {error}"
+        );
+    }
+
+    #[test]
+    fn recovery_requires_existing_ancestor_directory_durability() {
+        let (root, vault, binding, _) = staged_fixture();
+        inject_sync_failures(vec![(identity(root.path()), "root directory")]);
+
+        let result = vault.recover(&binding);
+        clear_sync_failures();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exact_replay_requires_existing_ancestor_directory_durability() {
+        let (root, _, binding, png) = staged_fixture();
+        let replay = ResultVault::open(root.path()).unwrap();
+        inject_sync_failures(vec![(identity(root.path()), "root directory")]);
+
+        let result = replay.stage(&binding, &png);
+        clear_sync_failures();
+
+        assert!(result.is_err());
+    }
 }

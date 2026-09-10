@@ -1,5 +1,7 @@
 #[cfg(unix)]
 mod native {
+    #[cfg(test)]
+    use std::cell::RefCell;
     use std::{
         ffi::{CString, OsStr},
         fs::{self, File},
@@ -14,8 +16,42 @@ mod native {
 
     static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    #[cfg(test)]
+    thread_local! {
+        static INJECTED_SYNC_FAILURES: RefCell<Vec<((u64, u64), &'static str)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_sync_failures(failures: Vec<((u64, u64), &'static str)>) {
+        INJECTED_SYNC_FAILURES.with(|configured| *configured.borrow_mut() = failures);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_sync_failures() {
+        INJECTED_SYNC_FAILURES.with(|configured| configured.borrow_mut().clear());
+    }
+
     pub(crate) struct RootDirectory {
         descriptor: OwnedFd,
+    }
+
+    struct ParentDirectory {
+        chain: Vec<OwnedFd>,
+        name: CString,
+    }
+
+    impl ParentDirectory {
+        fn leaf(&self) -> &OwnedFd {
+            self.chain.last().expect("directory chain contains root")
+        }
+
+        fn sync_chain(&self) -> Result<(), String> {
+            for directory in self.chain.iter().rev() {
+                sync_directory(directory)?;
+            }
+            Ok(())
+        }
     }
 
     impl RootDirectory {
@@ -43,8 +79,10 @@ mod native {
         }
 
         pub(crate) fn read(&self, components: &[&str], limit: usize) -> Result<Vec<u8>, String> {
-            let (directory, name) = self.parent_directory(components, false)?;
-            read_file_at(&directory, &name, limit)
+            let parent = self.parent_directory(components, false)?;
+            let bytes = read_file_at(parent.leaf(), &parent.name, limit)?;
+            parent.sync_chain()?;
+            Ok(bytes)
         }
 
         pub(crate) fn write_immutable(
@@ -52,7 +90,8 @@ mod native {
             components: &[&str],
             contents: &[u8],
         ) -> Result<(), String> {
-            let (directory, name) = self.parent_directory(components, true)?;
+            let parent = self.parent_directory(components, true)?;
+            let directory = parent.leaf();
             let temporary_name = CString::new(format!(
                 ".result-{}-{}.tmp",
                 std::process::id(),
@@ -85,16 +124,14 @@ mod native {
                 temporary
                     .write_all(contents)
                     .map_err(|error| format!("Result file write failed: {error}"))?;
-                temporary
-                    .sync_all()
-                    .map_err(|error| format!("Result file sync failed: {error}"))?;
+                sync_descriptor(temporary.as_raw_fd(), "Result file")?;
                 // SAFETY: both names are valid and relative to the held parent descriptor.
                 if unsafe {
                     libc::linkat(
                         directory.as_raw_fd(),
                         temporary_name.as_ptr(),
                         directory.as_raw_fd(),
-                        name.as_ptr(),
+                        parent.name.as_ptr(),
                         0,
                     )
                 } != 0
@@ -103,7 +140,7 @@ mod native {
                     if error.kind() != ErrorKind::AlreadyExists {
                         return Err(format!("Immutable result commit failed: {error}"));
                     }
-                    let existing = read_file_at(&directory, &name, contents.len())?;
+                    let existing = read_file_at(directory, &parent.name, contents.len())?;
                     if existing != contents {
                         return Err(
                             "Immutable result already exists with different contents".into()
@@ -118,7 +155,7 @@ mod native {
                         std::io::Error::last_os_error()
                     ));
                 }
-                sync_directory(&directory)
+                parent.sync_chain()
             })();
 
             if result.is_err() {
@@ -134,18 +171,20 @@ mod native {
             &self,
             components: &[&str],
             create: bool,
-        ) -> Result<(OwnedFd, CString), String> {
+        ) -> Result<ParentDirectory, String> {
             let (final_name, parents) = components
                 .split_last()
                 .ok_or_else(|| "Result path is empty".to_string())?;
-            let mut directory = self
+            let root = self
                 .descriptor
                 .try_clone()
                 .map_err(|error| format!("Result root descriptor cannot be cloned: {error}"))?;
+            let mut chain = vec![root];
             for component in parents {
                 let name = component_name(component)?;
-                match open_directory_at(&directory, &name) {
-                    Ok(next) => directory = next,
+                let directory = chain.last().expect("directory chain contains root");
+                let next = match open_directory_at(directory, &name) {
+                    Ok(next) => next,
                     Err(error) if create && error.kind() == ErrorKind::NotFound => {
                         // SAFETY: mkdirat creates one component and never follows its final name.
                         let created =
@@ -160,18 +199,22 @@ mod native {
                         } else {
                             sync_directory(&directory)?;
                         }
-                        directory = open_directory_at(&directory, &name).map_err(|error| {
+                        open_directory_at(directory, &name).map_err(|error| {
                             format!("Result directory cannot be opened safely: {error}")
-                        })?;
+                        })?
                     }
                     Err(error) => {
                         return Err(format!(
                             "Result path contains a symbolic link or non-directory: {error}"
                         ))
                     }
-                }
+                };
+                chain.push(next);
             }
-            Ok((directory, component_name(final_name)?))
+            Ok(ParentDirectory {
+                chain,
+                name: component_name(final_name)?,
+            })
         }
     }
 
@@ -236,18 +279,39 @@ mod native {
         if bytes.len() > limit || bytes.len() != expected {
             return Err("Result file changed while it was read".into());
         }
-        file.sync_all()
-            .map_err(|error| format!("Result file sync failed: {error}"))?;
+        sync_descriptor(file.as_raw_fd(), "Result file")?;
         Ok(bytes)
     }
 
     fn sync_directory(directory: &OwnedFd) -> Result<(), String> {
+        sync_descriptor(directory.as_raw_fd(), "Result directory")
+    }
+
+    fn sync_descriptor(descriptor: i32, subject: &str) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: descriptor is held live and successful fstat initializes metadata.
+            if unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } == 0 {
+                // SAFETY: successful fstat initialized metadata.
+                let metadata = unsafe { metadata.assume_init() };
+                let identity = (metadata.st_dev as u64, metadata.st_ino as u64);
+                if let Some(label) = INJECTED_SYNC_FAILURES.with(|configured| {
+                    configured
+                        .borrow()
+                        .iter()
+                        .find_map(|(candidate, label)| (*candidate == identity).then_some(*label))
+                }) {
+                    return Err(format!("Injected sync failure for {label}"));
+                }
+            }
+        }
         // SAFETY: fsync accepts this live directory descriptor.
-        if unsafe { libc::fsync(directory.as_raw_fd()) } == 0 {
+        if unsafe { libc::fsync(descriptor) } == 0 {
             Ok(())
         } else {
             Err(format!(
-                "Result directory sync failed: {}",
+                "{subject} sync failed: {}",
                 std::io::Error::last_os_error()
             ))
         }
@@ -256,6 +320,9 @@ mod native {
 
 #[cfg(unix)]
 pub(super) use native::RootDirectory;
+
+#[cfg(all(test, unix))]
+pub(super) use native::{clear_sync_failures, inject_sync_failures};
 
 #[cfg(not(unix))]
 pub(super) struct RootDirectory;

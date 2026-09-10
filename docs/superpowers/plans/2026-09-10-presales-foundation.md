@@ -28,7 +28,7 @@ This plan implements the instruction/contract portion of §§3.1–3.3. It suppl
 Next independent implementation plans consume these interfaces in order:
 
 1. Native companion save/load/CAS, joint outline/detail editor and approval binding, actual adapter routing (§3.2–3.3).
-2. Isolated v3 catalog, origin migration, page version/approval selection, durable jobs and Worker-owned two-slot scheduler (§§4–6).
+2. Isolated v3 catalog, origin migration, page version/approval selection, durable jobs and Worker-owned configurable scheduler (1–4; first real target 4, per 2026-09-10 confirmation; §§4–6).
 3. Multi-page gallery, history feedback, image references, content revision copies and exact-version export/QA (§§5,7).
 
 No scope is removed. A foundation test pass must not be reported as concurrent generation, finished visual quality or full design completion.

@@ -245,3 +245,64 @@ test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 A post-run process check found no lingering cargo or `presales_queue` test process from this
 worktree. The earlier PIDs 5194/5234 cleanup remains fully documented in the preceding section;
 this fix round introduced no additional leak.
+
+## Review fix round 2: SQL token boundaries
+
+The scoped re-review found that fix round 1 still removed every whitespace character outside
+string literals. That made `INTEGER PRIMARY KEY` and SQLite's non-constraint type spelling
+`INTEGER PRIMARYKEY` compare equal, so a marked schema without the required primary key could
+still be accepted.
+
+A real marked-database preservation regression was added first. It replaces the first
+`PRIMARY KEY` with `PRIMARYKEY`, creates the schema through SQLite, and asserts that `QueueStore`
+rejects it without changing markers, journal mode, or schema objects.
+
+RED command:
+
+```text
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue marked_database_with_merged_primary_key_tokens_is_rejected_without_mutation -- --exact
+```
+
+RED result: exit 101, no warnings.
+
+```text
+running 1 test
+test marked_database_with_merged_primary_key_tokens_is_rejected_without_mutation ... FAILED
+mutation merged-primary-key-tokens was accepted
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.01s
+```
+
+The minimal fix replaces whitespace deletion with SQL tokenization. ASCII word tokens are
+case-folded individually, punctuation remains distinct, and complete single-quoted literals are
+preserved exactly (including escaped quotes). Consequently layout and SQL keyword case remain
+insignificant while keyword boundaries and literal status semantics cannot collapse.
+
+Exact regression GREEN command:
+
+```text
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue marked_database_with_merged_primary_key_tokens_is_rejected_without_mutation -- --exact
+```
+
+Result: exit 0, no warnings; 1 passed, 0 failed, 18 filtered out.
+
+Final focused/check commands:
+
+```text
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+git diff --check
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue
+```
+
+Result: exit 0, no warnings.
+
+```text
+running 19 tests
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+Self-review covered merged word tokens, whitespace around punctuation, SQL keyword/identifier
+case, exact quoted status literals, and escaped single quotes. Noncanonical comment or quoting
+forms fail closed, which is acceptable for the owned v1 schema. A post-run process check found
+no lingering cargo or `presales_queue` test process from this worktree; the original 5194/5234
+cleanup remains the only leak event.

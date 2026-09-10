@@ -619,3 +619,9 @@ fn marked_database_with_uppercase_status_predicate_is_rejected_without_mutation(
     let schema = TEST_QUEUE_SCHEMA.replacen("'queued'", "'QUEUED'", 1);
     assert_marked_schema_rejected_without_mutation("uppercase-status-literal", &schema);
 }
+
+#[test]
+fn marked_database_with_merged_primary_key_tokens_is_rejected_without_mutation() {
+    let schema = TEST_QUEUE_SCHEMA.replacen("PRIMARY KEY", "PRIMARYKEY", 1);
+    assert_marked_schema_rejected_without_mutation("merged-primary-key-tokens", &schema);
+}

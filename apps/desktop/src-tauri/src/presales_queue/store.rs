@@ -494,20 +494,47 @@ fn verify_schema(connection: &Connection, tables: &[String]) -> Result<(), Strin
     Ok(())
 }
 
-fn normalized_schema_sql(value: &str) -> String {
-    let mut normalized = String::with_capacity(value.len());
-    let mut in_string_literal = false;
-    for character in value.chars() {
-        if character == '\'' {
-            in_string_literal = !in_string_literal;
-            normalized.push(character);
-        } else if in_string_literal {
-            normalized.push(character);
-        } else if !character.is_whitespace() {
-            normalized.push(character.to_ascii_lowercase());
+fn normalized_schema_sql(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character.is_whitespace() {
+            continue;
         }
+        if character.is_ascii_alphanumeric() || character == '_' {
+            let mut word = String::from(character.to_ascii_lowercase());
+            while characters
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_')
+            {
+                word.push(
+                    characters
+                        .next()
+                        .expect("peeked schema character exists")
+                        .to_ascii_lowercase(),
+                );
+            }
+            tokens.push(word);
+            continue;
+        }
+        if character == '\'' {
+            let mut literal = String::from(character);
+            while let Some(next) = characters.next() {
+                literal.push(next);
+                if next == '\'' {
+                    if characters.peek() == Some(&'\'') {
+                        literal.push(characters.next().expect("peeked quote exists"));
+                    } else {
+                        break;
+                    }
+                }
+            }
+            tokens.push(literal);
+            continue;
+        }
+        tokens.push(character.to_string());
     }
-    normalized
+    tokens
 }
 
 fn read_settings(connection: &Connection) -> Result<QueueSettings, String> {

@@ -367,13 +367,18 @@ fn validate_lifecycle(pipeline: &Value, checkpoint: &PresalesCheckpoint) -> Resu
                 "paired approval proof order or skill identity is invalid",
             ));
         }
-        exact_approval(
+        let pipeline_approval_id = exact_approval(
             &approvals[index],
             &project_id,
             expected_stage,
             &binding.version_id,
             &binding.decided_at,
         )?;
+        if pipeline_approval_id != binding.approval_id {
+            return Err(invalid(
+                "pipeline approval id does not match its saved joint proof",
+            ));
+        }
         let hashes_match = if index == 0 {
             binding.version_id == checkpoint.basis.outline.version_id
                 && binding.content_hash == checkpoint.basis.outline.content_hash

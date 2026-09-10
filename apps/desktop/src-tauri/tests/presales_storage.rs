@@ -507,6 +507,50 @@ fn reload_rejects_reordered_joint_approval_proofs() {
 }
 
 #[test]
+fn reload_and_next_commit_reject_pipeline_proof_id_divergence() {
+    let path = temporary_database("approval-id-divergence");
+    let id = "project-approval-id-divergence";
+    let database = create_database(&path, id);
+    let (outline, pair) = save_first_pair(&database, id);
+    let approved = outline_approval(&outline);
+    database
+        .replace_checkpoint_with_artifacts(
+            id,
+            3,
+            &approved,
+            &pair,
+            &[],
+            VisualCommitContext::default(),
+            || Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+
+    let mut corrupted = approved;
+    corrupted["approvals"][0]["id"] = json!("different-pipeline-proof-id");
+    replace_raw_pipeline(&path, id, &corrupted);
+    let reload_rejected = database.load_project_checkpoint(id).is_err();
+    let mut next = corrupted;
+    next["revision"] = json!(5);
+    next["project"]["updatedAt"] = json!("2026-09-10T00:04:00Z");
+    let commit_rejected = database
+        .replace_checkpoint_with_artifacts(
+            id,
+            4,
+            &next,
+            &pair,
+            &[],
+            VisualCommitContext::default(),
+            || Ok(()),
+        )
+        .is_err();
+    assert!(reload_rejected);
+    assert!(commit_rejected);
+    drop(database);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn invalid_half_and_callback_failure_leave_no_marker_or_relational_changes() {
     let path = temporary_database("rollback");
     let id = "project-rollback";

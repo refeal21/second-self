@@ -52,3 +52,11 @@
 - Added corrupt slot/status/time/workflow/order reload cases and a next-commit case proving corrupt prior state fails closed.
 - Focused GREEN: `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_storage` passed 14/14 tests.
 - Final formatting check passed. Final `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` passed 91/91 tests with no doc-test failures.
+
+## Proof-ID re-review fix after `113d32c`
+
+- RED: `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_storage reload_and_next_commit_reject_pipeline_proof_id_divergence` failed because changing only the pipeline approval ID was accepted on reload and by the prior-checkpoint path.
+- The ordered lifecycle check now compares the ID returned by exact approval validation with the append-only binding's `approval_id`.
+- The regression covers both exact-revision reload and a subsequent paired commit from the corrupted state.
+- Focused GREEN: the `presales_storage` suite passed 15/15 tests.
+- Final formatting check passed. Final full Rust suite passed 92/92 tests with no doc-test failures.

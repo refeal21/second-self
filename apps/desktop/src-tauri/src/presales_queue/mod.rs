@@ -1,4 +1,5 @@
 mod contracts;
+mod lifecycle;
 mod store;
 
 pub use contracts::*;

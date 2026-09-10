@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const APPLICATION_ID: i64 = 0x44545133;
-const USER_VERSION: i64 = 1;
+const USER_VERSION: i64 = 2;
 const MAX_CONCURRENCY: u8 = 4;
 const MAX_BATCH_SIZE: usize = 100;
 const MAX_REFERENCES: usize = 32;
@@ -21,7 +21,7 @@ struct SchemaObject {
     sql: &'static str,
 }
 
-const SCHEMA_OBJECTS: [SchemaObject; 7] = [
+const SCHEMA_OBJECTS: [SchemaObject; 8] = [
     SchemaObject {
         kind: "table",
         name: "queue_settings",
@@ -105,6 +105,18 @@ WHERE status IN (
     from_status TEXT,
     to_status TEXT NOT NULL,
     epoch INTEGER,
+    created_at_ms INTEGER NOT NULL
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "queue_lifecycle_events",
+        sql: r#"CREATE TABLE queue_lifecycle_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL REFERENCES queue_jobs(request_id),
+    attempt_id TEXT NOT NULL REFERENCES queue_attempts(attempt_id),
+    kind TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL
 )"#,
     },
@@ -353,16 +365,7 @@ impl QueueStore {
     }
 
     pub fn list_jobs(&self) -> Result<Vec<QueueJob>, String> {
-        let mut statement = self
-            .connection
-            .prepare(&format!("{JOB_COLUMNS} ORDER BY sequence"))
-            .map_err(message)?;
-        let jobs = statement
-            .query_map([], row_to_job)
-            .map_err(message)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(message)?;
-        Ok(jobs)
+        read_jobs(&self.connection)
     }
 
     pub fn get_job(&self, request_id: &str) -> Result<Option<QueueJob>, String> {
@@ -438,7 +441,7 @@ impl QueueStore {
     }
 }
 
-fn message(error: impl std::fmt::Display) -> String {
+pub(super) fn message(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
@@ -471,7 +474,9 @@ fn verify_schema(connection: &Connection, tables: &[String]) -> Result<(), Strin
         .map(|object| object.name)
         .collect();
     if actual_tables != expected_tables {
-        return Err("durable queue schema does not match user_version 1".into());
+        return Err(format!(
+            "durable queue schema does not match user_version {USER_VERSION}"
+        ));
     }
     for object in SCHEMA_OBJECTS {
         let actual: Option<String> = connection
@@ -486,7 +491,7 @@ fn verify_schema(connection: &Connection, tables: &[String]) -> Result<(), Strin
             != Some(&normalized_schema_sql(object.sql))
         {
             return Err(format!(
-                "durable queue {} {} does not match user_version 1",
+                "durable queue {} {} does not match user_version {USER_VERSION}",
                 object.kind, object.name
             ));
         }
@@ -544,7 +549,7 @@ fn is_sqlite_sql_whitespace(character: char) -> bool {
     )
 }
 
-fn read_settings(connection: &Connection) -> Result<QueueSettings, String> {
+pub(super) fn read_settings(connection: &Connection) -> Result<QueueSettings, String> {
     connection
         .query_row(
             "SELECT concurrency, paused, epoch FROM queue_settings WHERE singleton = 1",
@@ -570,6 +575,18 @@ fn read_settings(connection: &Connection) -> Result<QueueSettings, String> {
 const JOB_COLUMNS: &str = "SELECT sequence, batch_id, request_id, attempt_id, target_json,
  status, epoch, provider_json, result_json, error, created_at_ms, updated_at_ms, dispatched_at_ms
  FROM queue_jobs";
+
+pub(super) fn read_jobs(connection: &Connection) -> Result<Vec<QueueJob>, String> {
+    let mut statement = connection
+        .prepare(&format!("{JOB_COLUMNS} ORDER BY sequence"))
+        .map_err(message)?;
+    let jobs = statement
+        .query_map([], row_to_job)
+        .map_err(message)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(message)?;
+    Ok(jobs)
+}
 
 pub(super) fn read_job(
     connection: &Connection,
@@ -657,7 +674,7 @@ fn read_batch_outcome(connection: &Connection, batch_id: &str) -> Result<Enqueue
     })
 }
 
-fn epoch_milliseconds() -> Result<i64, String> {
+pub(super) fn epoch_milliseconds() -> Result<i64, String> {
     let milliseconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(message)?
@@ -783,7 +800,7 @@ fn validate_free_text(
     Ok(())
 }
 
-fn validate_hash(value: &str, field: &str) -> Result<(), String> {
+pub(super) fn validate_hash(value: &str, field: &str) -> Result<(), String> {
     if value.len() != 64
         || !value
             .as_bytes()

@@ -373,7 +373,7 @@ fn queue_markers_are_persisted_and_foreign_databases_are_not_mutated() {
         queue
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         queue
@@ -546,6 +546,14 @@ CREATE TABLE queue_transition_events (
     epoch INTEGER,
     created_at_ms INTEGER NOT NULL
 );
+CREATE TABLE queue_lifecycle_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL REFERENCES queue_jobs(request_id),
+    attempt_id TEXT NOT NULL REFERENCES queue_attempts(attempt_id),
+    kind TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
 "#;
 
 fn create_marked_schema(
@@ -564,7 +572,7 @@ fn create_marked_schema(
     connection
         .pragma_update(None, "application_id", QUEUE_APPLICATION_ID)
         .unwrap();
-    connection.pragma_update(None, "user_version", 1).unwrap();
+    connection.pragma_update(None, "user_version", 2).unwrap();
     let snapshot = schema_snapshot(&connection);
     drop(connection);
     snapshot

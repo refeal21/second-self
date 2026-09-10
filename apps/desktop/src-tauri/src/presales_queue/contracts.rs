@@ -108,3 +108,22 @@ pub struct EnqueueOutcome {
     pub jobs: Vec<QueueJob>,
     pub reused_request_ids: Vec<String>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueueEvent {
+    pub sequence: i64,
+    pub request_id: String,
+    pub attempt_id: String,
+    pub kind: String,
+    pub detail: serde_json::Value,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoverySnapshot {
+    pub settings: QueueSettings,
+    pub jobs: Vec<QueueJob>,
+    pub unresolved_remote_count: usize,
+}

@@ -89,3 +89,10 @@ Focused commands:
 - RED: `pnpm --filter @digital-twin/desktop exec vitest run src/presales-checkpoint.test.ts -t "rejects a .* checkpoint returned for another project without fallback"` — 2 failed because structurally valid paired and legacy-null checkpoints for project B resolved successfully when project A was requested.
 - GREEN: the same focused command — 2 passed, 12 skipped. Both response shapes now require `pipeline.project.id` to equal the requested project ID, and each test confirms exactly one `ppt_load_checkpoint` invocation with no fallback.
 - Final verification: full `src/presales-checkpoint.test.ts` 14 passed; desktop typecheck, zero-warning lint, production build (66 modules), and `git diff --check` all exited 0.
+
+## Deterministic mounted/off-page lifecycle test fix
+
+- Root cause: the mounted-completion test waited only for the details-generation button to exist. Initial pipeline/style restoration renders it before `styleReady`, so the click can be ignored while disabled and `finish()` then dereferences an attempt that was never created.
+- RED: with `loadVisualStyle` held behind a controlled deferred promise, the old sequence failed deterministically at `attempts.get(projectId)![0]` with no generation attempt.
+- GREEN: the test now proves the visible button is initially disabled, releases the style-load gate, waits for the actual enabled condition, clicks, and asserts `generateDetails` ran before resolving the attempt. No sleep, timeout increase, or production change was added.
+- Final verification: the exact test passed 1/1; the full desktop suite passed 326/326; desktop typecheck, zero-warning lint, and `git diff --check` exited 0.

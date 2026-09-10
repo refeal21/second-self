@@ -306,3 +306,77 @@ case, exact quoted status literals, and escaped single quotes. Noncanonical comm
 forms fail closed, which is acceptable for the owned v1 schema. A post-run process check found
 no lingering cargo or `presales_queue` test process from this worktree; the original 5194/5234
 cleanup remains the only leak event.
+
+## Review fix round 3: SQLite whitespace semantics
+
+The scoped re-review found that Rust `char::is_whitespace()` still merged tokens across Unicode
+separators that SQLite does not recognize as SQL whitespace. In particular,
+`PRIMARY\u{00a0}KEY` was tokenized like `PRIMARY KEY` by the verifier, while SQLite stored it as
+the column type `INTEGER PRIMARY\u{00a0}KEY` with `pk=0` and allowed duplicate singleton values.
+
+A focused in-memory SQLite DDL probe established the separator behavior on this build before the
+fix:
+
+```text
+HT status=0 result=0|id|INTEGER|0||1
+LF status=0 result=0|id|INTEGER|0||1
+VT status=1 result=Parse error ... unrecognized token
+FF status=0 result=0|id|INTEGER|0||1
+CR status=0 result=0|id|INTEGER|0||1
+SPACE status=0 result=0|id|INTEGER|0||1
+NBSP status=0 result=0|id|INTEGER PRIMARY KEY|0||0
+```
+
+A real marked-database preservation regression then replaced `PRIMARY KEY` with
+`PRIMARY\u{00a0}KEY` and asserted rejection without any marker, journal-mode, or schema-object
+mutation.
+
+RED command:
+
+```text
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue marked_database_with_non_sqlite_unicode_whitespace_is_rejected_without_mutation -- --exact
+```
+
+RED result: exit 101, no warnings.
+
+```text
+running 1 test
+test marked_database_with_non_sqlite_unicode_whitespace_is_rejected_without_mutation ... FAILED
+mutation unicode-primary-key-separator was accepted
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.01s
+```
+
+The minimal production fix replaces `char::is_whitespace()` with an explicit SQLite SQL
+whitespace predicate containing only U+0009, U+000A, U+000C, U+000D, and U+0020. It deliberately
+does not use `char::is_ascii_whitespace()`, which would also admit U+000B even though SQLite
+rejects vertical tab here.
+
+Exact regression GREEN command:
+
+```text
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue marked_database_with_non_sqlite_unicode_whitespace_is_rejected_without_mutation -- --exact
+```
+
+Result: exit 0, no warnings; 1 passed, 0 failed, 19 filtered out.
+
+Final focused/check commands:
+
+```text
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+git diff --check
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_queue
+```
+
+Result: exit 0, no warnings.
+
+```text
+running 20 tests
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+Self-review confirms canonical schema spaces/newlines still compare normally, all five supported
+SQLite separators preserve token boundaries, and non-SQLite Unicode/control separators remain
+distinct tokens or fail closed. A post-run process check found no lingering cargo or
+`presales_queue` test process from this worktree; the original 5194/5234 cleanup remains the only
+leak event.

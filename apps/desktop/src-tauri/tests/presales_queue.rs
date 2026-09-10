@@ -625,3 +625,9 @@ fn marked_database_with_merged_primary_key_tokens_is_rejected_without_mutation()
     let schema = TEST_QUEUE_SCHEMA.replacen("PRIMARY KEY", "PRIMARYKEY", 1);
     assert_marked_schema_rejected_without_mutation("merged-primary-key-tokens", &schema);
 }
+
+#[test]
+fn marked_database_with_non_sqlite_unicode_whitespace_is_rejected_without_mutation() {
+    let schema = TEST_QUEUE_SCHEMA.replacen("PRIMARY KEY", "PRIMARY\u{00a0}KEY", 1);
+    assert_marked_schema_rejected_without_mutation("unicode-primary-key-separator", &schema);
+}

@@ -498,7 +498,7 @@ fn normalized_schema_sql(value: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut characters = value.chars().peekable();
     while let Some(character) = characters.next() {
-        if character.is_whitespace() {
+        if is_sqlite_sql_whitespace(character) {
             continue;
         }
         if character.is_ascii_alphanumeric() || character == '_' {
@@ -535,6 +535,13 @@ fn normalized_schema_sql(value: &str) -> Vec<String> {
         tokens.push(character.to_string());
     }
     tokens
+}
+
+fn is_sqlite_sql_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' | '\u{0020}'
+    )
 }
 
 fn read_settings(connection: &Connection) -> Result<QueueSettings, String> {

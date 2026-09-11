@@ -180,7 +180,9 @@ expect(() => validateLegacyCopySnapshot({ schemaVersion: 3 })).toThrow();
 - [ ] **Step 2:** Implement a narrow reusable tracker and native transport integration; do not rewrite the legacy adapter or infer an unobserved remote cancellation. Named blocking reasons remain visible when proof is absent.
 - [ ] **Step 3:** Run tracker/legacy process regression tests including default and native-feature builds as relevant; commit `feat: guard legacy copies with native activity evidence`. Task 4 reuses the tracker rather than inventing another authority.
 
-### Task 3c: Atomic explicit copy catalog and import service
+### Stage 3c: Atomic explicit copy catalog and import service
+
+The following shared contract is implemented by sequential reviewed Tasks 3c1 and 3c2. Task 3c1 alone is not a usable copy feature; no Stage 3c requirement is dropped by this split.
 
 **Files:** Create `presales_v3/{import,service}.rs`, exact closed draft/history/import tables and contracts, tests `presales_v3_import.rs`; reuse Tasks 3a/3b and narrow pure paired/style validation seams. Extend existing v3 basis/store/history/review/publication/delivery only through explicit receipt-backed imported branches, preserving all native generated-version checks.
 
@@ -194,6 +196,29 @@ expect(() => validateLegacyCopySnapshot({ schemaVersion: 3 })).toThrow();
 - [ ] **Step 1:** RED tests for both modes, distinct destination identity, absent/partial paired evidence, origin approval proof, missing assets, source changed after prepare, active/unknown guard, atomic failure and reopen; compare original DB/WAL/artifacts byte-for-byte.
 - [ ] **Step 2:** Implement staged immutable copies and atomic index/receipt/catalog publication with no half-visible project on failure. Keep validated tokens private and public read models tagged frozen/draft/history-only.
 - [ ] **Step 3:** Run import/snapshot/activity/storage/event regressions; commit `feat: create validated parallel-review project copies`.
+
+### Task 3c1: Exact catalog schema upgrade and selected snapshot evidence
+
+**Files:** Focused `presales_queue/v3_schema_upgrade.rs` and exact prior-schema declarations/fixture; `presales_queue/schema.rs`; necessary native-only `presales_v3/store.rs` compatibility and tagged catalog contracts; selected-envelope extraction in `presales_v3/legacy_snapshot.rs` or a focused private helper. Synthetic migration/extraction tests. No incomplete public copy-service entry points.
+
+**Interfaces and boundaries:** Implement the Stage 3c exact V3-only v1→v2 upgrade with a real tagged catalog root and separate frozen/draft/history schema; preserve existing native project/history/queue/approval/delivery/activity row identities and JSON. Recognize only exact prior schema from `7066c841df3d08850ba05a38b7ad55881b2916bc`, reject unknown/foreign/partial variants before mutation. Connection-local foreign-key enforcement may be disabled before the immediate transaction solely for table rebuilding; recheck source schema under the writer lock, validate exact target schema/foreign keys/integrity before commit, and restore/verify enforcement before returning the connection. Roll back every failure and discard a connection whose restoration is uncertain. No original workbench/source DB mutation, generic migration framework or non-frozen sentinel in frozen evidence.
+
+- Extract exact selected-project pipeline/companion/style/receipt rows from the same verified READONLY memory database image. Preserve raw selected cell bytes and bind the envelope to capture identity/digests. Full shared main/WAL bytes remain private/transient; unrelated project data must not enter the selected envelope. Do not introduce import validity booleans or a second source connection.
+- [ ] **Step 1:** RED/green exact recognized upgrade/reopen, foreign/partial/unknown-future rejection, real unresolved native activity preservation and representative checked native history/approval/queue preservation tests.
+- [ ] **Step 2:** Add injected post-DDL/row-copy rollback and two-project selected-envelope isolation/raw-byte preservation regressions; confirm original source bytes remain unchanged.
+- [ ] **Step 3:** Run affected migration/store/snapshot/activity/native history regressions and native build/fmt/diff checks, self-review, commit `feat: upgrade v3 catalog and capture selected import evidence`. Report exact migration, envelope APIs, warning debt and verification; full importer remains Task 3c2.
+
+### Task 3c2: Full immutable copy publication and imported history
+
+**Files:** `presales_v3/{import,service}.rs` plus focused asset/receipt/origin-proof helpers; native/import-specific extensions to basis/store/history/review/publication/delivery/contracts, using Task 3c1's exact catalog schema and selected envelope. Synthetic service/import/history tests.
+
+**Interfaces and boundaries:** Implement the complete Stage 3c shared contract through `V3WorkbenchService::{prepare_legacy_copy,publish_legacy_copy,load_v3_project,list_project_catalog}` and explicit `format_copy` / `presales_content_revision` modes. Consume the private Task 3a full-replay token, Task 3b short native guards and Task 3c1 selected snapshot envelope. Opaque preparation IDs do not replace final source/activity/file rechecks. Only selected immutable assets/evidence enter destination storage; publish catalog/index/receipt/history/eligibility atomically after byte verification. No original modification, fabricated approvals, source-ID rewriting or full shared-database copying.
+
+- Implement distinct destination identities and repeat-copy mappings, typed origin approval references, missing-history metadata, required-active-image rejection, honest tagged frozen/history-only/draft states, same-snapshot style/receipt evidence and explicit legacy-versus-native hash algorithms. Current pairs enable new generation but do not manufacture old image design/skill provenance. All original native-generated version/queue/receipt checks stay intact; imports are an explicit checked branch, never a fallback after native validation fails.
+- Content revision only initializes a verified explicit draft with preserved origin/source/analysis/brief/palette and no inherited effective approval or delivery. Draft authoring/promotion/reference management remains Task 3d.
+- [ ] **Step 1:** RED genuine full-replay source fixtures and the Stage 3c service/identity/asset/origin-approval matrix, including two copies, mixed imported/native history, stale source/activity, missing/changed files and rollback/reopen.
+- [ ] **Step 2:** Implement complete staged copy plus atomic publication and checked imported review/delivery routes; no half-visible project or loss of historical decisions.
+- [ ] **Step 3:** Run affected import/snapshot/activity/store/event/approval/delivery regressions and build/fmt/diff checks, self-review, commit `feat: create validated parallel-review project copies`. Report production construction path and limitations; no UI/runtime acceptance claim.
 
 ### Task 3d: V3 paired drafts, promotion and page reference assets
 

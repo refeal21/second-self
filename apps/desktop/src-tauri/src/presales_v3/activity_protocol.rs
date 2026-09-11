@@ -287,6 +287,33 @@ pub(super) fn observe(inner: &mut Inner, process: &ProcessKey, v: &Value) -> Res
                 .map(|(i, _)| i)
                 .collect();
             for i in &ids {
+                let observation = inner.evidence[*i].clone();
+                // A resumed observation belongs to this exact process. Only its
+                // pre-send targets may inherit this terminal witness; IDs alone
+                // never authorize settlement across generations or workspaces.
+                let targets: Vec<_> = inner
+                    .evidence
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, old)| {
+                        observation.resume_targets.contains(&old.id)
+                            && old.kind == Kind::Turn
+                            && !old.settled
+                            && old.scope == observation.scope
+                            && old.thread == observation.thread
+                            && old.turn == observation.turn
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                for target in targets {
+                    settle(
+                        inner,
+                        target,
+                        "resume_turn_completed",
+                        process,
+                        observation.linked.clone(),
+                    )?;
+                }
                 settle(inner, *i, "turn_completed", process, None)?;
             }
             if ids.is_empty()
@@ -408,29 +435,39 @@ pub(super) fn observe(inner: &mut Inner, process: &ProcessKey, v: &Value) -> Res
             if let Some(turns) = result["thread"]["turns"].as_array() {
                 for turn in turns.iter().filter(|turn| !terminal(turn)) {
                     if let Some(turn) = text(&turn["id"]) {
-                        if !inner.evidence.iter().any(|old| {
-                            old.kind == Kind::Turn
-                                && old.thread.as_ref() == Some(&thread)
-                                && old.turn.as_ref() == Some(&turn)
-                        }) {
-                            inner.insert(Evidence {
-                                proof_version: 1,
-                                id: uuid::Uuid::new_v4().to_string(),
-                                process: process.clone(),
-                                rpc: None,
-                                kind: Kind::Turn,
-                                scope: scope.clone(),
-                                thread: Some(thread.clone()),
-                                turn: Some(turn),
-                                reason: None,
-                                settled: false,
-                                visual_id: None,
-                                prompt_hash: None,
-                                linked: None,
-                                resolution: None,
-                                resume_targets: Vec::new(),
-                            })?;
-                        }
+                        // Every successful setup response is a fresh native
+                        // observation, even if historical settled/unresolved
+                        // evidence happens to reuse the same thread/turn IDs.
+                        let resume_targets = inner
+                            .evidence
+                            .iter()
+                            .filter(|old| {
+                                e.resume_targets.contains(&old.id)
+                                    && old.kind == Kind::Turn
+                                    && !old.settled
+                                    && old.scope == scope
+                                    && old.thread.as_ref() == Some(&thread)
+                                    && old.turn.as_ref() == Some(&turn)
+                            })
+                            .map(|old| old.id.clone())
+                            .collect();
+                        inner.insert(Evidence {
+                            proof_version: 1,
+                            id: uuid::Uuid::new_v4().to_string(),
+                            process: process.clone(),
+                            rpc: None,
+                            kind: Kind::Turn,
+                            scope: scope.clone(),
+                            thread: Some(thread.clone()),
+                            turn: Some(turn),
+                            reason: None,
+                            settled: false,
+                            visual_id: None,
+                            prompt_hash: None,
+                            linked: Some(e.id.clone()),
+                            resolution: None,
+                            resume_targets,
+                        })?;
                     }
                 }
             }

@@ -131,6 +131,56 @@ pub(crate) struct SourceGuard<'a> {
     inner: MutexGuard<'a, Inner>,
 }
 
+#[cfg(test)]
+mod mixed_frame_tests {
+    use super::*;
+
+    #[test]
+    fn worker_mixed_bad_frame_preserves_correlated_reply_and_loss() {
+        for bad in [vec![b'x'; 65], vec![0xff]] {
+            let t = LegacyActivityTracker::new(V3Store::open_in_memory().unwrap()).unwrap();
+            let p = t.process_key(Transport::Worker, 1);
+            t.send(
+                &p,
+                r#"{"id":1,"method":"ppt.project.execute"}"#,
+                |_| None,
+                || Ok(()),
+            )
+            .unwrap();
+            t.inner
+                .lock()
+                .unwrap()
+                .buffers
+                .insert(p.clone(), FrameDecoder::new(64));
+            let mut chunk = bad;
+            chunk.extend_from_slice(b"\n{\"id\":1,\"result\":{}}\n");
+            let events = t.observe_bytes(&p, &chunk).unwrap();
+            assert_eq!(
+                events,
+                vec![
+                    Err("protocol_evidence_lost".to_owned()),
+                    Ok("{\"id\":1,\"result\":{}}\n".to_owned())
+                ]
+            );
+            let source = NativeSource::new(
+                PathBuf::from("/synthetic/db"),
+                "a".into(),
+                PathBuf::from("/synthetic/a"),
+            );
+            assert!(t.try_source_guard(&source).is_err());
+            assert!(t
+                .inner
+                .lock()
+                .unwrap()
+                .evidence
+                .iter()
+                .any(|e| e.kind == Kind::Local && e.settled));
+            t.transport_lost(&p, "remote_terminal_missing").unwrap();
+            assert!(t.try_source_guard(&source).is_ok());
+        }
+    }
+}
+
 impl LegacyActivityTracker {
     pub(crate) fn new(store: V3Store) -> Result<Self, String> {
         let mut evidence = storage::load(&store)?;
@@ -277,14 +327,13 @@ impl LegacyActivityTracker {
         &self,
         process: &ProcessKey,
         bytes: &[u8],
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<Result<String, String>>, String> {
         let mut inner = self.lock()?;
         let mut decoder = inner
             .buffers
             .remove(process)
             .unwrap_or_else(|| FrameDecoder::new(process.transport.frame_limit()));
         let mut forwarded = Vec::new();
-        let mut result = Ok(());
         decoder.push(bytes, |frame| {
             let observed = (|| {
                 let Ok(bytes) = frame else {
@@ -297,18 +346,20 @@ impl LegacyActivityTracker {
                 };
                 // Preserve valid UTF-8 wire frames even when JSON is malformed;
                 // evidence parsing and frontend protocol handling stay separate.
-                forwarded.push(line.to_owned());
+                forwarded.push(Ok(line.to_owned()));
                 match serde_json::from_slice::<Value>(bytes) {
                     Ok(v) if v.is_object() => protocol::observe(&mut inner, process, &v),
                     _ => inner.lost(process, "protocol_evidence_lost", false),
                 }
             })();
-            if observed.is_err() {
-                result = observed;
+            if let Err(error) = observed {
+                forwarded.push(Err(error));
             }
         });
         inner.buffers.insert(process.clone(), decoder);
-        result.map(|()| forwarded)
+        // Per-frame loss must not erase other complete wire frames in this
+        // chunk. The receiver emits both successes and named loss events.
+        Ok(forwarded)
     }
     pub(crate) fn transport_lost(&self, process: &ProcessKey, reason: &str) -> Result<(), String> {
         let mut inner = self.lock()?;

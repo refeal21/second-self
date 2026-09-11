@@ -488,7 +488,10 @@ fn large_worker_artifact_reply_settles_and_forwarding_preserves_chinese_utf8() {
         .observe_bytes(&p, "\"}],\"message\":\"中文\"}}\n".as_bytes())
         .unwrap();
     assert_eq!(frames.len(), 1);
-    assert!(frames[0].ends_with("\"message\":\"中文\"}}\n"));
+    assert!(frames[0]
+        .as_ref()
+        .unwrap()
+        .ends_with("\"message\":\"中文\"}}\n"));
     assert!(t.try_source_guard(&source("a")).is_ok());
 }
 
@@ -519,6 +522,67 @@ fn correlated_resume_nonterminal_history_is_active_even_without_original_send() 
         &q,
         json!({"id":1,"result":{"thread":{"id":"th","cwd":source("a").root,"turns":[{"id":"running","status":"inProgress"}]}}}),
     );
+    assert!(t.try_source_guard(&source("a")).is_err());
+    terminal(&t, &q, "running");
+    assert!(t.try_source_guard(&source("a")).is_ok());
+}
+
+#[test]
+fn resumed_existing_nonterminal_turn_completes_only_pre_resume_targets() {
+    let t = tracker();
+    let p = t.process_key(Transport::Codex, 1);
+    thread(&t, &p);
+    start(&t, &p, json!(2));
+    child(&t, &p, json!({"id":2,"result":{"turn":{"id":"running"}}}));
+    t.transport_lost(&p, "remote_terminal_missing").unwrap();
+    let q = t.process_key(Transport::Codex, 2);
+    send(
+        &t,
+        &q,
+        json!({"id":1,"method":"thread/resume","params":{"threadId":"th"}}),
+    );
+    child(
+        &t,
+        &q,
+        json!({"id":1,"result":{"thread":{"id":"th","cwd":source("a").root,"turns":[{"id":"running","status":"inProgress"}]}}}),
+    );
+    assert!(t.try_source_guard(&source("a")).is_err());
+    terminal(&t, &q, "running");
+    assert!(t.try_source_guard(&source("a")).is_ok());
+
+    // A later generation using the same IDs is not a target of Q's observation.
+    let r = t.process_key(Transport::Codex, 3);
+    thread(&t, &r);
+    start(&t, &r, json!(2));
+    child(&t, &r, json!({"id":2,"result":{"turn":{"id":"running"}}}));
+    terminal(&t, &q, "running");
+    assert!(t.try_source_guard(&source("a")).is_err());
+    terminal(&t, &r, "running");
+    assert!(t.try_source_guard(&source("a")).is_ok());
+}
+
+#[test]
+fn resumed_nonterminal_observation_is_not_hidden_by_settled_same_id_history() {
+    let t = tracker();
+    let p = t.process_key(Transport::Codex, 1);
+    thread(&t, &p);
+    start(&t, &p, json!(2));
+    child(&t, &p, json!({"id":2,"result":{"turn":{"id":"running"}}}));
+    terminal(&t, &p, "running");
+    assert!(t.try_source_guard(&source("a")).is_ok());
+    let q = t.process_key(Transport::Codex, 2);
+    send(
+        &t,
+        &q,
+        json!({"id":1,"method":"thread/resume","params":{"threadId":"th"}}),
+    );
+    child(
+        &t,
+        &q,
+        json!({"id":1,"result":{"thread":{"id":"th","cwd":source("a").root,"turns":[{"id":"running","status":"inProgress"}]}}}),
+    );
+    assert!(t.try_source_guard(&source("a")).is_err());
+    terminal(&t, &p, "running");
     assert!(t.try_source_guard(&source("a")).is_err());
     terminal(&t, &q, "running");
     assert!(t.try_source_guard(&source("a")).is_ok());

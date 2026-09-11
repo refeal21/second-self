@@ -124,23 +124,21 @@ pub async fn start_worker_sidecar(
         let mut stderr_frames = crate::legacy_frames::FrameDecoder::new(64 * 1024);
         while let Some(event) = receiver.recv().await {
             match event {
-                CommandEvent::Stdout(bytes) => match activity.observe_bytes(&key, &bytes) {
-                    Ok(lines) => {
-                        for line in lines {
-                            let _ = event_app
-                                .emit(WORKER_STDOUT_EVENT, WorkerLine { generation, line });
-                        }
+                CommandEvent::Stdout(bytes) => {
+                    let events = activity
+                        .observe_bytes(&key, &bytes)
+                        .unwrap_or_else(|error| vec![Err(error)]);
+                    for event in events {
+                        let (name, line) = match event {
+                            Ok(line) => (WORKER_STDOUT_EVENT, line),
+                            Err(error) => (
+                                WORKER_STDERR_EVENT,
+                                format!("Workflow worker transport evidence lost: {error}"),
+                            ),
+                        };
+                        let _ = event_app.emit(name, WorkerLine { generation, line });
                     }
-                    Err(error) => {
-                        let _ = event_app.emit(
-                            WORKER_STDERR_EVENT,
-                            WorkerLine {
-                                generation,
-                                line: format!("Workflow worker transport evidence lost: {error}"),
-                            },
-                        );
-                    }
-                },
+                }
                 CommandEvent::Stderr(bytes) => {
                     stderr_frames.push(&bytes, |frame| {
                         let line = frame

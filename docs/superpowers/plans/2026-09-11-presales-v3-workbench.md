@@ -124,6 +124,7 @@ enum DatabaseProfile { QueueOnly, PresalesV3 }
 
 **Files:**
 - Create `apps/desktop/src-tauri/src/presales_v3/{import,service}.rs` and `apps/worker/src/presales/legacy-copy.ts`.
+- Add focused private v3 `draft.rs`, `legacy_snapshot.rs`, `validator_process.rs` helpers and explicit draft/history-only tables in the closed v3 schema; extend the catalog with tagged kinds instead of weakening the frozen seed. Reuse paired pure validation through narrow crate-private seams in `presales/storage.rs`.
 - Modify `database.rs`, `workbench.rs`, `paths.rs`, Worker RPC only for read-only snapshot validation/copy bridge.
 - Test `tests/presales_v3_import.rs` and `apps/worker/src/presales/legacy-copy.test.ts`.
 
@@ -131,6 +132,10 @@ enum DatabaseProfile { QueueOnly, PresalesV3 }
 - Consume Task 1 seed/catalog and Task 2 immutable version/event contracts.
 - Produce `prepare_legacy_copy`, `publish_legacy_copy`, `load_v3_project`, `list_project_catalog` through `V3WorkbenchService`; opaque prepared-copy ID binds source ID/revision/snapshot digest, mode and immutable copied artifact index. Modes are `format_copy` and `presales_content_revision`.
 - Worker `validateLegacyCopySnapshot(snapshot)` uses complete existing v1/v2 `validateNativePipelineCheckpoint`; returns a digest-bound result over exact supplied bytes, not a caller asserted validity flag.
+- Production full-replay evidence comes only from a dedicated native-owned offline validator child using the bundled Worker in a separate mode. Private correlated requests bind the actual child's generation and exact snapshot bytes to a non-deserializable validated token. Legacy WebView send/start/stop commands cannot inject into or replace that child. This transport becomes the v3 Worker host in Task 4.
+- Separate destination identity from verbatim source evidence using an immutable native import receipt. Format copies without a current genuine frozen presales pair are history-only for generation; proven legacy delivery approval can survive only through an explicit `originApprovalRef` plus complete image/content/palette evidence. Do not manufacture new approvals or skill hashes. Content-revision copies start in explicit v3 draft storage without inherited approvals; validated paired draft saves and genuine joint approvals promote to the frozen catalog atomically. Preserve the original import lineage through promotion.
+- Source snapshot acquisition must not open/migrate the original through writable legacy APIs. Capture bounded, descriptor-verified stable copies of the main database and any WAL into an owned temporary location, validate/recover only that private copy, and recheck source file identities/content plus source revision before publication. Retry boundedly or fail on activity/inconsistent snapshots; do not use immutable SQLite mode on a changing original or ignore a live WAL. Synthetic tests cover WAL and concurrent source changes.
+- Add explicit page-scoped reference-asset attachment through native validated file selection, immutable copied bytes and a saved intended use (such as the cockpit subject). References are not factual content authority. Bind reference set/usage to admission and provenance; reject changes during affected-page unfinished work and invalidate only that page's eligibility on an explicit reference change. No automatic read of previously mentioned customer image paths in development tests.
 
 - [ ] **Step 1: Red tests reject active/unknown source work, tampered source after prepare, malformed replay, missing active image, unsafe paths and half-failed copy publication; compare original DB/artifact bytes before and after.**
 
@@ -148,6 +153,7 @@ expect(() => validateLegacyCopySnapshot({ schemaVersion: 3 })).toThrow();
 
 **Files:**
 - Create `apps/desktop/src-tauri/src/presales_v3/{commands,supervisor}.rs`, `apps/worker/src/presales/runtime.ts`.
+- Extend Task 3's dedicated native-owned Worker host and reuse `CodexAppServerProcess` in a separate supervisor-owned instance; no v3 authority or image bytes go through legacy WebView raw stdout/send/restart commands. Add a Worker AppServerTransport proxy over private correlated messages as needed.
 - Modify `lib.rs`, `tauri_worker.rs`, Worker `sidecar-cli.ts`, `sidecar-rpc.ts`, protocol contracts and tests.
 - Test `apps/worker/src/presales/runtime.test.ts`, native `tests/presales_v3_supervisor.rs` and actual process harness.
 
@@ -155,6 +161,7 @@ expect(() => validateLegacyCopySnapshot({ schemaVersion: 3 })).toThrow();
 - Consume service admission/publication and queue epoch/lifecycle/claim operations.
 - Produce typed short native commands for load/list/enqueue/approve/draft/history/settings/pause/cancel/abandon and `presales-queue-changed` events carrying revision, never full image bytes.
 - Worker messages `presales/start` acknowledge promptly, emit provider identity/progress/result events asynchronously and service correlated native requests while a generation runs. Rust owns dispatch and global slots, Worker does not invent a second concurrency limit.
+- The same bundled Worker executable serves an explicit v3 mode, but its child handle and provider are separate from the legacy adapter instances. UI reconnect cannot restart active v3 jobs. Share the existing account login, not process lifetime; record combined memory in acceptance. Bound UTF-8 line assembly and private message buffers, consume PNG data natively and emit only small UI change events.
 
 - [ ] **Step 1: Add RED fake-provider tests at concurrency 1/2/4 with five pages completing out of order; prove stdin remains responsive and a native callback can complete during a slow job.**
 
@@ -212,6 +219,7 @@ expect(() => validateLegacyCopySnapshot({ schemaVersion: 3 })).toThrow();
 
 - [ ] **Step 2: Run new component tests and record RED.**
 - [ ] **Step 3: Implement Chinese UI: page gallery with thumbnails/status, concurrency selector 1–4, selected/all missing generation, per-job progress/retry/save-result/cancel controls, persistent feedback, history selector, explicit current-delivery badge and exact-version approval checks.** Use accessible buttons and explain running/unknown/missing basis states. No global busy lock or automatic selection jump when another page finishes. Draft save failures retain text and visibly prevent silent navigation loss. Show copied-project origin and explicit copy confirmation.
+- Include page-scoped reference attachment and intended-use display so an approved cockpit reference can actually reach generation; user chooses the file and page, and the UI never invents its provenance.
 - [ ] **Step 4: Wire content/design paired draft save and joint approval to existing human-readable outline/details editors.** New presales drafts use bundled rules and actual template palette. Editing a visible bound string invalidates dependent draft design, not silent mismatch. Speaker notes remain an explicitly separate field. No user-facing JSON-only review.
 - [ ] **Step 5: Run UI/read-model regression tests and browser QA using synthetic app state; commit `feat: add independent multi-page review and revision workspace`.**
 

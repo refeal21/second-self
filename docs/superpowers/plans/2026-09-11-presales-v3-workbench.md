@@ -44,6 +44,7 @@ Paths prefixed `src-tauri/` above are under `apps/desktop/`. Keep responsibiliti
 - Create `apps/desktop/src-tauri/src/presales_queue/schema.rs`.
 - Create `apps/desktop/src-tauri/src/presales_v3/{mod,contracts,store,basis}.rs`.
 - Modify `apps/desktop/src-tauri/src/presales_queue/{mod,store}.rs`, `apps/desktop/src-tauri/src/presales/{mod,storage}.rs`, `apps/desktop/src-tauri/src/lib.rs` only for shared schema/basis seams and module registration.
+- Modify `apps/desktop/src-tauri/src/visual_style.rs` only to expose the existing `validate_profile` as crate-private for checked seed reuse; keep its behavior unchanged.
 - Test `apps/desktop/src-tauri/tests/presales_v3_store.rs` and existing queue/storage suites.
 
 **Interfaces:**
@@ -84,12 +85,15 @@ enum DatabaseProfile { QueueOnly, PresalesV3 }
 
 **Files:**
 - Create `apps/desktop/src-tauri/src/presales_v3/{events,publication,feedback}.rs`.
+- Create private v3 `prompt.rs` and a shared technical `apps/worker/src/presales/visual-prompt.contract.json`; extend the existing skill compiler to emit `skill.bundle.generated.json` for native consumption without modifying skill sources or their hash. Refactor only the presales branch of `apps/worker/src/visual-prompt.ts` to consume the same technical policy; keep legacy prompt behavior unchanged.
 - Modify v3 contracts/store plus crate-private transaction seams in `presales_queue/{store,lifecycle,result_staging}.rs`.
 - Test `apps/desktop/src-tauri/tests/presales_v3_events.rs`.
 
 **Interfaces:**
 - Consume Task 1 `V3Store`, validated saved per-page basis and existing `ResultVault`/`VerifiedPngResult`.
 - Produce store methods `enqueue_pages`, `commit_result`, `approve_version`, `save_feedback`, `adopt_version`, `restore_approval`, `create_delivery_snapshot` plus typed inputs/outputs in v3 contracts. `enqueue_pages` input includes project, batch/request/attempt IDs, page IDs, expected page revisions, optional parent version and feedback; derive the target/basis natively. `approve_version` includes exact version/image/basis, page revision and two true manual checks. No arbitrary pipeline replacement command.
+- Prompt admission uses one shared, explicitly versioned technical policy and the existing compiled visual skill. Native code derives visible content/design projections from the checked saved pair, excluding speaker notes and provenance-only text; the UI cannot supply an arbitrary prompt, claimed hashes or image paths. Parent/reference identities resolve from native immutable artifact evidence. Add a common synthetic golden input that independently checks Rust/TypeScript instruction sections and parsed payload parity. JSON object key ordering is not itself a semantic mismatch; the actual native final prompt is persisted verbatim in the queue target.
+- Add page-local revision/intent and complete history/draft projections as necessary within the undeployed v3 schema. A page draft CAS must not make an unrelated in-flight generation stale. Keep queue-only schema/behavior unchanged. Partial file-local helper subdivisions are allowed for admission, approval and delivery responsibilities; do not grow a single monolith.
 
 - [ ] **Step 1: Write red tests for three-page interleaved completion/approval, request replay, corrupt/missing vault file, same-page duplicate, changed basis, five revisions, draft keys, historical inspection versus adoption, cancellation/abandonment and delivery invalidation.**
 
@@ -126,7 +130,7 @@ enum DatabaseProfile { QueueOnly, PresalesV3 }
 **Interfaces:**
 - Consume Task 1 seed/catalog and Task 2 immutable version/event contracts.
 - Produce `prepare_legacy_copy`, `publish_legacy_copy`, `load_v3_project`, `list_project_catalog` through `V3WorkbenchService`; opaque prepared-copy ID binds source ID/revision/snapshot digest, mode and immutable copied artifact index. Modes are `format_copy` and `presales_content_revision`.
-- Worker `validateLegacyCopySnapshot(snapshot)` uses complete existing v1/v2 `validateNativePipeline`; returns a digest-bound result over exact supplied bytes, not a caller asserted validity flag.
+- Worker `validateLegacyCopySnapshot(snapshot)` uses complete existing v1/v2 `validateNativePipelineCheckpoint`; returns a digest-bound result over exact supplied bytes, not a caller asserted validity flag.
 
 - [ ] **Step 1: Red tests reject active/unknown source work, tampered source after prepare, malformed replay, missing active image, unsafe paths and half-failed copy publication; compare original DB/artifact bytes before and after.**
 

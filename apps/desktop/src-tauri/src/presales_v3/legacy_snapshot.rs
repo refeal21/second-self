@@ -1,7 +1,7 @@
-//! Source files are never opened by SQLite. Only an owned copy is recovered.
+//! SQLite sees only a read-only in-memory image derived from captured bytes.
 use crate::paths::{read_bounded_workspace_file, FileReadEvidence, VerifiedFileRead};
 use crate::presales::ProjectCheckpoint;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -53,7 +53,18 @@ impl CapturedLegacySnapshot {
         relative: &Path,
         project_id: &str,
         temporary_parent: &Path,
+        copied: impl FnMut(usize),
+    ) -> Result<Self, String> {
+        Self::capture_with_observers(root, relative, project_id, temporary_parent, copied, || {})
+    }
+
+    fn capture_with_observers(
+        root: &Path,
+        relative: &Path,
+        project_id: &str,
+        temporary_parent: &Path,
         mut copied: impl FnMut(usize),
+        mut verified: impl FnMut(),
     ) -> Result<Self, String> {
         if project_id.is_empty() || project_id.len() > 160 {
             return Err("invalid source project id".into());
@@ -69,10 +80,15 @@ impl CapturedLegacySnapshot {
                 }
                 copied(attempt);
                 directory.verify_copied_files(&files)?;
+                verified();
                 let evidence = evidence(&files);
                 check_source(&root, relative, &evidence)?;
-                let (pipeline_json, checkpoint) =
-                    read_private_checkpoint(&directory.0.join("snapshot.sqlite3"), project_id)?;
+                let image = super::wal_snapshot::materialize(
+                    &files.0.bytes,
+                    files.1.as_ref().map(|w| w.bytes.as_slice()),
+                    DATABASE_FILE_LIMIT,
+                )?;
+                let (pipeline_json, checkpoint) = read_memory_checkpoint(&image, project_id)?;
                 check_source(&root, relative, &evidence)?;
                 let revision = checkpoint.pipeline["revision"]
                     .as_i64()
@@ -181,20 +197,16 @@ fn check_source(
     Ok(())
 }
 
-fn read_private_checkpoint(
-    path: &Path,
+fn read_memory_checkpoint(
+    image: &[u8],
     project_id: &str,
 ) -> Result<(String, ProjectCheckpoint), String> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(message)?;
+    let connection = open_read_image(image)?;
     connection
         .busy_timeout(std::time::Duration::from_millis(50))
         .map_err(message)?;
     connection
-        .execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;")
+        .execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA temp_store=MEMORY;")
         .map_err(message)?;
     let check: String = connection
         .query_row("PRAGMA quick_check", [], |r| r.get(0))
@@ -254,6 +266,20 @@ fn read_private_checkpoint(
     };
     transaction.commit().map_err(message)?;
     Ok((raw, checkpoint))
+}
+
+fn open_read_image(image: &[u8]) -> Result<Connection, String> {
+    if image.is_empty() || image.len() > DATABASE_FILE_LIMIT {
+        return Err("snapshot_image_limit: invalid deserialize allocation length".into());
+    }
+    let mut connection = Connection::open_in_memory().map_err(message)?;
+    // The slice length equals the requested exact read, so rusqlite's allocated
+    // buffer cannot encounter a short read. SQLite owns/frees it on close or
+    // deserialize failure (FREEONCLOSE); READONLY prevents mutation/growth.
+    connection
+        .deserialize_read_exact("main", image, image.len(), true)
+        .map_err(message)?;
+    Ok(connection)
 }
 fn table_exists(connection: &Connection, name: &str) -> Result<bool, String> {
     let kind: Option<String> = connection
@@ -415,3 +441,7 @@ impl Drop for PrivateSnapshotDirectory {
 #[cfg(test)]
 #[path = "legacy_snapshot_tests.rs"]
 mod legacy_snapshot_tests;
+
+#[cfg(test)]
+#[path = "legacy_wal_tests.rs"]
+mod legacy_wal_tests;

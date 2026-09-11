@@ -4,9 +4,9 @@ use serde_json::json;
 use std::{fs, path::Path};
 
 #[path = "../../tests/support/v3_temp.rs"]
-mod temp;
+pub(super) mod temp;
 
-fn fixture(root: &Path, wal: bool) -> Connection {
+pub(super) fn fixture(root: &Path, wal: bool) -> Connection {
     let db = Connection::open(root.join("legacy.sqlite3")).unwrap();
     db.execute_batch("CREATE TABLE projects (id TEXT PRIMARY KEY, pipeline_json TEXT NOT NULL)")
         .unwrap();

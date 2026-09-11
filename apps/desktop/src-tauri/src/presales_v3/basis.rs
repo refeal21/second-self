@@ -177,6 +177,10 @@ fn message(error: impl std::fmt::Display) -> String {
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/v3_temp.rs"]
+mod test_tempdir;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::database::{Database, NewProject};
@@ -443,11 +447,8 @@ mod tests {
     #[test]
     fn populated_catalog_reopens_and_rejects_tampered_frozen_evidence() {
         let (checkpoint, palette) = frozen_fixture();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("v3-frozen-{nonce}.sqlite3"));
+        let directory = test_tempdir::tempdir().unwrap();
+        let path = directory.path().join("v3-frozen.sqlite3");
         let mut store = V3Store::open(&path).unwrap();
         store
             .insert_project(ValidatedV3ProjectSeed::from_checkpoint(checkpoint, palette).unwrap())
@@ -472,7 +473,6 @@ mod tests {
             .unwrap();
         assert!(reopened.load_project("frozen-project").is_err());
         drop(reopened);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

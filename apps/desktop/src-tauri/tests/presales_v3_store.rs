@@ -1,28 +1,43 @@
 use digital_twin_desktop_lib::{presales_queue::QueueStore, presales_v3::V3Store};
 use rusqlite::Connection;
 
-// Test-owned temporary directories; no new runtime dependency is needed.
-mod tempfile {
-    pub struct TempDir(std::path::PathBuf);
-    pub fn tempdir() -> std::io::Result<TempDir> {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("v3-store-{}-{nonce}", std::process::id()));
-        std::fs::create_dir(&path)?;
-        Ok(TempDir(path))
-    }
-    impl TempDir {
-        pub fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+#[path = "support/v3_temp.rs"]
+mod tempfile;
+
+#[test]
+fn temporary_directories_retry_existing_names_without_reusing_them() {
+    let parent = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir_at(parent.path(), 42).unwrap();
+    let second = tempfile::tempdir_at(parent.path(), 42).unwrap();
+    assert_ne!(first.path(), second.path());
+    drop(second);
+    assert!(
+        first.path().is_dir(),
+        "another fixture cleanup must not delete the first directory"
+    );
+}
+
+#[test]
+fn temporary_directories_are_exclusive_with_identical_concurrent_timestamps() {
+    let parent = tempfile::tempdir().unwrap();
+    let barrier = std::sync::Barrier::new(16);
+    let directories = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    tempfile::tempdir_at(parent.path(), 42).unwrap()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let paths: std::collections::HashSet<_> = directories.iter().map(|dir| dir.path()).collect();
+    assert_eq!(paths.len(), 16);
+    assert!(paths.iter().all(|path| path.is_dir()));
 }
 
 #[test]

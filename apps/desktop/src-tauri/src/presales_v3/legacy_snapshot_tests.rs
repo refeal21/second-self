@@ -28,6 +28,114 @@ pub(super) fn fixture(root: &Path, wal: bool) -> Connection {
 }
 
 #[test]
+fn selected_owner_identity_does_not_inherit_source_nocase_collation() {
+    let root = temp::tempdir().unwrap();
+    let staging = temp::tempdir().unwrap();
+    let db = fixture(root.path(), true);
+    db.execute(
+        "INSERT INTO projects VALUES ('SOURCE',?1)",
+        [
+            json!({"schemaVersion":1,"revision":1,"project":{"id":"SOURCE","name":"Other"}})
+                .to_string(),
+        ],
+    )
+    .unwrap();
+    db.execute_batch("CREATE TABLE visual_generation_records(id TEXT, project_id TEXT NOT NULL COLLATE NOCASE REFERENCES projects(id), record_json TEXT);
+        INSERT INTO visual_generation_records VALUES ('ours','source',' { \"raw\" : true } ');
+        INSERT INTO visual_generation_records VALUES ('theirs','SOURCE','UNRELATED_PRIVATE_SENTINEL');").unwrap();
+    let before = ["legacy.sqlite3", "legacy.sqlite3-wal", "legacy.sqlite3-shm"]
+        .map(|name| fs::read(root.path().join(name)).unwrap());
+    let captured = CapturedLegacySnapshot::capture(
+        root.path(),
+        Path::new("legacy.sqlite3"),
+        "source",
+        staging.path(),
+    )
+    .unwrap();
+    for (name, bytes) in ["legacy.sqlite3", "legacy.sqlite3-wal", "legacy.sqlite3-shm"]
+        .into_iter()
+        .zip(before)
+    {
+        assert_eq!(fs::read(root.path().join(name)).unwrap(), bytes);
+    }
+    assert_eq!(
+        captured.selected_rows()["visual_generation_records"].rows,
+        vec![vec![
+            json!("ours"),
+            json!("source"),
+            json!(" { \"raw\" : true } ")
+        ]]
+    );
+    assert_eq!(captured.selected_rows()["projects"].rows.len(), 1);
+    assert!(!serde_json::to_string(captured.selected_envelope())
+        .unwrap()
+        .contains("UNRELATED_PRIVATE_SENTINEL"));
+    captured.recheck().unwrap();
+}
+
+#[test]
+fn selected_owner_identity_excludes_numeric_and_blob_owners_without_coercion() {
+    for project_id in ["01", "1"] {
+        let root = temp::tempdir().unwrap();
+        let staging = temp::tempdir().unwrap();
+        let db = fixture(root.path(), true);
+        db.execute("INSERT INTO projects VALUES (?1,?2)", params![project_id,
+            json!({"schemaVersion":1,"revision":1,"project":{"id":project_id,"name":"Numeric-looking text ID"}}).to_string()]).unwrap();
+        db.execute_batch(
+            "CREATE TABLE visual_generation_records(id TEXT, project_id INTEGER, record_json TEXT);
+            INSERT INTO visual_generation_records VALUES ('numeric',1,'UNRELATED_INTEGER_SENTINEL');
+            CREATE TABLE approvals(id TEXT, project_id, proof_json TEXT);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO approvals VALUES ('ours',?1,' { \"raw\" : true } ')",
+            [project_id],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO approvals VALUES ('blob',?1,'UNRELATED_BLOB_SENTINEL')",
+            [project_id.as_bytes()],
+        )
+        .unwrap();
+        let before = ["legacy.sqlite3", "legacy.sqlite3-wal", "legacy.sqlite3-shm"]
+            .map(|name| fs::read(root.path().join(name)).unwrap());
+        let captured = CapturedLegacySnapshot::capture(
+            root.path(),
+            Path::new("legacy.sqlite3"),
+            project_id,
+            staging.path(),
+        )
+        .unwrap();
+        for (name, bytes) in ["legacy.sqlite3", "legacy.sqlite3-wal", "legacy.sqlite3-shm"]
+            .into_iter()
+            .zip(before)
+        {
+            assert_eq!(fs::read(root.path().join(name)).unwrap(), bytes);
+        }
+        assert!(
+            captured.selected_rows()["visual_generation_records"]
+                .rows
+                .is_empty(),
+            "{project_id}"
+        );
+        assert_eq!(
+            captured.selected_rows()["approvals"].rows,
+            vec![vec![
+                json!("ours"),
+                json!(project_id),
+                json!(" { \"raw\" : true } ")
+            ]]
+        );
+        assert_eq!(captured.selected_rows()["projects"].rows.len(), 1);
+        assert_eq!(captured.selected_rows()["projects"].rows[0][0], project_id);
+        assert!(!serde_json::to_string(captured.selected_envelope())
+            .unwrap()
+            .contains("UNRELATED_"));
+        captured.recheck().unwrap();
+    }
+}
+
+#[test]
 fn captured_selected_rows_preserve_raw_json_and_exclude_other_project_bytes() {
     let root = temp::tempdir().unwrap();
     let staging = temp::tempdir().unwrap();

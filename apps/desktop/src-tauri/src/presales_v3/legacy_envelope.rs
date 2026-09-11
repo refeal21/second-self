@@ -116,9 +116,11 @@ pub(super) fn extract(connection: &Connection, project_id: &str) -> Result<Selec
         } else {
             "project_id"
         };
+        // Source columns may have non-binary collation or numeric affinity.
+        // Admit only exact TEXT owner bytes, without coercing the original cell.
         let mut statement = connection
             .prepare(&format!(
-                "SELECT * FROM {name} WHERE {key}=?1 ORDER BY rowid"
+                "SELECT * FROM {name} WHERE typeof({key})='text' AND CAST({key} AS BLOB)=CAST(?1 AS BLOB) ORDER BY rowid"
             ))
             .map_err(message)?;
         let columns = statement

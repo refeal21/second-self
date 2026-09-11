@@ -4,6 +4,7 @@ mod result_files;
 mod result_staging;
 mod result_vault;
 mod rpc;
+pub(crate) mod schema;
 mod store;
 
 pub use contracts::*;

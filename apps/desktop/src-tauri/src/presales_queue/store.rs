@@ -1,11 +1,10 @@
+use super::schema::{initialize, DatabaseProfile};
 use super::{EnqueueBatch, EnqueueOutcome, JobStatus, QueueJob, QueueSettings, QueueTarget};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const APPLICATION_ID: i64 = 0x44545133;
-const USER_VERSION: i64 = 2;
 const MAX_CONCURRENCY: u8 = 4;
 const MAX_BATCH_SIZE: usize = 100;
 const MAX_REFERENCES: usize = 32;
@@ -13,114 +12,6 @@ const MAX_TARGET_BYTES: usize = 128 * 1024;
 const MAX_VERSION_BYTES: usize = 128;
 const MAX_PROMPT_BYTES: usize = 65_536;
 const MAX_FEEDBACK_BYTES: usize = 16_384;
-
-#[derive(Clone, Copy)]
-struct SchemaObject {
-    kind: &'static str,
-    name: &'static str,
-    sql: &'static str,
-}
-
-const SCHEMA_OBJECTS: [SchemaObject; 8] = [
-    SchemaObject {
-        kind: "table",
-        name: "queue_settings",
-        sql: r#"CREATE TABLE queue_settings (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    concurrency INTEGER NOT NULL CHECK (concurrency BETWEEN 1 AND 4),
-    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
-    epoch INTEGER NOT NULL
-)"#,
-    },
-    SchemaObject {
-        kind: "table",
-        name: "queue_batches",
-        sql: r#"CREATE TABLE queue_batches (
-    batch_id TEXT PRIMARY KEY,
-    input_json TEXT NOT NULL,
-    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
-    created_at_ms INTEGER NOT NULL
-)"#,
-    },
-    SchemaObject {
-        kind: "table",
-        name: "queue_jobs",
-        sql: r#"CREATE TABLE queue_jobs (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    batch_id TEXT NOT NULL REFERENCES queue_batches(batch_id),
-    request_id TEXT NOT NULL UNIQUE,
-    attempt_id TEXT NOT NULL UNIQUE,
-    project_id TEXT NOT NULL,
-    slide_id TEXT NOT NULL,
-    target_json TEXT NOT NULL,
-    status TEXT NOT NULL,
-    epoch INTEGER,
-    provider_json TEXT,
-    result_json TEXT,
-    error TEXT,
-    created_at_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER NOT NULL,
-    dispatched_at_ms INTEGER
-)"#,
-    },
-    SchemaObject {
-        kind: "index",
-        name: "queue_jobs_active_page",
-        sql: r#"CREATE UNIQUE INDEX queue_jobs_active_page
-ON queue_jobs(project_id, slide_id)
-WHERE status IN (
-    'queued', 'dispatching', 'running', 'result_ready', 'committing',
-    'cancel_requested', 'outcome_unknown'
-)"#,
-    },
-    SchemaObject {
-        kind: "table",
-        name: "queue_attempts",
-        sql: r#"CREATE TABLE queue_attempts (
-    attempt_id TEXT PRIMARY KEY,
-    request_id TEXT NOT NULL UNIQUE REFERENCES queue_jobs(request_id),
-    target_json TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL
-)"#,
-    },
-    SchemaObject {
-        kind: "table",
-        name: "queue_batch_entries",
-        sql: r#"CREATE TABLE queue_batch_entries (
-    batch_id TEXT NOT NULL REFERENCES queue_batches(batch_id),
-    ordinal INTEGER NOT NULL,
-    submitted_request_id TEXT NOT NULL UNIQUE,
-    submitted_attempt_id TEXT NOT NULL UNIQUE,
-    resolved_request_id TEXT NOT NULL REFERENCES queue_jobs(request_id),
-    reused INTEGER NOT NULL CHECK (reused IN (0, 1)),
-    PRIMARY KEY (batch_id, ordinal)
-)"#,
-    },
-    SchemaObject {
-        kind: "table",
-        name: "queue_transition_events",
-        sql: r#"CREATE TABLE queue_transition_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    request_id TEXT NOT NULL REFERENCES queue_jobs(request_id),
-    from_status TEXT,
-    to_status TEXT NOT NULL,
-    epoch INTEGER,
-    created_at_ms INTEGER NOT NULL
-)"#,
-    },
-    SchemaObject {
-        kind: "table",
-        name: "queue_lifecycle_events",
-        sql: r#"CREATE TABLE queue_lifecycle_events (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    request_id TEXT NOT NULL REFERENCES queue_jobs(request_id),
-    attempt_id TEXT NOT NULL REFERENCES queue_attempts(attempt_id),
-    kind TEXT NOT NULL,
-    detail_json TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL
-)"#,
-    },
-];
 
 pub struct QueueStore {
     pub(super) connection: Connection,
@@ -135,61 +26,10 @@ impl QueueStore {
         Self::initialize(Connection::open_in_memory().map_err(message)?, false)
     }
 
-    fn initialize(mut connection: Connection, file_backed: bool) -> Result<Self, String> {
-        let application_id = pragma_i64(&connection, "application_id")?;
-        let user_version = pragma_i64(&connection, "user_version")?;
-        let objects = user_schema_objects(&connection)?;
-        let unowned_empty = application_id == 0 && user_version == 0 && objects.is_empty();
-        if !unowned_empty && (application_id != APPLICATION_ID || user_version != USER_VERSION) {
-            return Err("database is not a compatible durable queue".into());
-        }
-        if !unowned_empty {
-            verify_schema(&objects)?;
-        }
-
-        connection
-            .busy_timeout(Duration::from_millis(5_000))
-            .map_err(message)?;
-        connection
-            .pragma_update(None, "foreign_keys", "ON")
-            .map_err(message)?;
-        if file_backed {
-            let journal_mode: String = connection
-                .pragma_query_value(None, "journal_mode", |row| row.get(0))
-                .map_err(message)?;
-            if !journal_mode.eq_ignore_ascii_case("wal") {
-                connection
-                    .pragma_update(None, "journal_mode", "WAL")
-                    .map_err(message)?;
-            }
-        }
-        connection
-            .pragma_update(None, "synchronous", "FULL")
-            .map_err(message)?;
-
-        if unowned_empty {
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(message)?;
-            for object in SCHEMA_OBJECTS {
-                transaction.execute(object.sql, []).map_err(message)?;
-            }
-            transaction
-                .execute(
-                    "INSERT INTO queue_settings (singleton, concurrency, paused, epoch)
-                     VALUES (1, 4, 0, 0)",
-                    [],
-                )
-                .map_err(message)?;
-            transaction
-                .pragma_update(None, "application_id", APPLICATION_ID)
-                .map_err(message)?;
-            transaction
-                .pragma_update(None, "user_version", USER_VERSION)
-                .map_err(message)?;
-            transaction.commit().map_err(message)?;
-        }
-        Ok(Self { connection })
+    fn initialize(connection: Connection, file_backed: bool) -> Result<Self, String> {
+        Ok(Self {
+            connection: initialize(connection, file_backed, DatabaseProfile::QueueOnly)?,
+        })
     }
 
     pub fn settings(&self) -> Result<QueueSettings, String> {
@@ -443,101 +283,6 @@ impl QueueStore {
 
 pub(super) fn message(error: impl std::fmt::Display) -> String {
     error.to_string()
-}
-
-fn pragma_i64(connection: &Connection, name: &str) -> Result<i64, String> {
-    connection
-        .pragma_query_value(None, name, |row| row.get(0))
-        .map_err(message)
-}
-
-fn user_schema_objects(
-    connection: &Connection,
-) -> Result<Vec<(String, String, Option<String>)>, String> {
-    let mut statement = connection
-        .prepare(
-            "SELECT type, name, sql FROM sqlite_schema
-             WHERE lower(substr(name, 1, 7)) <> 'sqlite_' ORDER BY type, name",
-        )
-        .map_err(message)?;
-    let objects = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-        .map_err(message)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(message)?;
-    Ok(objects)
-}
-
-fn verify_schema(objects: &[(String, String, Option<String>)]) -> Result<(), String> {
-    if objects.len() != SCHEMA_OBJECTS.len() {
-        return Err(format!(
-            "durable queue schema does not match user_version {USER_VERSION}"
-        ));
-    }
-    for object in SCHEMA_OBJECTS {
-        let actual = objects
-            .iter()
-            .find(|(kind, name, _)| kind == object.kind && name == object.name)
-            .and_then(|(_, _, sql)| sql.as_deref());
-        if actual.map(normalized_schema_sql).as_deref() != Some(&normalized_schema_sql(object.sql))
-        {
-            return Err(format!(
-                "durable queue {} {} does not match user_version {USER_VERSION}",
-                object.kind, object.name
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn normalized_schema_sql(value: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut characters = value.chars().peekable();
-    while let Some(character) = characters.next() {
-        if is_sqlite_sql_whitespace(character) {
-            continue;
-        }
-        if character.is_ascii_alphanumeric() || character == '_' {
-            let mut word = String::from(character.to_ascii_lowercase());
-            while characters
-                .peek()
-                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_')
-            {
-                word.push(
-                    characters
-                        .next()
-                        .expect("peeked schema character exists")
-                        .to_ascii_lowercase(),
-                );
-            }
-            tokens.push(word);
-            continue;
-        }
-        if character == '\'' {
-            let mut literal = String::from(character);
-            while let Some(next) = characters.next() {
-                literal.push(next);
-                if next == '\'' {
-                    if characters.peek() == Some(&'\'') {
-                        literal.push(characters.next().expect("peeked quote exists"));
-                    } else {
-                        break;
-                    }
-                }
-            }
-            tokens.push(literal);
-            continue;
-        }
-        tokens.push(character.to_string());
-    }
-    tokens
-}
-
-fn is_sqlite_sql_whitespace(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' | '\u{0020}'
-    )
 }
 
 pub(super) fn read_settings(connection: &Connection) -> Result<QueueSettings, String> {

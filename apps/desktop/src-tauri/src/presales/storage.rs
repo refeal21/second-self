@@ -636,7 +636,7 @@ fn approval_rows(
     rows
 }
 
-fn validate_loaded(pipeline: &Value, checkpoint: &PresalesCheckpoint) -> Result<()> {
+pub(crate) fn validate_loaded(pipeline: &Value, checkpoint: &PresalesCheckpoint) -> Result<()> {
     let valid_skill = !checkpoint.skill.id.trim().is_empty()
         && !checkpoint.skill.version.trim().is_empty()
         && checkpoint.skill.sha256.len() == 64

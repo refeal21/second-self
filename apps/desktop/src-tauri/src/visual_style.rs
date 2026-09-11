@@ -106,7 +106,7 @@ fn identifier(id: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn validate_profile(profile: &VisualStyleProfile) -> Result<(), String> {
+pub(crate) fn validate_profile(profile: &VisualStyleProfile) -> Result<(), String> {
     for color in [
         &profile.primary_color,
         &profile.background_color,

@@ -17,27 +17,38 @@ impl V3Store {
         if input.pages.is_empty() || input.pages.len() > 100 || encoded.len() > 2 * 1024 * 1024 {
             return Err("admission requires 1..=100 pages within 2 MiB".into());
         }
-        {
+        let (snapshot, active_pages) = {
             let tx = self.connection.unchecked_transaction().map_err(message)?;
             if let Some(outcome) = replay_on(&tx, &input)? {
                 tx.commit().map_err(message)?;
                 return Ok(outcome);
             }
+            let snapshot = load_on(&tx, &input.project_id)?;
+            let mut active_pages = std::collections::HashSet::new();
+            for request in &input.pages {
+                if active_job(&tx, &input.project_id, &request.slide_id)?.is_some() {
+                    active_pages.insert(request.slide_id.clone());
+                }
+            }
             tx.commit().map_err(message)?;
-        }
+            (snapshot, active_pages)
+        };
         // Resolve byte evidence outside the short write transaction. Every identity
         // is checked again against the transaction's immutable saved versions.
-        let snapshot = self.load_project(&input.project_id)?;
         let mut parents = std::collections::HashMap::new();
         for request in &input.pages {
+            if active_pages.contains(&request.slide_id) {
+                continue;
+            }
             if let Some(id) = &request.parent_version_id {
                 let page = page_on(&snapshot, &request.slide_id)?;
-                let image = super::publication::verify_version(
-                    &self.connection,
-                    page,
-                    id,
-                    vault.ok_or("parent visual requires native result vault")?,
-                )?;
+                // A concurrent admission may win during verification. Defer any
+                // parent error until the write snapshot confirms this is still new.
+                let image = vault
+                    .ok_or_else(|| "parent visual requires native result vault".to_string())
+                    .and_then(|vault| {
+                        super::publication::verify_version(&self.connection, page, id, vault)
+                    });
                 parents.insert((request.slide_id.clone(), id.clone()), image);
             }
         }
@@ -66,7 +77,9 @@ impl V3Store {
                                 let version = super::publication::version_on(page, id)?;
                                 let image = parents
                                     .get(&(page.slide_id.clone(), id.clone()))
-                                    .ok_or("missing verified parent")?;
+                                    .ok_or("missing verified parent")?
+                                    .as_ref()
+                                    .map_err(Clone::clone)?;
                                 if version.image.as_ref() != Some(image) {
                                     return Err("parent evidence changed".into());
                                 }

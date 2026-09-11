@@ -153,6 +153,60 @@ fn exact_admission_replay_does_not_reverify_historical_parent_bytes() {
 }
 
 #[test]
+fn competing_parent_intent_is_ignored_without_vault_or_parent_bytes_including_mixed_batch() {
+    for missing_parent_bytes in [false, true] {
+        let (mut store, dir, vault) = fixture();
+        let initial = input(&store, 1, "initial");
+        store.enqueue_pages(initial, None).unwrap();
+        let completion = ready(&mut store, &vault, "initial");
+        store.commit_result(completion, &vault).unwrap();
+        let parent = page(&store, 1).current_version_id;
+        let revision = input(&store, 1, "revision");
+        let admitted = store.enqueue_pages(revision, None).unwrap();
+        let original_page = page(&store, 1);
+        if missing_parent_bytes {
+            std::fs::remove_file(dir.path().join("queue-results/initial/attempt-initial.png"))
+                .unwrap();
+        }
+        let optional_vault = missing_parent_bytes.then_some(&vault);
+        let mut competing = input(&store, 1, "competing");
+        competing.pages[0].parent_version_id = parent.clone();
+        competing.pages[0].feedback = "unused replacement feedback".into();
+        let reused = store.enqueue_pages(competing, optional_vault).unwrap();
+        assert_eq!(reused.jobs, admitted.jobs);
+        assert_eq!(reused.reused_request_ids, vec!["revision"]);
+        assert_eq!(page(&store, 1), original_page);
+
+        let mut mixed = input(&store, 1, "competing-mixed");
+        mixed.pages[0].parent_version_id = parent;
+        mixed.pages[0].feedback = "also unused replacement feedback".into();
+        mixed
+            .pages
+            .push(input(&store, 2, "new-page").pages.remove(0));
+        let mixed_outcome = store.enqueue_pages(mixed, optional_vault).unwrap();
+        assert_eq!(mixed_outcome.jobs[0], admitted.jobs[0]);
+        assert_eq!(mixed_outcome.jobs[1].request_id, "new-page");
+        assert_eq!(mixed_outcome.reused_request_ids, vec!["revision"]);
+        assert_eq!(page(&store, 1), original_page);
+        assert_eq!(page(&store, 2).revision, 2);
+        assert_eq!(
+            page(&store, 2).intent_request_id.as_deref(),
+            Some("new-page")
+        );
+        assert!(
+            crate::presales_queue::store::read_job(&store.connection, "competing")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::presales_queue::store::read_job(&store.connection, "competing-mixed")
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn saturated_project_revision_rolls_back_admission_atomically() {
     let (mut store, _dir, _vault) = fixture();
     store

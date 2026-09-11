@@ -187,4 +187,3 @@ CREATE TABLE v3_artifacts (
 INSERT INTO queue_settings VALUES (1,4,0,0);
 PRAGMA application_id=1146377779;
 PRAGMA user_version=1;
-

@@ -1,0 +1,24 @@
+{
+  "spec": {
+    "id": "golden-page", "title": "Exact 001", "body": ["https://example.invalid/a  b"],
+    "tables": [{"id":"internal-table","headers":["Count"],"rows":[["007"]]}],
+    "charts": [{"id":"internal-chart","type":"bar","categories":["A"],"series":[{"name":"Total","values":[7]}]}],
+    "shapes": [{"id":"internal-shape","type":"rect","x":1,"y":2,"w":3,"h":4,"fill":"#ff0000","text":"Label"}],
+    "findingIds": [], "dataPointIds": [], "sourceMap": [], "imageGenerationBrief": "SECRET PROVENANCE"
+  },
+  "design": {
+    "slideId":"golden-page","layout":"Two columns","visualFocus":"Count",
+    "speakerNotes":"SECRET SPEAKER NOTES",
+    "textBindings":[{"id":"title","path":"/title"},{"id":"body","path":"/body/0"},{"id":"header","path":"/tables/0/headers/0"},{"id":"cell","path":"/tables/0/rows/0/0"},{"id":"category","path":"/charts/0/categories/0"},{"id":"series","path":"/charts/0/series/0/name"},{"id":"value","path":"/charts/0/series/0/values/0"},{"id":"shape","path":"/shapes/0/text"}],
+    "scene": null
+  },
+  "style":{"revision":2,"locked":false,"profile":{"primaryColor":"#112233","backgroundColor":"#ffffff","textColor":"#000000","accentColors":["#445566"],"instructions":"Synthetic style","template":null}},
+  "feedback":"\uFEFF  More space  \uFEFF",
+  "expectedPayload": {
+    "approvedSlideSpec":{"title":"Exact 001","body":["https://example.invalid/a  b"],"tables":[{"headers":["Count"],"rows":[["007"]]}],"charts":[{"type":"bar","categories":["A"],"series":[{"name":"Total","values":[7]}]}],"shapes":[{"type":"rect","x":1,"y":2,"w":3,"h":4,"text":"Label"}]},
+    "approvedDesign":{"slideId":"golden-page","layout":"Two columns","visualFocus":"Count","textBindings":[{"id":"title","path":"/title"},{"id":"body","path":"/body/0"},{"id":"header","path":"/tables/0/headers/0"},{"id":"cell","path":"/tables/0/rows/0/0"},{"id":"category","path":"/charts/0/categories/0"},{"id":"series","path":"/charts/0/series/0/name"},{"id":"value","path":"/charts/0/series/0/values/0"},{"id":"shape","path":"/shapes/0/text"}],"scene":null},
+    "projectStyle":{"primaryColor":"#112233","backgroundColor":"#ffffff","textColor":"#000000","accentColors":["#445566"],"instructions":"Synthetic style"},
+    "userFeedback":"More space"
+  },
+  "instructionFragments":["16:9 PNG at 1920×1080", "sole authority for visible text and data", "Never render internal IDs", "User feedback may change layout and styling only", "confirmed project palette", "do not auto-approve it"]
+}

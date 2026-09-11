@@ -139,6 +139,10 @@ pub(super) fn frozen_snapshot(
                 versions: vec![],
                 approval: None,
                 feedback: None,
+                revision: 1,
+                intent_request_id: None,
+                approvals: vec![],
+                feedback_drafts: vec![],
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -160,6 +164,7 @@ pub(super) fn frozen_snapshot(
         frozen_checkpoint: frozen,
         palette,
         pages,
+        delivery_snapshot: None,
     })
 }
 
@@ -181,7 +186,7 @@ fn message(error: impl std::fmt::Display) -> String {
 mod test_tempdir;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::database::{Database, NewProject};
     use crate::presales::{PresalesDraftPair, ProjectCheckpoint};
@@ -192,6 +197,10 @@ mod tests {
     // Exercise the actual native paired saves and freeze transitions. A status
     // string alone never stands in for native approval evidence.
     fn frozen_fixture() -> (ProjectCheckpoint, VisualStyleState) {
+        frozen_fixture_pages(1)
+    }
+
+    pub(crate) fn frozen_fixture_pages(count: usize) -> (ProjectCheckpoint, VisualStyleState) {
         let db = Database::open_in_memory().unwrap();
         let id = "frozen-project";
         let at = "2026-09-10T00:00:00Z";
@@ -206,7 +215,29 @@ mod tests {
             "../../../../../fixtures/presales/native-contract.json"
         ))
         .unwrap();
-        let full: PresalesDraftPair = serde_json::from_value(fixture["pair"].clone()).unwrap();
+        let mut full: PresalesDraftPair = serde_json::from_value(fixture["pair"].clone()).unwrap();
+        for index in 1..count {
+            let id = format!("scenario-{}", index + 1);
+            let mut outline = full.outline["outline"]["slides"][0].clone();
+            outline["id"] = json!(id);
+            full.outline["outline"]["slides"]
+                .as_array_mut()
+                .unwrap()
+                .push(outline);
+            let mut page = full.outline["plan"]["pages"][0].clone();
+            page["slideId"] = json!(id);
+            full.outline["plan"]["pages"]
+                .as_array_mut()
+                .unwrap()
+                .push(page);
+            let details = full.details.as_mut().unwrap();
+            let mut spec = details["specs"][0].clone();
+            spec["id"] = json!(id);
+            details["specs"].as_array_mut().unwrap().push(spec);
+            let mut design = details["designs"][0].clone();
+            design["slideId"] = json!(id);
+            details["designs"].as_array_mut().unwrap().push(design);
+        }
         let mut pair = full.clone();
         pair.details = None;
         let mut p = db.get_project(id).unwrap().unwrap().pipeline;

@@ -11,6 +11,24 @@ const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const QUEUE_APPLICATION_ID: i64 = 0x44545133;
 
+#[path = "support/v3_temp.rs"]
+mod tempfile;
+
+#[test]
+fn invalid_queue_only_batch_keeps_validation_precedence_under_writer_contention() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite3");
+    let mut store = QueueStore::open(&path).unwrap();
+    let other = Connection::open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let error = store.enqueue(batch("invalid", vec![])).unwrap_err();
+    assert!(
+        error.contains("jobs"),
+        "original validation must run before acquiring writer lock: {error}"
+    );
+    other.execute_batch("ROLLBACK").unwrap();
+}
+
 fn temporary_database(name: &str) -> std::path::PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

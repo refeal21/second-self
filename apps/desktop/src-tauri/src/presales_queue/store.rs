@@ -78,128 +78,11 @@ impl QueueStore {
 
     pub fn enqueue(&mut self, input: EnqueueBatch) -> Result<EnqueueOutcome, String> {
         validate_batch(&input)?;
-        let input_json = serde_json::to_string(&input).map_err(message)?;
-        let now = epoch_milliseconds()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(message)?;
-
-        if let Some(original_json) = transaction
-            .query_row(
-                "SELECT input_json FROM queue_batches WHERE batch_id = ?1",
-                [&input.batch_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(message)?
-        {
-            let original: EnqueueBatch = serde_json::from_str(&original_json).map_err(message)?;
-            if original != input {
-                return Err(format!(
-                    "batch_id {} was already used with different input",
-                    input.batch_id
-                ));
-            }
-            let outcome = read_batch_outcome(&transaction, &input.batch_id)?;
-            transaction.commit().map_err(message)?;
-            return Ok(outcome);
-        }
-
-        for job in &input.jobs {
-            let collision = transaction
-                .query_row(
-                    "SELECT 1 FROM queue_batch_entries
-                     WHERE submitted_request_id = ?1 OR submitted_attempt_id = ?2 LIMIT 1",
-                    params![job.request_id, job.attempt_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(message)?;
-            if collision.is_some() {
-                return Err("request_id and attempt_id must be globally unique".into());
-            }
-        }
-
-        transaction
-            .execute(
-                "INSERT INTO queue_batches (batch_id, input_json, paused, created_at_ms)
-                 VALUES (?1, ?2, 0, ?3)",
-                params![input.batch_id, input_json, now],
-            )
-            .map_err(message)?;
-
-        for (ordinal, input_job) in input.jobs.iter().enumerate() {
-            let existing_request_id = transaction
-                .query_row(
-                    "SELECT request_id FROM queue_jobs
-                     WHERE project_id = ?1 AND slide_id = ?2
-                       AND status IN ('queued', 'dispatching', 'running', 'result_ready',
-                                      'committing', 'cancel_requested', 'outcome_unknown')",
-                    params![input_job.target.project_id, input_job.target.slide_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(message)?;
-
-            let (resolved_request_id, reused) = if let Some(request_id) = existing_request_id {
-                (request_id, true)
-            } else {
-                let target_json = serde_json::to_string(&input_job.target).map_err(message)?;
-                transaction
-                    .execute(
-                        "INSERT INTO queue_jobs (
-                           batch_id, request_id, attempt_id, project_id, slide_id, target_json,
-                           status, created_at_ms, updated_at_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?7)",
-                        params![
-                            input.batch_id,
-                            input_job.request_id,
-                            input_job.attempt_id,
-                            input_job.target.project_id,
-                            input_job.target.slide_id,
-                            target_json,
-                            now,
-                        ],
-                    )
-                    .map_err(message)?;
-                transaction
-                    .execute(
-                        "INSERT INTO queue_attempts (attempt_id, request_id, target_json, created_at_ms)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![input_job.attempt_id, input_job.request_id, target_json, now],
-                    )
-                    .map_err(message)?;
-                transaction
-                    .execute(
-                        "INSERT INTO queue_transition_events (
-                           request_id, from_status, to_status, epoch, created_at_ms
-                         ) VALUES (?1, NULL, 'queued', NULL, ?2)",
-                        params![input_job.request_id, now],
-                    )
-                    .map_err(message)?;
-                (input_job.request_id.clone(), false)
-            };
-
-            transaction
-                .execute(
-                    "INSERT INTO queue_batch_entries (
-                       batch_id, ordinal, submitted_request_id, submitted_attempt_id,
-                       resolved_request_id, reused
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        input.batch_id,
-                        i64::try_from(ordinal).map_err(message)?,
-                        input_job.request_id,
-                        input_job.attempt_id,
-                        resolved_request_id,
-                        i64::from(reused),
-                    ],
-                )
-                .map_err(message)?;
-        }
-
-        let outcome = read_batch_outcome(&transaction, &input.batch_id)?;
+        let outcome = enqueue_on(&transaction, input)?;
         transaction.commit().map_err(message)?;
         Ok(outcome)
     }
@@ -213,72 +96,201 @@ impl QueueStore {
     }
 
     pub fn claim_next(&mut self, epoch: i64) -> Result<Option<QueueJob>, String> {
-        let now = epoch_milliseconds()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(message)?;
-        let settings = read_settings(&transaction)?;
-        if epoch != settings.epoch {
+        let job = claim_next_on(&transaction, epoch)?;
+        transaction.commit().map_err(message)?;
+        Ok(job)
+    }
+}
+
+pub(crate) fn enqueue_on(
+    transaction: &rusqlite::Transaction<'_>,
+    input: EnqueueBatch,
+) -> Result<EnqueueOutcome, String> {
+    validate_batch(&input)?;
+    let input_json = serde_json::to_string(&input).map_err(message)?;
+    let now = epoch_milliseconds()?;
+    if let Some(original_json) = transaction
+        .query_row(
+            "SELECT input_json FROM queue_batches WHERE batch_id = ?1",
+            [&input.batch_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(message)?
+    {
+        let original: EnqueueBatch = serde_json::from_str(&original_json).map_err(message)?;
+        if original != input {
             return Err(format!(
-                "queue epoch mismatch: expected {}, received {epoch}",
-                settings.epoch
+                "batch_id {} was already used with different input",
+                input.batch_id
             ));
         }
-        if settings.paused {
-            transaction.commit().map_err(message)?;
-            return Ok(None);
-        }
-        let occupied: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM queue_jobs
-                 WHERE status IN ('dispatching', 'running', 'cancel_requested', 'outcome_unknown')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(message)?;
-        if occupied >= i64::from(settings.concurrency) {
-            transaction.commit().map_err(message)?;
-            return Ok(None);
-        }
+        let outcome = read_batch_outcome(&transaction, &input.batch_id)?;
+        return Ok(outcome);
+    }
 
-        let request_id = transaction
+    for job in &input.jobs {
+        let collision = transaction
             .query_row(
-                "SELECT jobs.request_id FROM queue_jobs AS jobs
-                 JOIN queue_batches AS batches ON batches.batch_id = jobs.batch_id
-                 WHERE jobs.status = 'queued' AND batches.paused = 0
-                 ORDER BY jobs.sequence LIMIT 1",
-                [],
+                "SELECT 1 FROM queue_batch_entries
+                     WHERE submitted_request_id = ?1 OR submitted_attempt_id = ?2 LIMIT 1",
+                params![job.request_id, job.attempt_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(message)?;
+        if collision.is_some() {
+            return Err("request_id and attempt_id must be globally unique".into());
+        }
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO queue_batches (batch_id, input_json, paused, created_at_ms)
+                 VALUES (?1, ?2, 0, ?3)",
+            params![input.batch_id, input_json, now],
+        )
+        .map_err(message)?;
+
+    for (ordinal, input_job) in input.jobs.iter().enumerate() {
+        let existing_request_id = transaction
+            .query_row(
+                "SELECT request_id FROM queue_jobs
+                     WHERE project_id = ?1 AND slide_id = ?2
+                       AND status IN ('queued', 'dispatching', 'running', 'result_ready',
+                                      'committing', 'cancel_requested', 'outcome_unknown')",
+                params![input_job.target.project_id, input_job.target.slide_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()
             .map_err(message)?;
-        let Some(request_id) = request_id else {
-            transaction.commit().map_err(message)?;
-            return Ok(None);
+
+        let (resolved_request_id, reused) = if let Some(request_id) = existing_request_id {
+            (request_id, true)
+        } else {
+            let target_json = serde_json::to_string(&input_job.target).map_err(message)?;
+            transaction
+                .execute(
+                    "INSERT INTO queue_jobs (
+                           batch_id, request_id, attempt_id, project_id, slide_id, target_json,
+                           status, created_at_ms, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?7)",
+                    params![
+                        input.batch_id,
+                        input_job.request_id,
+                        input_job.attempt_id,
+                        input_job.target.project_id,
+                        input_job.target.slide_id,
+                        target_json,
+                        now,
+                    ],
+                )
+                .map_err(message)?;
+            transaction
+                    .execute(
+                        "INSERT INTO queue_attempts (attempt_id, request_id, target_json, created_at_ms)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![input_job.attempt_id, input_job.request_id, target_json, now],
+                    )
+                    .map_err(message)?;
+            transaction
+                .execute(
+                    "INSERT INTO queue_transition_events (
+                           request_id, from_status, to_status, epoch, created_at_ms
+                         ) VALUES (?1, NULL, 'queued', NULL, ?2)",
+                    params![input_job.request_id, now],
+                )
+                .map_err(message)?;
+            (input_job.request_id.clone(), false)
         };
 
         transaction
             .execute(
-                "UPDATE queue_jobs
+                "INSERT INTO queue_batch_entries (
+                       batch_id, ordinal, submitted_request_id, submitted_attempt_id,
+                       resolved_request_id, reused
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    input.batch_id,
+                    i64::try_from(ordinal).map_err(message)?,
+                    input_job.request_id,
+                    input_job.attempt_id,
+                    resolved_request_id,
+                    i64::from(reused),
+                ],
+            )
+            .map_err(message)?;
+    }
+
+    let outcome = read_batch_outcome(&transaction, &input.batch_id)?;
+    Ok(outcome)
+}
+
+pub(crate) fn claim_next_on(
+    transaction: &rusqlite::Transaction<'_>,
+    epoch: i64,
+) -> Result<Option<QueueJob>, String> {
+    let now = epoch_milliseconds()?;
+    let settings = read_settings(&transaction)?;
+    if epoch != settings.epoch {
+        return Err(format!(
+            "queue epoch mismatch: expected {}, received {epoch}",
+            settings.epoch
+        ));
+    }
+    if settings.paused {
+        return Ok(None);
+    }
+    let occupied: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM queue_jobs
+                 WHERE status IN ('dispatching', 'running', 'cancel_requested', 'outcome_unknown')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(message)?;
+    if occupied >= i64::from(settings.concurrency) {
+        return Ok(None);
+    }
+
+    let request_id = transaction
+        .query_row(
+            "SELECT jobs.request_id FROM queue_jobs AS jobs
+                 JOIN queue_batches AS batches ON batches.batch_id = jobs.batch_id
+                 WHERE jobs.status = 'queued' AND batches.paused = 0
+                 ORDER BY jobs.sequence LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(message)?;
+    let Some(request_id) = request_id else {
+        return Ok(None);
+    };
+
+    transaction
+        .execute(
+            "UPDATE queue_jobs
                  SET status = 'dispatching', epoch = ?1, updated_at_ms = ?2, dispatched_at_ms = ?2
                  WHERE request_id = ?3 AND status = 'queued'",
-                params![epoch, now, request_id],
-            )
-            .map_err(message)?;
-        transaction
-            .execute(
-                "INSERT INTO queue_transition_events (
+            params![epoch, now, request_id],
+        )
+        .map_err(message)?;
+    transaction
+        .execute(
+            "INSERT INTO queue_transition_events (
                    request_id, from_status, to_status, epoch, created_at_ms
                  ) VALUES (?1, 'queued', 'dispatching', ?2, ?3)",
-                params![request_id, epoch, now],
-            )
-            .map_err(message)?;
-        let job = read_job(&transaction, &request_id)?
-            .ok_or_else(|| "claimed queue job disappeared".to_string())?;
-        transaction.commit().map_err(message)?;
-        Ok(Some(job))
-    }
+            params![request_id, epoch, now],
+        )
+        .map_err(message)?;
+    let job = read_job(&transaction, &request_id)?
+        .ok_or_else(|| "claimed queue job disappeared".to_string())?;
+    Ok(Some(job))
 }
 
 pub(super) fn message(error: impl std::fmt::Display) -> String {
@@ -312,7 +324,7 @@ const JOB_COLUMNS: &str = "SELECT sequence, batch_id, request_id, attempt_id, ta
  status, epoch, provider_json, result_json, error, created_at_ms, updated_at_ms, dispatched_at_ms
  FROM queue_jobs";
 
-pub(super) fn read_jobs(connection: &Connection) -> Result<Vec<QueueJob>, String> {
+pub(crate) fn read_jobs(connection: &Connection) -> Result<Vec<QueueJob>, String> {
     let mut statement = connection
         .prepare(&format!("{JOB_COLUMNS} ORDER BY sequence"))
         .map_err(message)?;
@@ -324,7 +336,7 @@ pub(super) fn read_jobs(connection: &Connection) -> Result<Vec<QueueJob>, String
     Ok(jobs)
 }
 
-pub(super) fn read_job(
+pub(crate) fn read_job(
     connection: &Connection,
     request_id: &str,
 ) -> Result<Option<QueueJob>, String> {
@@ -380,7 +392,10 @@ fn parse_status(index: usize, value: &str) -> rusqlite::Result<JobStatus> {
     parse_json(index, &quoted)
 }
 
-fn read_batch_outcome(connection: &Connection, batch_id: &str) -> Result<EnqueueOutcome, String> {
+pub(crate) fn read_batch_outcome(
+    connection: &Connection,
+    batch_id: &str,
+) -> Result<EnqueueOutcome, String> {
     let mut statement = connection
         .prepare(
             "SELECT resolved_request_id, reused FROM queue_batch_entries
@@ -410,7 +425,7 @@ fn read_batch_outcome(connection: &Connection, batch_id: &str) -> Result<Enqueue
     })
 }
 
-pub(super) fn epoch_milliseconds() -> Result<i64, String> {
+pub(crate) fn epoch_milliseconds() -> Result<i64, String> {
     let milliseconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(message)?

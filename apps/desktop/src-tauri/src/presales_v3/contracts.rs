@@ -39,6 +39,7 @@ pub struct V3ProjectSnapshot {
     pub frozen_checkpoint: V3FrozenCheckpoint,
     pub palette: VisualStyleState,
     pub pages: Vec<V3PageState>,
+    pub delivery_snapshot: Option<V3DeliverySnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +63,102 @@ pub struct V3PageState {
     pub versions: Vec<V3VisualVersion>,
     pub approval: Option<V3Approval>,
     pub feedback: Option<V3FeedbackDraft>,
+    pub revision: i64,
+    pub intent_request_id: Option<String>,
+    pub approvals: Vec<V3Approval>,
+    pub feedback_drafts: Vec<V3FeedbackDraft>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnqueuePages {
+    pub project_id: String,
+    pub batch_id: String,
+    pub pages: Vec<PageRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PageRequest {
+    pub slide_id: String,
+    pub request_id: String,
+    pub attempt_id: String,
+    pub expected_revision: i64,
+    pub parent_version_id: Option<String>,
+    pub feedback: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommitResult {
+    pub epoch: i64,
+    pub request_id: String,
+    pub attempt_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct V3PublicationReceipt {
+    pub request_id: String,
+    pub attempt_id: String,
+    pub project_id: String,
+    pub slide_id: String,
+    pub version_id: String,
+    pub image: ImageReference,
+    pub target_sha256: String,
+    pub page_revision: i64,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApproveVersion {
+    pub project_id: String,
+    pub slide_id: String,
+    pub version_id: String,
+    pub image_sha256: String,
+    pub basis: V3VisualBasis,
+    pub expected_revision: i64,
+    pub content_checked: bool,
+    pub visual_checked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveFeedback {
+    pub project_id: String,
+    pub slide_id: String,
+    pub base_version_id: Option<String>,
+    pub expected_revision: i64,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptVersion {
+    pub project_id: String,
+    pub slide_id: String,
+    pub version_id: String,
+    pub expected_revision: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct V3DeliveryPage {
+    pub slide_id: String,
+    pub version_id: String,
+    pub image: ImageReference,
+    pub approval_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct V3DeliverySnapshot {
+    pub snapshot_id: String,
+    pub project_id: String,
+    pub revision: i64,
+    pub pages: Vec<V3DeliveryPage>,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

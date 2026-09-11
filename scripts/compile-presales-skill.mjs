@@ -256,6 +256,7 @@ function compile(root) {
   };
   return {
     bundle: `export const PRESALES_SKILL = ${JSON.stringify(bundle, null, 2)} as const;\n`,
+    nativeBundle: `${JSON.stringify(bundle, null, 2)}\n`,
     metadata: `${JSON.stringify(
       { id: bundle.id, version: bundle.version, sha256: bundle.sha256 },
       null,
@@ -270,6 +271,7 @@ function main() {
   const outputs = [
     [OUTPUT_PATH, expected.bundle],
     [METADATA_OUTPUT_PATH, expected.metadata],
+    ['apps/worker/src/presales/skill.bundle.generated.json', expected.nativeBundle],
   ];
 
   if (check) {

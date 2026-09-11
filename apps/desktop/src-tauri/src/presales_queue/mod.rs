@@ -1,11 +1,11 @@
 mod contracts;
-mod lifecycle;
+pub(crate) mod lifecycle;
 mod result_files;
-mod result_staging;
+pub(crate) mod result_staging;
 mod result_vault;
 mod rpc;
 pub(crate) mod schema;
-mod store;
+pub(crate) mod store;
 
 pub use contracts::*;
 pub use result_vault::{ResultBinding, ResultVault, VerifiedPngResult};

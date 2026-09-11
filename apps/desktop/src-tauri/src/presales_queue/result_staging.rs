@@ -131,7 +131,7 @@ fn require_active_owner(job: &QueueJob, epoch: i64) -> Result<(), String> {
     }
 }
 
-fn result_binding(job: &QueueJob) -> Result<ResultBinding, String> {
+pub(crate) fn result_binding(job: &QueueJob) -> Result<ResultBinding, String> {
     let target = serde_json::to_vec(&job.target).map_err(message)?;
     Ok(ResultBinding {
         request_id: job.request_id.clone(),

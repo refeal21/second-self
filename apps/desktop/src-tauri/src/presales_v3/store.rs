@@ -9,22 +9,20 @@ pub struct V3Store {
 
 impl V3Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
-        Ok(Self {
-            connection: initialize(
-                Connection::open(path).map_err(message)?,
-                true,
-                DatabaseProfile::PresalesV3,
-            )?,
-        })
+        Self::initialize(Connection::open(path).map_err(message)?, true)
     }
     pub fn open_in_memory() -> Result<Self, String> {
-        Ok(Self {
-            connection: initialize(
-                Connection::open_in_memory().map_err(message)?,
-                false,
-                DatabaseProfile::PresalesV3,
-            )?,
-        })
+        Self::initialize(Connection::open_in_memory().map_err(message)?, false)
+    }
+
+    fn initialize(connection: Connection, file_backed: bool) -> Result<Self, String> {
+        let connection = initialize(connection, file_backed, DatabaseProfile::PresalesV3)?;
+        // V3 events use at most three short local write attempts. QueueOnly's
+        // existing timeout and transaction behavior remain independently owned.
+        connection
+            .busy_timeout(std::time::Duration::from_millis(25))
+            .map_err(message)?;
+        Ok(Self { connection })
     }
 
     pub(crate) fn insert_project(&mut self, seed: ValidatedV3ProjectSeed) -> Result<(), String> {
@@ -77,7 +75,10 @@ impl V3Store {
     }
 }
 
-fn load_on(connection: &Connection, project_id: &str) -> Result<V3ProjectSnapshot, String> {
+pub(super) fn load_on(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<V3ProjectSnapshot, String> {
     let stored = connection
         .query_row(
             "SELECT name, frozen_json, origin_json, palette_json, created_at, revision
@@ -109,7 +110,7 @@ fn load_on(connection: &Connection, project_id: &str) -> Result<V3ProjectSnapsho
     }
     snapshot.summary.revision = stored.5;
     let mut stmt = connection.prepare(
-        "SELECT slide_id, ordinal, spec_json, design_json, basis_json, current_version_id, approved_version_id
+        "SELECT slide_id, ordinal, spec_json, design_json, basis_json, current_version_id, approved_version_id, revision, intent_request_id
          FROM v3_pages WHERE project_id = ?1 ORDER BY ordinal").map_err(message)?;
     let rows = stmt
         .query_map([project_id], |row| {
@@ -121,6 +122,8 @@ fn load_on(connection: &Connection, project_id: &str) -> Result<V3ProjectSnapsho
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })
         .map_err(message)?
@@ -139,6 +142,8 @@ fn load_on(connection: &Connection, project_id: &str) -> Result<V3ProjectSnapsho
             return Err("v3 page does not match frozen evidence".into());
         }
         page.current_version_id = row.5;
+        page.revision = row.7;
+        page.intent_request_id = row.8;
         let mut versions = connection.prepare(
             "SELECT version_json FROM v3_versions WHERE project_id = ?1 AND slide_id = ?2 ORDER BY sequence").map_err(message)?;
         let encoded = versions
@@ -152,26 +157,69 @@ fn load_on(connection: &Connection, project_id: &str) -> Result<V3ProjectSnapsho
             .iter()
             .map(|v| decode(v))
             .collect::<Result<_, _>>()?;
-        if let Some(version_id) = row.6 {
-            let encoded: String = connection.query_row(
-                "SELECT approval_json FROM v3_approvals WHERE project_id = ?1 AND slide_id = ?2 AND version_id = ?3",
-                params![project_id, page.slide_id, version_id], |r| r.get(0)).map_err(message)?;
-            page.approval = Some(decode(&encoded)?);
-        }
-        let feedback: Option<String> = connection.query_row(
-            "SELECT draft_json FROM v3_feedback WHERE project_id = ?1 AND slide_id = ?2 AND base_version_id = COALESCE(?3, '')",
-            params![project_id, page.slide_id, page.current_version_id], |r| r.get(0)).optional().map_err(message)?;
-        page.feedback = feedback.as_deref().map(decode).transpose()?;
+        super::history::load_page_history(connection, project_id, page, row.6.as_deref())?;
     }
+    super::history::load_delivery(connection, &mut snapshot)?;
     Ok(snapshot)
 }
 
-fn encode(value: &impl serde::Serialize) -> Result<String, String> {
+pub(super) fn encode(value: &impl serde::Serialize) -> Result<String, String> {
     serde_json::to_string(value).map_err(message)
 }
-fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, String> {
+pub(super) fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(message)
 }
-fn message(error: impl std::fmt::Display) -> String {
+pub(super) fn message(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+pub(super) fn write_on<T>(
+    connection: &mut Connection,
+    mut operation: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    for attempt in 0..3 {
+        let result: Result<T, String> = (|| {
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(message)?;
+            let result = operation(&tx)?;
+            tx.commit().map_err(message)?;
+            Ok(result)
+        })();
+        match result {
+            Err(error)
+                if attempt < 2
+                    && (error.contains("database is locked")
+                        || error.contains("database is busy")) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
+    unreachable!("bounded local retry returns on final attempt")
+}
+
+pub(super) fn page_on<'a>(
+    snapshot: &'a V3ProjectSnapshot,
+    slide_id: &str,
+) -> Result<&'a V3PageState, String> {
+    snapshot
+        .pages
+        .iter()
+        .find(|page| page.slide_id == slide_id)
+        .ok_or_else(|| "unknown v3 page".into())
+}
+
+pub(super) fn bump_project(tx: &Connection, project_id: &str) -> Result<(), String> {
+    if tx.execute("UPDATE v3_projects SET revision = revision + 1 WHERE project_id = ?1 AND revision < 9223372036854775807", [project_id]).map_err(message)? != 1 {
+        return Err("project revision exhausted or project missing".into());
+    }
+    Ok(())
+}
+
+pub(super) fn now() -> Result<String, String> {
+    chrono::DateTime::from_timestamp_millis(crate::presales_queue::store::epoch_milliseconds()?)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .ok_or_else(|| "native timestamp is outside the RFC3339 range".into())
 }

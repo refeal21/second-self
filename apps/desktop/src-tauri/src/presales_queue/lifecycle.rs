@@ -318,7 +318,7 @@ impl QueueStore {
     }
 }
 
-pub(super) fn record_result_evidence(
+pub(crate) fn record_result_evidence(
     tx: &Transaction<'_>,
     mut job: QueueJob,
     result: StagedResult,
@@ -400,6 +400,39 @@ fn owned_job(
     if job.epoch != Some(epoch) || job.attempt_id != attempt_id {
         return Err("attempt identity or owning epoch mismatch".into());
     }
+    Ok(job)
+}
+
+/// Only the native V3 publisher calls this inside its version/receipt transaction.
+pub(crate) fn commit_success_on(
+    tx: &Transaction<'_>,
+    epoch: i64,
+    request_id: &str,
+    attempt_id: &str,
+    verified: &super::VerifiedPngResult,
+    version_id: &str,
+) -> Result<QueueJob, String> {
+    if read_settings(tx)?.epoch != epoch {
+        return Err("queue epoch mismatch".into());
+    }
+    let mut job = required_job(tx, request_id)?;
+    // ResultReady survives supervisor recovery without changing its owning epoch.
+    require(job.attempt_id == attempt_id && job.status == JobStatus::ResultReady)?;
+    if job.result.as_ref() != Some(verified.manifest())
+        || super::result_staging::result_binding(&job)? != *verified.binding()
+        || exact_event(tx, &job, "cancel_requested", &json!({}))?
+    {
+        return Err("result evidence or durable cancellation prevents publication".into());
+    }
+    let from = job.status.clone();
+    job.status = JobStatus::Succeeded;
+    persist_change(
+        tx,
+        &mut job,
+        from,
+        "published",
+        json!({"versionId": version_id}),
+    )?;
     Ok(job)
 }
 

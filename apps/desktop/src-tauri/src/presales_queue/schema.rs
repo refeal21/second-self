@@ -109,7 +109,7 @@ WHERE status IN (
     },
 ];
 
-const V3_OBJECTS: [SchemaObject; 9] = [
+const V3_OBJECTS: [SchemaObject; 11] = [
     SchemaObject {
         kind: "table",
         name: "v3_projects",
@@ -135,10 +135,32 @@ const V3_OBJECTS: [SchemaObject; 9] = [
     basis_json TEXT,
     current_version_id TEXT,
     approved_version_id TEXT,
+    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+    intent_request_id TEXT REFERENCES queue_jobs(request_id),
     PRIMARY KEY (project_id, slide_id),
     UNIQUE (project_id, ordinal),
     FOREIGN KEY (project_id, slide_id, current_version_id) REFERENCES v3_versions(project_id, slide_id, version_id),
     FOREIGN KEY (project_id, slide_id, approved_version_id) REFERENCES v3_versions(project_id, slide_id, version_id)
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "v3_admissions",
+        sql: r#"CREATE TABLE v3_admissions (
+    batch_id TEXT NOT NULL PRIMARY KEY REFERENCES queue_batches(batch_id),
+    input_json TEXT NOT NULL
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "v3_intents",
+        sql: r#"CREATE TABLE v3_intents (
+    request_id TEXT NOT NULL PRIMARY KEY REFERENCES queue_jobs(request_id),
+    project_id TEXT NOT NULL,
+    slide_id TEXT NOT NULL,
+    page_revision INTEGER NOT NULL CHECK (page_revision >= 1),
+    target_json TEXT NOT NULL,
+    FOREIGN KEY (project_id, slide_id) REFERENCES v3_pages(project_id, slide_id)
 )"#,
     },
     SchemaObject {

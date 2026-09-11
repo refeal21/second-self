@@ -1,9 +1,10 @@
 use std::{path::PathBuf, sync::Mutex};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::codex_process::{resolve_codex_binary, CodexAppServerProcess, SystemCodexBinaryProbe};
+use crate::{presales_v3::activity::Transport, workbench::WorkbenchService};
 
 pub const CODEX_STDOUT_EVENT: &str = "codex-app-server://stdout";
 pub const CODEX_STDERR_EVENT: &str = "codex-app-server://stderr";
@@ -72,19 +73,37 @@ pub fn start_codex_app_server(
     let configured_path = configured_path.map(PathBuf::from);
     let binary_path = resolve_codex_binary(configured_path.as_deref(), &SystemCodexBinaryProbe)?;
     let generation = state.reserve_generation();
+    let activity = app.state::<WorkbenchService>().activity().clone();
+    let key = activity.process_key(Transport::Codex, generation);
 
     let stdout_app = app.clone();
     let stderr_app = app.clone();
     let exit_app = app;
-    let process = CodexAppServerProcess::spawn(
+    let stdout_activity = activity.clone();
+    let stdout_key = key.clone();
+    let loss_activity = activity.clone();
+    let loss_key = key.clone();
+    let loss_app = stderr_app.clone();
+    let exit_activity = activity.clone();
+    let exit_key = key.clone();
+    let process = CodexAppServerProcess::spawn_observed(
         &binary_path,
         move |line| {
+            let _ = stdout_activity.observe_line(&stdout_key, line.as_bytes());
             let _ = stdout_app.emit(CODEX_STDOUT_EVENT, CodexAppServerLine { generation, line });
+        },
+        move || {
+            let _ = loss_activity.evidence_lost(&loss_key);
+            let _ = loss_app.emit(CODEX_STDERR_EVENT, CodexAppServerLine {
+                generation,
+                line: "protocol_evidence_lost: Codex output was oversized, truncated, unreadable or invalid UTF-8".into(),
+            });
         },
         move |line| {
             let _ = stderr_app.emit(CODEX_STDERR_EVENT, CodexAppServerLine { generation, line });
         },
         move |exit| {
+            let _ = exit_activity.transport_lost(&exit_key, "remote_terminal_missing");
             let _ = exit_app.emit(
                 CODEX_EXIT_EVENT,
                 CodexAppServerExit {
@@ -111,7 +130,10 @@ pub fn start_codex_app_server(
     });
     drop(inner);
     if let Some(previous) = previous {
-        previous.process.stop()?;
+        activity.retire_and_stop(
+            &activity.process_key(Transport::Codex, previous.generation),
+            || previous.process.stop(),
+        )?;
     }
 
     Ok(CodexProcessStarted {
@@ -123,6 +145,7 @@ pub fn start_codex_app_server(
 #[tauri::command]
 pub fn send_codex_app_server_line(
     state: State<'_, CodexProcessState>,
+    service: State<'_, WorkbenchService>,
     generation: u64,
     line: String,
 ) -> Result<(), String> {
@@ -137,12 +160,19 @@ pub fn send_codex_app_server_line(
     if active.generation != generation {
         return Err("Codex App Server generation is stale".to_string());
     }
-    active.process.write_line(&line)
+    let activity = service.activity();
+    activity.send(
+        &activity.process_key(Transport::Codex, generation),
+        &line,
+        |_| None,
+        || active.process.write_line(&line),
+    )
 }
 
 #[tauri::command]
 pub fn stop_codex_app_server(
     state: State<'_, CodexProcessState>,
+    service: State<'_, WorkbenchService>,
     generation: u64,
 ) -> Result<(), String> {
     let mut inner = state
@@ -155,7 +185,10 @@ pub fn stop_codex_app_server(
     };
     drop(inner);
     if let Some(process) = process {
-        process.process.stop()?;
+        let activity = service.activity();
+        activity.retire_and_stop(&activity.process_key(Transport::Codex, generation), || {
+            process.process.stop()
+        })?;
     }
     Ok(())
 }

@@ -5,7 +5,7 @@ use std::{
     process::{Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -41,6 +41,8 @@ static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub struct WorkbenchService {
     database: Mutex<Database>,
     workspace_root: Mutex<PathBuf>,
+    database_path: PathBuf,
+    activity: Arc<crate::presales_v3::activity::LegacyActivityTracker>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -217,7 +219,7 @@ impl WorkbenchService {
             .map_err(|error| format!("Workspace cannot be created: {error}"))?;
         let workspace_root = fs::canonicalize(requested_workspace)
             .map_err(|error| format!("Workspace cannot be resolved: {error}"))?;
-        let database = Database::open(database_path)
+        let database = Database::open(&database_path)
             .map_err(|error| format!("Local database cannot be opened: {error}"))?;
         if database
             .setting("workspace_path")
@@ -242,9 +244,16 @@ impl WorkbenchService {
             .map_err(|error| format!("Stored workspace cannot be created: {error}"))?;
         let stored_workspace = fs::canonicalize(stored_workspace)
             .map_err(|error| format!("Stored workspace cannot be resolved: {error}"))?;
+        let database_path = fs::canonicalize(database_path).map_err(|error| error.to_string())?;
+        let activity = crate::presales_v3::activity::LegacyActivityTracker::new(
+            crate::presales_v3::V3Store::open(database_path.with_file_name("presales-v3.sqlite3"))?,
+        )
+        .map_err(|error| format!("legacy_activity_initialization_failed: {error}"))?;
         Ok(Self {
             database: Mutex::new(database),
             workspace_root: Mutex::new(stored_workspace),
+            database_path,
+            activity: Arc::new(activity),
         })
     }
 
@@ -322,6 +331,7 @@ impl WorkbenchService {
     }
 
     pub fn create_project(&self, input: CreateProjectInput) -> Result<ProjectSummary, String> {
+        let _activity = self.activity.mutation_guard()?;
         let name = non_empty(input.name, "Project name")?;
         let goal = non_empty(input.goal, "Project goal")?;
         let id = next_identifier("project");
@@ -624,6 +634,7 @@ impl WorkbenchService {
     }
 
     pub fn attach_source(&self, input: AttachSourceInput) -> Result<Value, String> {
+        let _activity = self.activity.mutation_guard()?;
         let file_name = non_empty(input.file_name, "Source file name")?;
         if Path::new(&file_name)
             .file_name()
@@ -686,6 +697,7 @@ impl WorkbenchService {
     }
 
     pub fn commit_pipeline(&self, input: PipelineCommitInput) -> Result<Value, String> {
+        let _activity = self.activity.mutation_guard()?;
         let workspace = self.workspace()?;
         let database = self.database()?;
         let current = database
@@ -742,6 +754,7 @@ impl WorkbenchService {
         &self,
         input: PairedCheckpointCommitInput,
     ) -> Result<ProjectCheckpoint, String> {
+        let _activity = self.activity.mutation_guard()?;
         let workspace = self.workspace()?;
         let database = self.database()?;
         let current = database
@@ -804,6 +817,7 @@ impl WorkbenchService {
     }
 
     pub fn rename_project(&self, id: &str, name: String) -> Result<String, String> {
+        let _activity = self.activity.mutation_guard()?;
         let name = non_empty(name, "Project name")?;
         let changed = self
             .database()?
@@ -943,6 +957,7 @@ impl WorkbenchService {
     }
 
     pub fn decide_approval(&self, id: &str, decision: &str) -> Result<String, String> {
+        let _activity = self.activity.mutation_guard()?;
         let changed = self
             .database()?
             .decide_approval(id, decision, &now_string())
@@ -959,6 +974,7 @@ impl WorkbenchService {
     }
 
     pub fn decide_memory(&self, id: &str, decision: &str) -> Result<String, String> {
+        let _activity = self.activity.mutation_guard()?;
         let changed = self
             .database()?
             .decide_memory(id, decision, &now_string())
@@ -975,6 +991,7 @@ impl WorkbenchService {
     }
 
     pub fn propose_memory(&self, title: String, content: String) -> Result<String, String> {
+        let _activity = self.activity.mutation_guard()?;
         let title = non_empty(title, "Memory proposal title")?;
         let content = non_empty(content, "Memory proposal content")?;
         self.database()?
@@ -996,6 +1013,7 @@ impl WorkbenchService {
         codex_path: String,
         pdf_renderer_path: String,
     ) -> Result<String, String> {
+        let _activity = self.activity.mutation_guard()?;
         let workspace = PathBuf::from(non_empty(workspace_path, "Workspace path")?);
         if !workspace.is_absolute() {
             return Err("Workspace path must be absolute".into());
@@ -1077,6 +1095,7 @@ impl WorkbenchService {
     }
 
     fn persist_mutation(&self, id: &str, mutation: &ProjectMutation) -> Result<(), String> {
+        let _activity = self.activity.mutation_guard()?;
         let database = self.database()?;
         if database
             .get_project(id)
@@ -1099,6 +1118,42 @@ impl WorkbenchService {
         self.database
             .lock()
             .map_err(|_| "Database state lock poisoned".to_string())
+    }
+
+    pub(crate) fn activity(&self) -> &Arc<crate::presales_v3::activity::LegacyActivityTracker> {
+        &self.activity
+    }
+
+    pub(crate) fn native_source(
+        &self,
+        project_id: &str,
+    ) -> Result<crate::presales_v3::activity::NativeSource, String> {
+        let root = PathBuf::from(self.project_directory(project_id)?);
+        Ok(crate::presales_v3::activity::NativeSource::new(
+            self.database_path.clone(),
+            project_id.into(),
+            root,
+        ))
+    }
+
+    /// Used only while the caller already holds admission and has loaded and
+    /// validated this native project inside the legacy transaction. Avoids
+    /// re-entering the legacy DB mutex during visual-request begin.
+    pub(crate) fn native_source_for_checked_project(
+        &self,
+        project: &StoredProject,
+    ) -> Result<crate::presales_v3::activity::NativeSource, String> {
+        let workspace = self.workspace()?;
+        let root = fs::canonicalize(workspace.join(&project.id))
+            .map_err(|error| format!("Project directory cannot be resolved: {error}"))?;
+        if !root.is_dir() || !root.starts_with(&workspace) {
+            return Err("Project directory is outside the workspace".into());
+        }
+        Ok(crate::presales_v3::activity::NativeSource::new(
+            self.database_path.clone(),
+            project.id.clone(),
+            root,
+        ))
     }
 
     pub(crate) fn workspace(&self) -> Result<PathBuf, String> {

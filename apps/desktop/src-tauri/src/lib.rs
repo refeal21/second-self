@@ -1,5 +1,8 @@
 pub mod codex_process;
 pub mod database;
+mod legacy_frames;
+#[cfg(test)]
+mod legacy_frames_tests;
 mod native_revision_validation;
 pub mod paths;
 pub mod presales;

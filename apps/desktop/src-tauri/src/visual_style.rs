@@ -531,6 +531,7 @@ impl WorkbenchService {
         &self,
         input: SaveVisualStyleInput,
     ) -> Result<VisualStyleState, String> {
+        let _activity = self.activity().mutation_guard()?;
         identifier(&input.project_id)?;
         validate_profile(&input.profile)?;
         let workspace = self.workspace()?;
@@ -592,6 +593,7 @@ impl WorkbenchService {
         &self,
         input: VisualGenerationRequest,
     ) -> Result<VisualGenerationRecord, String> {
+        let mut activity = self.activity().mutation_guard()?;
         identifier(&input.id)?;
         identifier(&input.project_id)?;
         identifier(&input.slide_id)?;
@@ -626,6 +628,7 @@ impl WorkbenchService {
             return Err("stale style revision".into());
         }
         let spec = approved_spec(&p.pipeline, &input.slide_id)?;
+        let source = self.native_source_for_checked_project(&p)?;
         let record = VisualGenerationRecord {
             prompt_sha256: hash(input.prompt.as_bytes()),
             spec_sha256: hash(&serde_json::to_vec(&spec).map_err(err)?),
@@ -644,6 +647,8 @@ impl WorkbenchService {
         )
         .map_err(err)?;
         tx.commit().map_err(err)?;
+        drop(db);
+        activity.cover_visual(source, &record)?;
         Ok(record)
     }
     pub fn visual_records(&self, id: &str) -> Result<Vec<VisualGenerationRecord>, String> {

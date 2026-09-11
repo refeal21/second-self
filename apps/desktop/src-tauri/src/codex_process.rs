@@ -91,6 +91,16 @@ impl CodexAppServerProcess {
         on_stderr_line: impl Fn(String) + Send + 'static,
         on_exit: impl FnOnce(CodexProcessExit) + Send + 'static,
     ) -> Result<Self, String> {
+        Self::spawn_observed(binary_path, on_stdout_line, || {}, on_stderr_line, on_exit)
+    }
+
+    pub(crate) fn spawn_observed(
+        binary_path: &Path,
+        on_stdout_line: impl Fn(String) + Send + 'static,
+        on_stdout_loss: impl Fn() + Send + 'static,
+        on_stderr_line: impl Fn(String) + Send + 'static,
+        on_exit: impl FnOnce(CodexProcessExit) + Send + 'static,
+    ) -> Result<Self, String> {
         let mut command = build_codex_app_server_command(binary_path);
         let mut child = command
             .stdin(Stdio::piped())
@@ -113,14 +123,15 @@ impl CodexAppServerProcess {
         let child = Arc::new(Mutex::new(child));
 
         thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                on_stdout_line(line);
-            }
+            read_bounded_lines(
+                BufReader::new(stdout),
+                crate::legacy_frames::CODEX_FRAME_LIMIT,
+                on_stdout_line,
+                on_stdout_loss,
+            );
         });
         thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                on_stderr_line(line);
-            }
+            read_bounded_lines(BufReader::new(stderr), 64 * 1024, on_stderr_line, || {});
         });
 
         let monitored_child = Arc::clone(&child);
@@ -152,6 +163,9 @@ impl CodexAppServerProcess {
     }
 
     pub fn write_line(&self, line: &str) -> Result<(), String> {
+        if line.contains(['\n', '\r']) {
+            return Err("Codex JSON-RPC request must be exactly one line".into());
+        }
         let mut stdin = self
             .stdin
             .lock()
@@ -177,6 +191,44 @@ impl CodexAppServerProcess {
                 .map_err(|error| format!("Failed to stop Codex App Server: {error}"))?;
         }
         Ok(())
+    }
+}
+
+/// Bound allocation before reading more bytes. EOF without a frame delimiter,
+/// invalid UTF-8 and dropped oversized frames are evidence loss, never terminal.
+fn read_bounded_lines(
+    mut reader: impl BufRead,
+    limit: usize,
+    line: impl Fn(String),
+    lost: impl Fn(),
+) {
+    let mut decoder = crate::legacy_frames::FrameDecoder::new(limit);
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => {
+                if decoder.finish().is_err() {
+                    lost();
+                }
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                lost();
+                return;
+            }
+        };
+        let size = available.len();
+        decoder.push(available, |frame| {
+            match frame.ok().and_then(|b| std::str::from_utf8(b).ok()) {
+                Some(value) => {
+                    let value = value.strip_suffix('\n').unwrap_or(value);
+                    line(value.strip_suffix('\r').unwrap_or(value).to_owned());
+                }
+                None => lost(),
+            }
+        });
+        reader.consume(size);
     }
 }
 

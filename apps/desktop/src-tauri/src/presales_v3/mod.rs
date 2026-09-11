@@ -1,3 +1,6 @@
+pub(crate) mod activity;
+mod activity_protocol;
+mod activity_storage;
 mod basis;
 mod contracts;
 mod delivery;
@@ -16,5 +19,7 @@ pub(crate) use basis::ValidatedV3ProjectSeed;
 pub use contracts::*;
 pub use store::V3Store;
 
+#[cfg(test)]
+mod activity_tests;
 #[cfg(test)]
 mod events_tests;

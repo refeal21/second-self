@@ -109,7 +109,15 @@ WHERE status IN (
     },
 ];
 
-const V3_OBJECTS: [SchemaObject; 11] = [
+const V3_OBJECTS: [SchemaObject; 12] = [
+    SchemaObject {
+        kind: "table",
+        name: "v3_legacy_activity",
+        sql: r#"CREATE TABLE v3_legacy_activity (
+    evidence_id TEXT NOT NULL PRIMARY KEY,
+    evidence_json TEXT NOT NULL
+)"#,
+    },
     SchemaObject {
         kind: "table",
         name: "v3_projects",

@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use crate::{presales_v3::activity::Transport, workbench::WorkbenchService};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::{
@@ -81,11 +82,14 @@ pub async fn start_worker_sidecar(
     state: State<'_, WorkerSidecarState>,
 ) -> Result<WorkerStarted, String> {
     let generation = state.reserve_generation();
+    let activity = app.state::<WorkbenchService>().activity().clone();
+    let key = activity.process_key(Transport::Worker, generation);
     let command = app
         .shell()
         .sidecar("digital-twin-worker")
         .map_err(|error| format!("Bundled workflow worker is unavailable: {error}"))?;
     let (mut receiver, child) = command
+        .set_raw_out(true)
         .spawn()
         .map_err(|error| format!("Bundled workflow worker could not start: {error}"))?;
     let pid = child.pid();
@@ -104,38 +108,56 @@ pub async fn start_worker_sidecar(
         inner.active.replace(ActiveWorker { generation, child })
     };
     if let Some(previous) = previous {
-        previous
-            .child
-            .kill()
-            .map_err(|error| format!("Previous workflow worker could not stop: {error}"))?;
+        activity.retire_and_stop(
+            &activity.process_key(Transport::Worker, previous.generation),
+            || {
+                previous
+                    .child
+                    .kill()
+                    .map_err(|error| format!("Previous workflow worker could not stop: {error}"))
+            },
+        )?;
     }
 
     let event_app = app.clone();
     tauri::async_runtime::spawn(async move {
+        let mut stderr_frames = crate::legacy_frames::FrameDecoder::new(64 * 1024);
         while let Some(event) = receiver.recv().await {
             match event {
-                CommandEvent::Stdout(bytes) => {
-                    let _ = event_app.emit(
-                        WORKER_STDOUT_EVENT,
-                        WorkerLine {
-                            generation,
-                            line: String::from_utf8_lossy(&bytes).into_owned(),
-                        },
-                    );
-                }
+                CommandEvent::Stdout(bytes) => match activity.observe_bytes(&key, &bytes) {
+                    Ok(lines) => {
+                        for line in lines {
+                            let _ = event_app
+                                .emit(WORKER_STDOUT_EVENT, WorkerLine { generation, line });
+                        }
+                    }
+                    Err(error) => {
+                        let _ = event_app.emit(
+                            WORKER_STDERR_EVENT,
+                            WorkerLine {
+                                generation,
+                                line: format!("Workflow worker transport evidence lost: {error}"),
+                            },
+                        );
+                    }
+                },
                 CommandEvent::Stderr(bytes) => {
-                    let _ = event_app.emit(
-                        WORKER_STDERR_EVENT,
-                        WorkerLine {
-                            generation,
-                            line: String::from_utf8_lossy(&bytes).into_owned(),
-                        },
-                    );
+                    stderr_frames.push(&bytes, |frame| {
+                        let line = frame
+                            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                            .unwrap_or_else(|()| {
+                                "Workflow worker stderr frame exceeded limit".into()
+                            });
+                        let _ =
+                            event_app.emit(WORKER_STDERR_EVENT, WorkerLine { generation, line });
+                    });
                 }
                 CommandEvent::Error(line) => {
+                    let _ = activity.evidence_lost(&key);
                     let _ = event_app.emit(WORKER_STDERR_EVENT, WorkerLine { generation, line });
                 }
                 CommandEvent::Terminated(payload) => {
+                    let _ = activity.transport_lost(&key, "remote_terminal_missing");
                     event_app
                         .state::<WorkerSidecarState>()
                         .clear_active_if_generation(generation);
@@ -152,6 +174,9 @@ pub async fn start_worker_sidecar(
                 _ => {}
             }
         }
+        // A closed receiver is not itself a confirmed child exit. Only the
+        // Terminated event above can release local work after lost stdout.
+        let _ = activity.transport_retiring(&key);
     });
 
     Ok(WorkerStarted {
@@ -164,6 +189,7 @@ pub async fn start_worker_sidecar(
 #[tauri::command]
 pub fn send_worker_sidecar_line(
     state: State<'_, WorkerSidecarState>,
+    service: State<'_, WorkbenchService>,
     generation: u64,
     line: String,
 ) -> Result<(), String> {
@@ -181,15 +207,24 @@ pub fn send_worker_sidecar_line(
     if active.generation != generation {
         return Err("Workflow worker generation is stale".into());
     }
-    active
-        .child
-        .write(format!("{line}\n").as_bytes())
-        .map_err(|error| format!("Workflow worker stdin write failed: {error}"))
+    let activity = service.activity();
+    activity.send(
+        &activity.process_key(Transport::Worker, generation),
+        &line,
+        |id| service.native_source(id).ok(),
+        || {
+            active
+                .child
+                .write(format!("{line}\n").as_bytes())
+                .map_err(|error| format!("Workflow worker stdin write failed: {error}"))
+        },
+    )
 }
 
 #[tauri::command]
 pub fn stop_worker_sidecar(
     state: State<'_, WorkerSidecarState>,
+    service: State<'_, WorkbenchService>,
     generation: u64,
 ) -> Result<(), String> {
     let child = {
@@ -205,9 +240,12 @@ pub fn stop_worker_sidecar(
         }
     };
     if let Some(child) = child {
-        child
-            .kill()
-            .map_err(|error| format!("Workflow worker could not stop: {error}"))?;
+        let activity = service.activity();
+        activity.retire_and_stop(&activity.process_key(Transport::Worker, generation), || {
+            child
+                .kill()
+                .map_err(|error| format!("Workflow worker could not stop: {error}"))
+        })?;
     }
     Ok(())
 }

@@ -12,6 +12,8 @@ import {
   goldenSourceAnalysis,
 } from './golden-project.js';
 import type { NativePipelineResult, NativePptPipeline } from './native-pipeline.js';
+import { createNativePipeline } from './native-pipeline.js';
+import { createHash } from 'node:crypto';
 
 const children: ChildProcessWithoutNullStreams[] = [];
 
@@ -26,9 +28,9 @@ afterEach(async () => {
   );
 }, 20_000);
 
-function startWorker(testMode = false) {
+function startWorker(testMode = false, mode?: string) {
   const cli = fileURLToPath(new URL('./sidecar-cli.ts', import.meta.url));
-  const child = spawn(process.execPath, ['--import', 'tsx', cli], {
+  const child = spawn(process.execPath, ['--import', 'tsx', cli, ...(mode ? [mode] : [])], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
       ...process.env,
@@ -50,6 +52,35 @@ function startWorker(testMode = false) {
 }
 
 describe('worker sidecar process integration', () => {
+  it('isolates offline validation mode from runtime commands even when test mode is enabled', async () => {
+    const worker = startWorker(true, '--presales-validate');
+    for (const method of ['system.health', 'ppt.project.create', 'test.crash']) {
+      expect(await worker.request(JSON.stringify({ jsonrpc: '2.0', id: method, method,
+        params: { generation: 1, snapshot: '{}' } }))).toMatchObject({ error: { code: -32601 } });
+    }
+    expect(await worker.request(JSON.stringify({ jsonrpc: '2.0', id: 'invalid-snapshot',
+      method: 'presales.legacy.validate', params: { generation: 1, snapshot: '{"schemaVersion":3}' } })))
+      .toMatchObject({ id: 'invalid-snapshot', error: { code: -32602 } });
+  });
+
+  it('assembles Chinese UTF-8 snapshot bytes split across stdin writes in offline mode', async () => {
+    const worker = startWorker(false, '--presales-validate');
+    const snapshot = JSON.stringify(createNativePipeline({ id: 'synthetic-chinese', name: '合成驾驶舱',
+      goal: '逐字节验证中文', createdAt: '2026-09-11T00:00:00Z' }));
+    const bytes = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 'split', method: 'presales.legacy.validate',
+      params: { generation: 3, snapshot } }));
+    const lines = createInterface({ input: worker.child.stdout });
+    const received = once(lines, 'line');
+    const split = bytes.indexOf(Buffer.from('驾')) + 1;
+    worker.child.stdin.write(bytes.subarray(0, split));
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    worker.child.stdin.write(bytes.subarray(split));
+    worker.child.stdin.write('\n');
+    expect(JSON.parse((await received)[0] as string)).toMatchObject({ id: 'split', result: { generation: 3,
+      validation: { snapshotSha256: createHash('sha256').update(snapshot).digest('hex') } } });
+    lines.close();
+  });
+
   it('survives malformed and unknown requests before serving a valid request', async () => {
     const worker = startWorker();
     expect(await worker.request('{bad')).toMatchObject({

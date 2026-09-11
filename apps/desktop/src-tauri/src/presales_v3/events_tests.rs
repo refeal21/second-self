@@ -4,6 +4,123 @@ use rusqlite::params;
 
 #[path = "../../tests/support/v3_temp.rs"]
 mod tempfile;
+#[path = "../../tests/support/v3_v1_fixture.rs"]
+mod v1_fixture;
+
+#[test]
+fn exact_schema_upgrade_preserves_native_queue_history_approvals_and_delivery() {
+    let (mut store, directory, vault) = fixture();
+    for n in 1..=3 {
+        let request = format!("migration-{n}");
+        store
+            .enqueue_pages(input(&store, n, &request), None)
+            .unwrap();
+        let completion = ready(&mut store, &vault, &request);
+        store.commit_result(completion, &vault).unwrap();
+        approve(&mut store, &vault, n);
+    }
+    store
+        .create_delivery_snapshot("frozen-project", &vault)
+        .unwrap();
+    let before = store.load_project("frozen-project").unwrap();
+    let v2 = directory.path().join("catalog.sqlite3");
+    let v1 = directory.path().join("legacy-v3.sqlite3");
+    drop(store);
+    v1_fixture::copy_existing_rows_into_v1(&v2, &v1);
+    let original = rusqlite::Connection::open(&v1).unwrap();
+    original
+        .execute("UPDATE v3_projects SET rowid=rowid+40", [])
+        .unwrap();
+    original
+        .execute("UPDATE v3_pages SET rowid=rowid+100", [])
+        .unwrap();
+    let rows = |db: &rusqlite::Connection| {
+        [
+            "v3_projects",
+            "v3_pages",
+            "v3_versions",
+            "v3_approvals",
+            "v3_artifacts",
+            "v3_receipts",
+            "v3_delivery_snapshots",
+            "v3_intents",
+            "queue_jobs",
+            "queue_attempts",
+            "queue_lifecycle_events",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut statement = db
+                .prepare(&format!("SELECT rowid,* FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let count = statement.column_count();
+            statement
+                .query_map([], |r| {
+                    (0..count)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>()
+    };
+    let original_rows = rows(&original);
+    drop(original);
+    let upgraded = V3Store::open(&v1).unwrap();
+    assert_eq!(upgraded.load_project("frozen-project").unwrap(), before);
+    assert_eq!(rows(&upgraded.connection), original_rows);
+    assert_eq!(
+        upgraded
+            .connection
+            .pragma_query_value(None, "foreign_keys", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        upgraded
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn injected_upgrade_failures_roll_back_schema_rows_and_version_before_reopen() {
+    let (store, directory, _vault) = fixture();
+    let expected = store.load_project("frozen-project").unwrap();
+    drop(store);
+    for stage in ["after_catalog_ddl", "after_row_copy", "before_commit"] {
+        let old = directory.path().join(format!("{stage}.sqlite3"));
+        v1_fixture::copy_existing_rows_into_v1(&directory.path().join("catalog.sqlite3"), &old);
+        let original_bytes = std::fs::read(&old).unwrap();
+        crate::presales_queue::schema::inject_v3_upgrade_failure(Some(stage));
+        let error = V3Store::open(&old).err().unwrap();
+        crate::presales_queue::schema::inject_v3_upgrade_failure(None);
+        assert!(error.contains(stage));
+        assert_eq!(std::fs::read(&old).unwrap(), original_bytes, "{stage}");
+        let db = rusqlite::Connection::open(&old).unwrap();
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='v3_catalog'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(db);
+        let upgraded = V3Store::open(&old).unwrap();
+        assert_eq!(upgraded.load_project("frozen-project").unwrap(), expected);
+    }
+}
 
 fn fixture() -> (V3Store, tempfile::TempDir, ResultVault) {
     let (checkpoint, palette) = super::basis::tests::frozen_fixture_pages(3);
@@ -212,6 +329,10 @@ fn saturated_project_revision_rolls_back_admission_atomically() {
     store
         .connection
         .execute("UPDATE v3_projects SET revision=?1", [i64::MAX])
+        .unwrap();
+    store
+        .connection
+        .execute("UPDATE v3_catalog SET revision=?1", [i64::MAX])
         .unwrap();
     let i = input(&store, 1, "r1");
     assert!(store.enqueue_pages(i, None).is_err());

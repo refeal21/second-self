@@ -24,6 +24,21 @@ pub struct V3ProjectSummary {
     pub created_at: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum V3CatalogKind {
+    Frozen,
+    Draft,
+    HistoryOnly,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct V3CatalogEntry {
+    pub kind: V3CatalogKind,
+    pub summary: V3ProjectSummary,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct V3FrozenCheckpoint {

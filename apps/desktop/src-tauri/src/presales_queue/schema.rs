@@ -1,6 +1,14 @@
 use rusqlite::{Connection, TransactionBehavior};
 use std::time::Duration;
 
+#[path = "v3_schema_upgrade.rs"]
+mod v3_schema_upgrade;
+#[path = "v3_schema_v1.rs"]
+mod v3_schema_v1;
+
+#[cfg(test)]
+pub(crate) use v3_schema_upgrade::inject_failure as inject_v3_upgrade_failure;
+
 #[derive(Clone, Copy)]
 struct SchemaObject {
     kind: &'static str,
@@ -109,7 +117,45 @@ WHERE status IN (
     },
 ];
 
-const V3_OBJECTS: [SchemaObject; 12] = [
+const V3_OBJECTS: [SchemaObject; 16] = [
+    SchemaObject {
+        kind: "table",
+        name: "v3_catalog",
+        sql: r#"CREATE TABLE v3_catalog (
+    project_id TEXT NOT NULL PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('frozen', 'draft', 'history_only')),
+    revision INTEGER NOT NULL CHECK (revision >= 1)
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "v3_draft_projects",
+        sql: r#"CREATE TABLE v3_draft_projects (
+    project_id TEXT NOT NULL PRIMARY KEY REFERENCES v3_catalog(project_id),
+    draft_json TEXT NOT NULL
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "v3_history_projects",
+        sql: r#"CREATE TABLE v3_history_projects (
+    project_id TEXT NOT NULL PRIMARY KEY REFERENCES v3_catalog(project_id),
+    history_json TEXT NOT NULL
+)"#,
+    },
+    SchemaObject {
+        kind: "table",
+        name: "v3_origin_approvals",
+        sql: r#"CREATE TABLE v3_origin_approvals (
+    reference_id TEXT NOT NULL PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    slide_id TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    proof_json TEXT NOT NULL,
+    FOREIGN KEY (project_id, slide_id, version_id) REFERENCES v3_versions(project_id, slide_id, version_id),
+    UNIQUE (project_id, slide_id, version_id)
+)"#,
+    },
     SchemaObject {
         kind: "table",
         name: "v3_legacy_activity",
@@ -122,7 +168,7 @@ const V3_OBJECTS: [SchemaObject; 12] = [
         kind: "table",
         name: "v3_projects",
         sql: r#"CREATE TABLE v3_projects (
-    project_id TEXT NOT NULL PRIMARY KEY,
+    project_id TEXT NOT NULL PRIMARY KEY REFERENCES v3_catalog(project_id),
     name TEXT NOT NULL,
     frozen_json TEXT NOT NULL,
     origin_json TEXT NOT NULL,
@@ -135,7 +181,7 @@ const V3_OBJECTS: [SchemaObject; 12] = [
         kind: "table",
         name: "v3_pages",
         sql: r#"CREATE TABLE v3_pages (
-    project_id TEXT NOT NULL REFERENCES v3_projects(project_id),
+    project_id TEXT NOT NULL REFERENCES v3_catalog(project_id),
     slide_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     spec_json TEXT NOT NULL,
@@ -230,7 +276,7 @@ const V3_OBJECTS: [SchemaObject; 12] = [
         name: "v3_import_receipts",
         sql: r#"CREATE TABLE v3_import_receipts (
     import_id TEXT NOT NULL PRIMARY KEY,
-    project_id TEXT NOT NULL UNIQUE REFERENCES v3_projects(project_id),
+    project_id TEXT NOT NULL UNIQUE REFERENCES v3_catalog(project_id),
     origin_digest TEXT NOT NULL,
     receipt_json TEXT NOT NULL
 )"#,
@@ -240,7 +286,7 @@ const V3_OBJECTS: [SchemaObject; 12] = [
         name: "v3_delivery_snapshots",
         sql: r#"CREATE TABLE v3_delivery_snapshots (
     snapshot_id TEXT NOT NULL PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES v3_projects(project_id),
+    project_id TEXT NOT NULL REFERENCES v3_catalog(project_id),
     revision INTEGER NOT NULL CHECK (revision >= 1),
     snapshot_json TEXT NOT NULL,
     UNIQUE (project_id, revision)
@@ -251,7 +297,7 @@ const V3_OBJECTS: [SchemaObject; 12] = [
         name: "v3_artifacts",
         sql: r#"CREATE TABLE v3_artifacts (
     artifact_id TEXT NOT NULL PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES v3_projects(project_id),
+    project_id TEXT NOT NULL REFERENCES v3_catalog(project_id),
     version_id TEXT REFERENCES v3_versions(version_id),
     relative_path TEXT NOT NULL UNIQUE,
     sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
@@ -271,7 +317,7 @@ impl DatabaseProfile {
     fn identity(self) -> (i64, i64) {
         match self {
             Self::QueueOnly => (0x44545133, 2),
-            Self::PresalesV3 => (0x44545633, 1),
+            Self::PresalesV3 => (0x44545633, 2),
         }
     }
 
@@ -293,10 +339,20 @@ pub(crate) fn initialize(
     let user_version = pragma_i64(&connection, "user_version")?;
     let objects = user_schema_objects(&connection)?;
     let unowned_empty = application_id == 0 && user_version == 0 && objects.is_empty();
-    if !unowned_empty && (application_id != expected_id || user_version != expected_version) {
+    let upgrade = matches!(profile, DatabaseProfile::PresalesV3)
+        && application_id == 0x44545633
+        && user_version == 1;
+    if upgrade {
+        v3_schema_upgrade::verify_v1(&objects)?;
+        v3_schema_upgrade::upgrade(&mut connection)?;
+    }
+    if !unowned_empty
+        && !upgrade
+        && (application_id != expected_id || user_version != expected_version)
+    {
         return Err("database is not a compatible durable queue/profile owner".into());
     }
-    if !unowned_empty {
+    if !unowned_empty && !upgrade {
         verify_schema(&objects, profile)?;
     }
     connection

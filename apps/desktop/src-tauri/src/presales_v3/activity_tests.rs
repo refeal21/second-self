@@ -6,6 +6,44 @@ use std::path::PathBuf;
 fn tracker() -> LegacyActivityTracker {
     LegacyActivityTracker::new(V3Store::open_in_memory().unwrap()).unwrap()
 }
+
+#[test]
+fn unresolved_native_activity_remains_copy_blocking_across_exact_v3_upgrade() {
+    #[path = "../../tests/support/v3_temp.rs"]
+    mod temp;
+    #[path = "../../tests/support/v3_v1_fixture.rs"]
+    mod v1;
+    let directory = temp::tempdir().unwrap();
+    let current = directory.path().join("current.sqlite3");
+    let old = directory.path().join("v1.sqlite3");
+    let tracker = LegacyActivityTracker::new(V3Store::open(&current).unwrap()).unwrap();
+    let process = tracker.process_key(Transport::Codex, 1);
+    send(
+        &tracker,
+        &process,
+        json!({"id":1,"method":"future/unknown/write","params":{}}),
+    );
+    assert!(tracker.try_source_guard(&source("a")).is_err());
+    drop(tracker);
+    v1::copy_existing_rows_into_v1(&current, &old);
+    let db = rusqlite::Connection::open(&old).unwrap();
+    let before: String = db
+        .query_row("SELECT evidence_json FROM v3_legacy_activity", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    drop(db);
+    let upgraded = V3Store::open(&old).unwrap();
+    let after: String = upgraded
+        .connection
+        .query_row("SELECT evidence_json FROM v3_legacy_activity", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(before, after);
+    let reopened = LegacyActivityTracker::new(upgraded).unwrap();
+    assert!(reopened.try_source_guard(&source("a")).is_err());
+}
 fn source(id: &str) -> NativeSource {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let root = ROOT.get_or_init(|| {

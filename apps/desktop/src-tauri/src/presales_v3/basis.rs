@@ -353,6 +353,30 @@ pub(super) mod tests {
             .is_err());
         assert_eq!(store.load_project("frozen-project").unwrap(), loaded);
         assert_eq!(store.list_projects().unwrap(), vec![loaded.summary]);
+        assert_eq!(
+            store.list_project_catalog().unwrap()[0].kind,
+            V3CatalogKind::Frozen
+        );
+    }
+
+    #[test]
+    fn frozen_reader_rejects_changed_catalog_kind_revision_or_mixed_storage() {
+        for change in [
+            "UPDATE v3_catalog SET kind='history_only'",
+            "UPDATE v3_catalog SET revision=2",
+            "INSERT INTO v3_draft_projects VALUES ('frozen-project','{}')",
+        ] {
+            let (checkpoint, palette) = frozen_fixture();
+            let mut store = V3Store::open_in_memory().unwrap();
+            store
+                .insert_project(
+                    ValidatedV3ProjectSeed::from_checkpoint(checkpoint, palette).unwrap(),
+                )
+                .unwrap();
+            store.connection.execute(change, []).unwrap();
+            assert!(store.load_project("frozen-project").is_err(), "{change}");
+            assert!(store.list_project_catalog().is_err(), "{change}");
+        }
     }
 
     #[test]

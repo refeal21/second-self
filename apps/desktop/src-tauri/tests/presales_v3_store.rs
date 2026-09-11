@@ -84,7 +84,7 @@ fn v3_rejects_queue_only_database_before_mutation() {
 fn foreign_identity_schema_and_version_fail_closed_before_mutation() {
     for alteration in [
         "PRAGMA application_id = 1234",
-        "PRAGMA user_version = 2",
+        "PRAGMA user_version = 999",
         "CREATE TABLE extra_table (id TEXT)",
         "CREATE TRIGGER extra_trigger AFTER INSERT ON v3_projects BEGIN SELECT 1; END",
         "DROP TABLE v3_feedback; CREATE TABLE v3_feedback (id TEXT)",
@@ -117,6 +117,8 @@ fn feedback_drafts_are_keyed_by_their_base_version() {
     drop(V3Store::open(&path).unwrap());
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "foreign_keys", "ON").unwrap();
+    raw.execute("INSERT INTO v3_catalog VALUES ('project','frozen',1)", [])
+        .unwrap();
     raw.execute(
         "INSERT INTO v3_projects VALUES ('project', 'name', '{}', '{}', '{}', 'now', 1)",
         [],
@@ -137,6 +139,8 @@ fn distinct_import_copies_can_preserve_the_same_origin_digest() {
     let raw = Connection::open(&path).unwrap();
     raw.pragma_update(None, "foreign_keys", "ON").unwrap();
     for project in ["copy-a", "copy-b"] {
+        raw.execute("INSERT INTO v3_catalog VALUES (?1,'frozen',1)", [project])
+            .unwrap();
         raw.execute(
             "INSERT INTO v3_projects VALUES (?1, 'name', '{}', '{}', '{}', 'now', 1)",
             [project],

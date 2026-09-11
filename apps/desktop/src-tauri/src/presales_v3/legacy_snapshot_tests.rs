@@ -28,6 +28,194 @@ pub(super) fn fixture(root: &Path, wal: bool) -> Connection {
 }
 
 #[test]
+fn captured_selected_rows_preserve_raw_json_and_exclude_other_project_bytes() {
+    let root = temp::tempdir().unwrap();
+    let staging = temp::tempdir().unwrap();
+    let db = fixture(root.path(), true);
+    db.execute_batch("CREATE TABLE visual_generation_records(id TEXT, project_id TEXT, record_json TEXT);
+        CREATE TABLE visual_style_versions(project_id TEXT, revision INTEGER, profile_json TEXT, created_at TEXT);
+        CREATE TABLE visual_style_locks(project_id TEXT, created_at TEXT);
+        INSERT INTO visual_generation_records VALUES ('ours','source',' { \"raw\" : true } ');
+        INSERT INTO visual_generation_records VALUES ('theirs','other','UNRELATED_PRIVATE_SENTINEL');").unwrap();
+    db.execute("INSERT INTO projects VALUES ('other',?1)",[json!({"schemaVersion":1,"revision":1,"project":{"id":"other","name":"UNRELATED_PROJECT_SENTINEL"}}).to_string()]).unwrap();
+    let originals = ["legacy.sqlite3", "legacy.sqlite3-wal", "legacy.sqlite3-shm"]
+        .map(|n| fs::read(root.path().join(n)).unwrap());
+    let snapshot = CapturedLegacySnapshot::capture(
+        root.path(),
+        Path::new("legacy.sqlite3"),
+        "source",
+        staging.path(),
+    )
+    .unwrap();
+    let encoded = serde_json::to_string(snapshot.selected_rows()).unwrap();
+    assert!(encoded.contains(" { \\\"raw\\\" : true } "));
+    assert!(!encoded.contains("UNRELATED_PRIVATE_SENTINEL"));
+    assert!(!encoded.contains("UNRELATED_PROJECT_SENTINEL"));
+    let bound = serde_json::to_value(snapshot.selected_envelope()).unwrap();
+    assert_eq!(bound["evidence"]["sourceProjectId"], "source");
+    assert_eq!(bound["evidence"]["sourceRevision"], 1);
+    assert_eq!(
+        bound["evidence"]["sourceSnapshotSha256"],
+        snapshot.snapshot_sha256()
+    );
+    assert_eq!(
+        bound["evidence"]["rawPipelineSha256"],
+        format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(snapshot.pipeline_json().as_bytes())
+        )
+    );
+    assert_ne!(
+        bound["evidence"]["rawPipelineSha256"],
+        bound["evidence"]["sourceSnapshotSha256"]
+    );
+    for (name, bytes) in ["legacy.sqlite3", "legacy.sqlite3-wal", "legacy.sqlite3-shm"]
+        .into_iter()
+        .zip(originals)
+    {
+        assert_eq!(fs::read(root.path().join(name)).unwrap(), bytes);
+    }
+    db.execute(
+        "UPDATE visual_generation_records SET record_json='changed' WHERE id='ours'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_string(snapshot.selected_rows()).unwrap(),
+        encoded
+    );
+    assert!(snapshot.recheck().is_err());
+}
+
+#[test]
+fn selected_paired_pipeline_style_and_receipt_cells_are_preserved_verbatim() {
+    // Paired-valid native evidence is sufficient for capture testing; this is
+    // deliberately not asserted to be full Worker replay/import authority.
+    let (checkpoint, palette) = crate::presales_v3::basis::tests::frozen_fixture_pages(1);
+    let root = temp::tempdir().unwrap();
+    let staging = temp::tempdir().unwrap();
+    let db = Connection::open(root.path().join("paired.sqlite3")).unwrap();
+    db.execute_batch("CREATE TABLE projects(id TEXT PRIMARY KEY,pipeline_json TEXT);
+        CREATE TABLE visual_style_versions(project_id TEXT,revision INTEGER,profile_json TEXT,created_at TEXT);
+        CREATE TABLE visual_style_locks(project_id TEXT,created_at TEXT);
+        CREATE TABLE visual_generation_records(id TEXT,project_id TEXT,record_json TEXT);
+        PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+    crate::presales::storage::initialize_schema(&db).unwrap();
+    let pipeline = serde_json::to_string_pretty(&checkpoint.pipeline).unwrap();
+    let companion = serde_json::to_string_pretty(checkpoint.presales.as_ref().unwrap()).unwrap();
+    let profile = serde_json::to_string_pretty(palette.profile.as_ref().unwrap()).unwrap();
+    let raw_record = " { \"record\" : \"synthetic raw receipt cell\" } ";
+    db.execute(
+        "INSERT INTO projects VALUES ('frozen-project',?1)",
+        [&pipeline],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO projects VALUES ('other','UNRELATED_PIPELINE_BYTES')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO presales_projects VALUES ('frozen-project')",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO presales_projects VALUES ('other')", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO presales_checkpoints VALUES ('frozen-project',6,?1)",
+        [&companion],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO presales_checkpoints VALUES ('other',6,'UNRELATED_COMPANION_BYTES')",
+        [],
+    )
+    .unwrap();
+    let bindings = &checkpoint.presales.as_ref().unwrap().approval_bindings;
+    for (i, binding) in bindings.iter().enumerate() {
+        db.execute(
+            "INSERT INTO presales_approval_bindings VALUES (?1,'frozen-project',?2,6,?3)",
+            params![
+                binding.approval_id,
+                i as i64 + 1,
+                serde_json::to_string_pretty(binding).unwrap()
+            ],
+        )
+        .unwrap();
+    }
+    db.execute(
+        "INSERT INTO visual_style_versions VALUES ('frozen-project',2,?1,'synthetic')",
+        [&profile],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO visual_style_versions VALUES ('other',2,'UNRELATED_STYLE_BYTES','synthetic')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO visual_generation_records VALUES ('record','frozen-project',?1)",
+        [raw_record],
+    )
+    .unwrap();
+    db.execute("INSERT INTO visual_generation_records VALUES ('other-record','other','UNRELATED_RECORD_BYTES')",[]).unwrap();
+    let before = ["paired.sqlite3", "paired.sqlite3-wal", "paired.sqlite3-shm"]
+        .map(|name| fs::read(root.path().join(name)).unwrap());
+    let captured = CapturedLegacySnapshot::capture(
+        root.path(),
+        Path::new("paired.sqlite3"),
+        "frozen-project",
+        staging.path(),
+    )
+    .unwrap();
+    assert_eq!(captured.pipeline_json(), pipeline);
+    let selected = captured.selected_rows();
+    assert_eq!(selected["projects"].rows[0][1], pipeline);
+    assert_eq!(selected["presales_checkpoints"].rows[0][2], companion);
+    assert_eq!(selected["visual_style_versions"].rows[0][2], profile);
+    assert_eq!(selected["visual_generation_records"].rows[0][2], raw_record);
+    assert_eq!(selected["presales_approval_bindings"].rows.len(), 2);
+    assert!(!serde_json::to_string(captured.selected_envelope())
+        .unwrap()
+        .contains("UNRELATED_"));
+    for (name, bytes) in ["paired.sqlite3", "paired.sqlite3-wal", "paired.sqlite3-shm"]
+        .into_iter()
+        .zip(before)
+    {
+        assert_eq!(fs::read(root.path().join(name)).unwrap(), bytes);
+    }
+    captured.recheck().unwrap();
+}
+
+#[test]
+fn unsupported_selected_sql_cell_types_fail_without_touching_source_bytes() {
+    let root = temp::tempdir().unwrap();
+    let staging = temp::tempdir().unwrap();
+    let db = fixture(root.path(), true);
+    db.execute_batch(
+        "CREATE TABLE visual_generation_records(id TEXT,project_id TEXT,record_json TEXT);
+        INSERT INTO visual_generation_records VALUES ('bad','source',x'fffe');",
+    )
+    .unwrap();
+    let before = ["legacy.sqlite3", "legacy.sqlite3-wal", "legacy.sqlite3-shm"]
+        .map(|name| fs::read(root.path().join(name)).unwrap());
+    assert!(CapturedLegacySnapshot::capture(
+        root.path(),
+        Path::new("legacy.sqlite3"),
+        "source",
+        staging.path()
+    )
+    .is_err());
+    for (name, bytes) in ["legacy.sqlite3", "legacy.sqlite3-wal", "legacy.sqlite3-shm"]
+        .into_iter()
+        .zip(before)
+    {
+        assert_eq!(fs::read(root.path().join(name)).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn private_snapshot_recovers_live_wal_without_touching_any_source_file() {
     let root = temp::tempdir().unwrap();
     let staging = temp::tempdir().unwrap();

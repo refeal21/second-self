@@ -36,6 +36,7 @@ pub(crate) struct CapturedLegacySnapshot {
     snapshot_sha256: String,
     original_main: Vec<u8>,
     original_wal: Option<Vec<u8>>,
+    selected_envelope: super::legacy_envelope::SelectedEnvelope,
 }
 
 impl CapturedLegacySnapshot {
@@ -88,7 +89,8 @@ impl CapturedLegacySnapshot {
                     files.1.as_ref().map(|w| w.bytes.as_slice()),
                     DATABASE_FILE_LIMIT,
                 )?;
-                let (pipeline_json, checkpoint) = read_memory_checkpoint(&image, project_id)?;
+                let (pipeline_json, checkpoint, selected_rows) =
+                    read_memory_checkpoint(&image, project_id)?;
                 check_source(&root, relative, &evidence)?;
                 let revision = checkpoint.pipeline["revision"]
                     .as_i64()
@@ -107,6 +109,14 @@ impl CapturedLegacySnapshot {
                 // File evidence binds every row and raw original DB/WAL byte.
                 let digest =
                     serde_json::to_vec(&(1, project_id, revision, &evidence)).map_err(message)?;
+                let snapshot_sha256 = format!("{:x}", Sha256::digest(digest));
+                let selected_envelope = super::legacy_envelope::SelectedEnvelope::bind(
+                    project_id,
+                    revision,
+                    &snapshot_sha256,
+                    &pipeline_json,
+                    selected_rows,
+                )?;
                 Ok(Self {
                     source_root: root.clone(),
                     database_relative: relative.into(),
@@ -115,9 +125,10 @@ impl CapturedLegacySnapshot {
                     pipeline_json,
                     checkpoint,
                     evidence,
-                    snapshot_sha256: format!("{:x}", Sha256::digest(digest)),
+                    snapshot_sha256,
                     original_main: files.0.bytes,
                     original_wal: files.1.map(|w| w.bytes),
+                    selected_envelope,
                 })
             })();
             match result {
@@ -153,9 +164,14 @@ impl CapturedLegacySnapshot {
     pub(crate) fn snapshot_sha256(&self) -> &str {
         &self.snapshot_sha256
     }
-    /// Original bounded database/WAL bytes, retained before private SQLite recovery.
-    /// Later native envelope extraction can preserve exact companion/style rows
-    /// without reopening the source or trusting reserialized caller evidence.
+    pub(super) fn selected_rows(&self) -> &super::legacy_envelope::SelectedRows {
+        self.selected_envelope.rows()
+    }
+    pub(super) fn selected_envelope(&self) -> &super::legacy_envelope::SelectedEnvelope {
+        &self.selected_envelope
+    }
+    /// Original bounded database/WAL bytes remain private capture/recheck data.
+    /// Never persist these shared database bytes in a selected-project envelope.
     pub(crate) fn raw_database_bytes(&self) -> (&[u8], Option<&[u8]>) {
         (&self.original_main, self.original_wal.as_deref())
     }
@@ -200,7 +216,14 @@ fn check_source(
 fn read_memory_checkpoint(
     image: &[u8],
     project_id: &str,
-) -> Result<(String, ProjectCheckpoint), String> {
+) -> Result<
+    (
+        String,
+        ProjectCheckpoint,
+        super::legacy_envelope::SelectedRows,
+    ),
+    String,
+> {
     let connection = open_read_image(image)?;
     connection
         .busy_timeout(std::time::Duration::from_millis(50))
@@ -264,8 +287,9 @@ fn read_memory_checkpoint(
         }
         crate::presales::storage::load_on(&transaction, project_id).map_err(message)?
     };
+    let selected_rows = super::legacy_envelope::extract(&transaction, project_id)?;
     transaction.commit().map_err(message)?;
-    Ok((raw, checkpoint))
+    Ok((raw, checkpoint, selected_rows))
 }
 
 fn open_read_image(image: &[u8]) -> Result<Connection, String> {
@@ -281,7 +305,7 @@ fn open_read_image(image: &[u8]) -> Result<Connection, String> {
         .map_err(message)?;
     Ok(connection)
 }
-fn table_exists(connection: &Connection, name: &str) -> Result<bool, String> {
+pub(super) fn table_exists(connection: &Connection, name: &str) -> Result<bool, String> {
     let kind: Option<String> = connection
         .query_row(
             "SELECT type FROM sqlite_schema WHERE name=?1",

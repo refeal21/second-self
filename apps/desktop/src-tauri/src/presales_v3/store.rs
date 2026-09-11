@@ -31,6 +31,11 @@ impl V3Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(message)?;
+        tx.execute(
+            "INSERT INTO v3_catalog(project_id,kind,revision) VALUES (?1,'frozen',?2)",
+            params![snapshot.summary.project_id, snapshot.summary.revision],
+        )
+        .map_err(message)?;
         tx.execute("INSERT INTO v3_projects (project_id, name, frozen_json, origin_json, palette_json, created_at, revision)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![snapshot.summary.project_id, snapshot.summary.name,
@@ -47,10 +52,18 @@ impl V3Store {
     }
 
     pub fn list_projects(&self) -> Result<Vec<V3ProjectSummary>, String> {
+        Ok(self
+            .list_project_catalog()?
+            .into_iter()
+            .map(|entry| entry.summary)
+            .collect())
+    }
+
+    pub fn list_project_catalog(&self) -> Result<Vec<V3CatalogEntry>, String> {
         let tx = self.connection.unchecked_transaction().map_err(message)?;
         let ids = {
             let mut stmt = tx
-                .prepare("SELECT project_id FROM v3_projects ORDER BY created_at, project_id")
+                .prepare("SELECT c.project_id FROM v3_catalog c LEFT JOIN v3_projects p ON p.project_id=c.project_id ORDER BY p.created_at, c.project_id")
                 .map_err(message)?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
@@ -61,7 +74,12 @@ impl V3Store {
         };
         let projects = ids
             .iter()
-            .map(|id| load_on(&tx, id).map(|snapshot| snapshot.summary))
+            .map(|id| {
+                load_on(&tx, id).map(|snapshot| V3CatalogEntry {
+                    kind: V3CatalogKind::Frozen,
+                    summary: snapshot.summary,
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         tx.commit().map_err(message)?;
         Ok(projects)
@@ -76,6 +94,30 @@ impl V3Store {
 }
 
 pub(super) fn load_on(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<V3ProjectSnapshot, String> {
+    let (kind, revision): (String, i64) = connection
+        .query_row(
+            "SELECT kind,revision FROM v3_catalog WHERE project_id=?1",
+            [project_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(message)?;
+    if kind != "frozen" {
+        return Err("project is not a frozen native catalog entry".into());
+    }
+    let mixed: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM v3_draft_projects WHERE project_id=?1) OR EXISTS(SELECT 1 FROM v3_history_projects WHERE project_id=?1)",[project_id],|r|r.get(0)).map_err(message)?;
+    let snapshot = load_native_on(connection, project_id)?;
+    if mixed || snapshot.summary.revision != revision {
+        return Err("native catalog identity or revision mismatch".into());
+    }
+    Ok(snapshot)
+}
+
+/// Strict pre-import native evidence reader, also used only after exact v1
+/// schema ownership has been verified for the catalog upgrade.
+pub(super) fn load_native_on(
     connection: &Connection,
     project_id: &str,
 ) -> Result<V3ProjectSnapshot, String> {
@@ -214,6 +256,9 @@ pub(super) fn page_on<'a>(
 pub(super) fn bump_project(tx: &Connection, project_id: &str) -> Result<(), String> {
     if tx.execute("UPDATE v3_projects SET revision = revision + 1 WHERE project_id = ?1 AND revision < 9223372036854775807", [project_id]).map_err(message)? != 1 {
         return Err("project revision exhausted or project missing".into());
+    }
+    if tx.execute("UPDATE v3_catalog SET revision = revision + 1 WHERE project_id = ?1 AND revision < 9223372036854775807", [project_id]).map_err(message)? != 1 {
+        return Err("catalog revision exhausted or project missing".into());
     }
     Ok(())
 }

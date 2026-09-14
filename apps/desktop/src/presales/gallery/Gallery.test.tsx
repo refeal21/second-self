@@ -337,6 +337,19 @@ describe('Gallery', () => {
     rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'completed', requestId: 'attempted-b-request' } } : p) }} />);
     expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
   });
+  it('releases uncertain A when full native evidence includes failed A behind newer B without an A image', async () => {
+    const user = userEvent.setup();
+    const onGenerate = vi.fn(async () => ({ requestIds: {}, attemptedRequestIds: { b: 'request-A' } }));
+    const initial = props({ onGenerate }); const { rerender } = render(<Gallery {...initial} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.click(screen.getByRole('button', { name: '生成新稿' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(await screen.findByText('提交结果待确认，请核对任务列表；暂不重复提交。')).toBeVisible();
+    rerender(<Gallery {...initial} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'completed', requestId: 'request-B' }, observedRequestIds: ['unrelated', 'request-B'] } : p) }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    rerender(<Gallery {...initial} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'completed', requestId: 'request-B' }, observedRequestIds: ['request-A', 'request-B'] } : p) }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+  });
 
   it('reconciles accepted and missing pages of a partial batch independently by their exact request IDs', async () => {
     const user = userEvent.setup();

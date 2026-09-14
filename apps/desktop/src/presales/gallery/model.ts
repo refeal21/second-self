@@ -30,6 +30,8 @@ export interface GalleryPage {
   candidateVersionId: string | null;
   versions: GalleryVersion[];
   job: GalleryJob;
+  /** All exact native image-job IDs for this page, independent of the newest display job. */
+  observedRequestIds?: readonly string[];
   /** null permits an action; a string explains why the host forbids it. */
   eligibility: Record<GalleryAction, string | null>;
   /** Native page-scoped review fence, separate from immutable version sequence. */

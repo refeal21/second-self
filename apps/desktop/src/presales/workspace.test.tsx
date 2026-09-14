@@ -99,7 +99,10 @@ describe('native presales workspace', () => {
     queueState = { ...queueState, jobs: [{ kind: 'image', requestId: 'unrelated', projectId: 'route-uncertain-v3', slideId: 'b', status: 'succeeded', sequence: 9, error: null }] };
     await act(async () => { notify(); });
     expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
-    queueState = { ...queueState, jobs: [{ ...queueState.jobs[0]!, requestId: attemptedId }] };
+    queueState = { ...queueState, jobs: [
+      { ...queueState.jobs[0]!, requestId: attemptedId, status: 'failed', sequence: 9, error: 'failed before image publication' },
+      { ...queueState.jobs[0]!, requestId: 'later-B', status: 'succeeded', sequence: 10, error: null },
+    ] };
     await act(async () => { notify(); });
     await waitFor(() => expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled());
     expect(api.enqueue).toHaveBeenCalledTimes(1);

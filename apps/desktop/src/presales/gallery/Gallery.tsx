@@ -87,7 +87,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
     for (const [id, fence] of generationPendingRef.current) {
       if (fence.phase === 'submitting' || !fence.requestId) continue;
       const currentPage = current.pages.find(item => item.id === id);
-      if (currentPage && ((currentPage.job.state !== 'idle' && currentPage.job.requestId === fence.requestId) ||
+      if (currentPage && ((currentPage.job.state !== 'idle' && currentPage.job.requestId === fence.requestId) || currentPage.observedRequestIds?.includes(fence.requestId) ||
         currentPage.versions.some(item => item.requestId === fence.requestId))) {
         generationPendingRef.current.delete(id);
         changed = true;

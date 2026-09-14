@@ -39,4 +39,14 @@ describe('native v3 gallery join', () => {
     expect(model.pages[0]!.eligibility.generate).toContain('image input unavailable');
     expect(model.pages[1]!.eligibility.generate).toBeNull();
   });
+  it('retains exact request evidence for an older failed job hidden by a newer display job', () => {
+    const jobs = [
+      { kind: 'image' as const, requestId: 'request-A', projectId: 'v3', slideId: 'b', status: 'failed', sequence: 1, error: 'failed' },
+      { kind: 'image' as const, requestId: 'request-B', projectId: 'v3', slideId: 'b', status: 'succeeded', sequence: 2, error: null },
+    ];
+    const model = toGalleryModel({ ...snapshot, pages: [page('b', 1, [])] }, { ...queue, jobs });
+    expect(model.pages[0]!.job.requestId).toBe('request-B');
+    expect(model.pages[0]!.observedRequestIds).toEqual(['request-A', 'request-B']);
+    expect(model.pages[0]!.versions).toEqual([]);
+  });
 });

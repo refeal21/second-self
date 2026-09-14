@@ -44,6 +44,7 @@ export function toGalleryModel(snapshot: Pick<V3ProjectSnapshot, 'summary' | 'pa
         cancelReason: ['outcome_unknown', 'cancel_requested'].includes(job.status) ? '取消或结果尚未确认，仍占用队列槽位' : null,
         retryReason: job.status === 'failed' ? '失败任务需要明确创建新请求；本按钮不自动重试' : null,
       },
+      observedRequestIds: queue.jobs.filter(item => item.kind === 'image' && item.projectId === snapshot.summary.projectId && item.slideId === page.slideId).map(item => item.requestId),
       eligibility: {
         generate: historyReason ?? basisReason ?? activeReason ?? generationReason ?? (page.references.length ? editingReason : null),
         edit: historyReason ?? basisReason ?? activeReason ?? editingReason ?? (!current?.image ? '请选择有图片的父版本' : null),

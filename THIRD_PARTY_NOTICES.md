@@ -11,6 +11,7 @@ The application links, bundles, or uses the following principal third-party comp
 | React / React DOM | Desktop WebView UI | MIT |
 | PptxGenJS | Editable PPTX generation | MIT |
 | pngjs | Deterministic PNG fixtures and image checks | MIT |
+| png 0.18.1 (Rust) | Bounded native PNG decoding and checksum validation | MIT OR Apache-2.0; used under MIT |
 | JSZip | Local OOXML template and test inspection | MIT OR GPL-3.0-or-later; used under MIT |
 | fast-xml-parser 5.11.1 | Bounded local PPTX palette XML inspection | MIT |
 | SQLite / rusqlite | Local state store | SQLite public-domain dedication; rusqlite MIT |
@@ -35,8 +36,9 @@ Upstream license texts:
 
 ## MIT license text
 
-The XML inspection dependency and its bundled MIT-licensed dependency distributions carry these notices (the MIT permission and disclaimer below apply to each):
+The native PNG decoder, XML inspection dependency and its bundled MIT-licensed dependency distributions carry these notices (the MIT permission and disclaimer below apply to each):
 
+- png 0.18.1 (Rust): Copyright (c) 2015 nwin.
 - fast-xml-parser 5.11.1: Copyright (c) 2017 Amit Kumar Gupta.
 - fast-xml-builder 1.3.1, is-unsafe 2.0.2, xml-naming 0.3.0: Copyright (c) 2026 Natural Intelligence.
 - strnum 2.4.2: Copyright (c) 2021 Natural Intelligence.

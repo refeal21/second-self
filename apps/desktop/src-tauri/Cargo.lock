@@ -737,9 +737,14 @@ name = "digital-twin-desktop"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "block2",
  "chrono",
  "glob",
  "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "png 0.18.1",
  "rusqlite",
  "serde",
  "serde_json",
@@ -749,6 +754,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-shell",
  "tauri-utils",
+ "uuid",
 ]
 
 [[package]]
@@ -2357,6 +2363,7 @@ checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.1",
  "block2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
 ]

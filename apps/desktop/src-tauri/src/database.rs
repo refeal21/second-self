@@ -1,7 +1,9 @@
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+
+use crate::presales::{PresalesDraftPair, ProjectCheckpoint};
 
 pub struct Database {
     pub(crate) connection: Connection,
@@ -111,6 +113,12 @@ pub struct PersistedArtifact {
     pub path: String,
     pub kind: String,
     pub created_at: String,
+}
+
+enum ReplaceOutcome {
+    MissingProject,
+    Stale,
+    Committed(ProjectCheckpoint),
 }
 
 impl Database {
@@ -234,7 +242,9 @@ impl Database {
     }
 
     pub fn rename_project(&self, id: &str, name: &str, updated_at: &str) -> Result<bool> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        crate::presales::storage::guard_bare(&transaction, id)?;
         let encoded: Option<String> = transaction
             .query_row(
                 "SELECT pipeline_json FROM projects WHERE id = ?1",
@@ -274,7 +284,9 @@ impl Database {
         }
         let slides_json = serde_json::to_string(&mutation.slide_statuses)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        crate::presales::storage::guard_bare(&transaction, id)?;
         if let Some(project) = self.get_project(id)? {
             let style = crate::visual_style::load_style(&transaction, &project)
                 .map_err(|e| invalid_parameter(&e))?;
@@ -420,7 +432,65 @@ impl Database {
         visual: crate::visual_style::VisualCommitContext<'_>,
         commit_artifacts: impl FnOnce() -> std::result::Result<(), String>,
     ) -> Result<bool> {
+        match self.replace_checkpoint_internal(
+            project_id,
+            expected_revision,
+            pipeline,
+            None,
+            artifacts,
+            visual,
+            commit_artifacts,
+        )? {
+            ReplaceOutcome::MissingProject => Ok(false),
+            ReplaceOutcome::Stale => Err(invalid_parameter("stale pipeline revision")),
+            ReplaceOutcome::Committed(_) => Ok(true),
+        }
+    }
+
+    pub fn replace_checkpoint_with_artifacts(
+        &self,
+        project_id: &str,
+        expected_revision: i64,
+        pipeline: &serde_json::Value,
+        presales: &PresalesDraftPair,
+        artifacts: &[PersistedArtifact],
+        visual: crate::visual_style::VisualCommitContext<'_>,
+        commit_artifacts: impl FnOnce() -> std::result::Result<(), String>,
+    ) -> Result<Option<ProjectCheckpoint>> {
+        match self.replace_checkpoint_internal(
+            project_id,
+            expected_revision,
+            pipeline,
+            Some(presales),
+            artifacts,
+            visual,
+            commit_artifacts,
+        )? {
+            ReplaceOutcome::MissingProject => Err(invalid_parameter("Unknown project")),
+            ReplaceOutcome::Stale => Ok(None),
+            ReplaceOutcome::Committed(checkpoint) => Ok(Some(checkpoint)),
+        }
+    }
+
+    pub fn load_project_checkpoint(&self, project_id: &str) -> Result<ProjectCheckpoint> {
         let transaction = self.connection.unchecked_transaction()?;
+        let checkpoint = crate::presales::storage::load_on(&transaction, project_id)?;
+        transaction.commit()?;
+        Ok(checkpoint)
+    }
+
+    fn replace_checkpoint_internal(
+        &self,
+        project_id: &str,
+        expected_revision: i64,
+        pipeline: &serde_json::Value,
+        presales: Option<&PresalesDraftPair>,
+        artifacts: &[PersistedArtifact],
+        visual: crate::visual_style::VisualCommitContext<'_>,
+        commit_artifacts: impl FnOnce() -> std::result::Result<(), String>,
+    ) -> Result<ReplaceOutcome> {
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let revision = json_i64(pipeline, "/revision")?;
         if revision != expected_revision + 1 {
             return Err(invalid_parameter(
@@ -430,8 +500,7 @@ impl Database {
         if json_str(pipeline, "/project/id")? != project_id {
             return Err(invalid_parameter("pipeline project id does not match"));
         }
-        let current: Option<String> = self
-            .connection
+        let current: Option<String> = transaction
             .query_row(
                 "SELECT pipeline_json FROM projects WHERE id = ?1",
                 params![project_id],
@@ -439,7 +508,7 @@ impl Database {
             )
             .optional()?;
         let Some(current) = current else {
-            return Ok(false);
+            return Ok(ReplaceOutcome::MissingProject);
         };
         let current: serde_json::Value = serde_json::from_str(&current).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -449,8 +518,17 @@ impl Database {
             )
         })?;
         if json_i64(&current, "/revision")? != expected_revision {
-            return Err(invalid_parameter("stale pipeline revision"));
+            return Ok(ReplaceOutcome::Stale);
         }
+
+        let was_presales = crate::presales::storage::enabled(&transaction, project_id)?;
+        let presales = crate::presales::storage::prepare(
+            &transaction,
+            project_id,
+            &current,
+            pipeline,
+            presales,
+        )?;
 
         let workflow_status = json_str(pipeline, "/project/workflowStatus")?;
         let updated_at = json_str(pipeline, "/project/updatedAt")?;
@@ -643,11 +721,37 @@ impl Database {
             }
         }
         for artifact in artifacts {
-            transaction.execute(
-                "INSERT OR REPLACE INTO artifacts (id, project_id, version_id, path, kind, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
-                params![artifact.id, project_id, artifact.version_id, artifact.path, artifact.kind, artifact.created_at],
-            )?;
+            let existing_owner: Option<String> = transaction
+                .query_row(
+                    "SELECT project_id FROM artifacts WHERE id=?1",
+                    [&artifact.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let protected_owner = match existing_owner.as_deref() {
+                Some(owner) => crate::presales::storage::enabled(&transaction, owner)?,
+                None => false,
+            };
+            if presales.is_some() || protected_owner {
+                transaction.execute(
+                    "INSERT INTO artifacts (id, project_id, version_id, path, kind, created_at)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![
+                        artifact.id,
+                        project_id,
+                        artifact.version_id,
+                        artifact.path,
+                        artifact.kind,
+                        artifact.created_at
+                    ],
+                )?;
+            } else {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO artifacts (id, project_id, version_id, path, kind, created_at)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![artifact.id, project_id, artifact.version_id, artifact.path, artifact.kind, artifact.created_at],
+                )?;
+            }
         }
         transaction.execute(
             "INSERT INTO checkpoints (project_id, sequence, workflow_status, selected_slide,
@@ -664,9 +768,21 @@ impl Database {
                 pipeline_json
             ],
         )?;
+        if let Some(checkpoint) = &presales {
+            crate::presales::storage::persist(
+                &transaction,
+                project_id,
+                revision,
+                checkpoint,
+                was_presales,
+            )?;
+        }
         commit_artifacts().map_err(|error| invalid_parameter(&error))?;
         transaction.commit()?;
-        Ok(true)
+        Ok(ReplaceOutcome::Committed(ProjectCheckpoint {
+            pipeline: pipeline.clone(),
+            presales,
+        }))
     }
 
     pub fn persistence_counts(&self, project_id: &str) -> Result<PersistenceCounts> {
@@ -686,7 +802,10 @@ impl Database {
     }
 
     pub fn insert_approval(&self, approval: &StoredApproval) -> Result<()> {
-        self.connection.execute(
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        crate::presales::storage::guard_bare(&transaction, &approval.project_id)?;
+        transaction.execute(
             "INSERT INTO approvals
              (id, project_id, version_id, stage, slide_id, status, title,
               detail, author, created_at, decided_at)
@@ -705,7 +824,7 @@ impl Database {
                 approval.decided_at
             ],
         )?;
-        Ok(())
+        transaction.commit()
     }
 
     pub fn list_pending_approvals(&self) -> Result<Vec<StoredApproval>> {
@@ -737,10 +856,21 @@ impl Database {
 
     pub fn decide_approval(&self, id: &str, status: &str, decided_at: &str) -> Result<bool> {
         validate_decision(status, "approval")?;
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let project_id: Option<String> = transaction
+            .query_row(
+                "SELECT project_id FROM approvals WHERE id=?1 AND status='pending'",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(project_id) = &project_id {
+            crate::presales::storage::guard_bare(&transaction, project_id)?;
+        }
         if status == "approved" {
-            let project_id: Option<String> = transaction.query_row("SELECT project_id FROM approvals WHERE id=?1 AND status='pending' AND stage='visual_review'", [id], |r| r.get(0)).optional()?;
-            if let Some(project_id) = project_id {
+            let visual_project_id: Option<String> = transaction.query_row("SELECT project_id FROM approvals WHERE id=?1 AND status='pending' AND stage='visual_review'", [id], |r| r.get(0)).optional()?;
+            if let Some(project_id) = visual_project_id {
                 if let Some(project) = self.get_project(&project_id)? {
                     let style = crate::visual_style::load_style(&transaction, &project)
                         .map_err(|e| invalid_parameter(&e))?;
@@ -843,6 +973,8 @@ impl Database {
             );
             ",
         )?;
+
+        crate::presales::storage::initialize_schema(&self.connection)?;
 
         for (table, column, definition) in [
             ("projects", "goal", "TEXT NOT NULL DEFAULT ''"),

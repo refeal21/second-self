@@ -1,0 +1,393 @@
+# Presales v3 Workbench Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Connect the existing durable queue, presales rules and verified PNG vault to a usable multi-page workbench with independent history, feedback, approval and delivery selection.
+
+**Architecture:** A new strictly owned v3 SQLite database contains both queue and project/page records so publication is one local transaction. The legacy database, sequential pipeline and original customer directories retain their existing behavior. Rust owns persistent authority; an asynchronous Worker executes bounded jobs; React reconciles snapshots and never owns generation lifetime.
+
+**Tech Stack:** Existing Tauri 2, React/TypeScript, Rust/rusqlite, TypeScript Worker and Codex App Server; no replacement stack or paid API.
+
+**Spec:** `docs/superpowers/specs/2026-09-09-presales-batch-visual-design.md` (approved 2026-09-10).
+
+## Global Constraints
+
+- Default global concurrency is 4; the supported user setting is 1–4. FIFO applies across projects. At most one unfinished generation exists per project/page.
+- AI outline/details authoring uses the same native concurrency, pause, FIFO and uncertain-outcome budget as image generation. It has a distinct typed whole-project operation, not a fabricated frozen image target; at most one unfinished authoring operation exists per draft project.
+- All pages remain independently viewable and reviewable while other pages generate. Manual revisions have no application-imposed count limit; automatic QA still has at most two repair rounds.
+- Existing v1/v2 projects, data, approvals and directories are not rewritten or silently upgraded. Creating a v3 copy requires an explicit in-product action; all development tests use synthetic fixtures.
+- Outline/content and their companion presales plan/design are saved and approved as exact pairs. Frozen on-screen content is the truth; speaker notes must not become slide text.
+- New generated candidates require exact content, design, skill and palette provenance. Do not fabricate missing legacy provenance or claim old approval is a new approval.
+- Files are immutable and durably verified before publication. Candidate, receipt, page selection, eligibility and queue success are committed in the same v3 SQLite transaction.
+- Uncertain or unconfirmed cancelled remote jobs retain their local slots until resolved or explicitly abandoned with a risk acknowledgement. Restart must not automatically resend them.
+- Selecting a historical image for inspection is not selecting it for delivery. Revision invalidates only the affected page's effective approval; old versions and decisions remain available.
+- Feedback drafts persist by project/page/base version. A same-page running job does not prevent saving the next draft but does prevent automatically sending another job.
+- A history-based image edit must actually transmit the parent image. Unsupported reference input must be explicitly capability-gated; text-only regeneration cannot be presented as an image edit.
+- No API Key configuration, paid API fallback, local HTTP server, personal Codex configuration changes, sound playback, app replacement or customer-project mutation during synthetic implementation/testing.
+- All implementation occurs in `.worktrees/presales-batch` on `codex/presales-batch-review`; preserve the original checkout. Commit only task-owned changes.
+
+## File and ownership map
+
+- `src-tauri/src/presales_queue/schema.rs`: shared exact queue DDL and strict closed database ownership profiles; not an arbitrary extra-table facility.
+- `src-tauri/src/presales_v3/{contracts,store,basis}.rs`: v3 transport/read model, database ownership, catalog and validated frozen basis.
+- `src-tauri/src/presales_v3/{events,publication,feedback}.rs`: narrow page events, atomic verified publication, version-bound drafts and approval.
+- `src-tauri/src/presales_v3/{import,service}.rs`: explicit copy preparation, immutable assets and workbench-facing authority.
+- `src-tauri/src/presales_v3/{commands,supervisor}.rs`: Tauri commands/events and application-owned dispatch/recovery.
+- `apps/worker/src/presales/{runtime,delivery}.ts`: asynchronous queue execution and frozen active-version export selection.
+- `apps/desktop/src/presales/{adapter,workspace,read-model}.ts[x]`: typed native adapter and multi-page review UI.
+- Targeted seams in existing App, Worker CLI/RPC, native service and process transport; do not rewrite the legacy workspace/pipeline to imitate independent pages.
+
+Paths prefixed `src-tauri/` above are under `apps/desktop/`. Keep responsibilities in focused files; subdividing a named module into private helpers is allowed when needed to avoid a monolith.
+
+### Task 1: Strict combined v3 store and frozen project catalog
+
+**Files:**
+- Create `apps/desktop/src-tauri/src/presales_queue/schema.rs`.
+- Create `apps/desktop/src-tauri/src/presales_v3/{mod,contracts,store,basis}.rs`.
+- Modify `apps/desktop/src-tauri/src/presales_queue/{mod,store}.rs`, `apps/desktop/src-tauri/src/presales/{mod,storage}.rs`, `apps/desktop/src-tauri/src/lib.rs` only for shared schema/basis seams and module registration.
+- Modify `apps/desktop/src-tauri/src/visual_style.rs` only to expose the existing `validate_profile` as crate-private for checked seed reuse; keep its behavior unchanged.
+- Test `apps/desktop/src-tauri/tests/presales_v3_store.rs` and existing queue/storage suites.
+
+**Interfaces:**
+- Consume `ProjectCheckpoint`, native paired validation, `native_value_hash`, `NATIVE_VALUE_HASH_ALGORITHM`, `QueueStore` and queue DDL.
+- Produce `V3Store::open(path)`, `V3Store::open_in_memory()`, `V3Store::load_project(&str) -> Result<V3ProjectSnapshot, String>` and `V3Store::list_projects() -> Result<Vec<V3ProjectSummary>, String>`.
+- Produce a crate-private `ValidatedV3ProjectSeed` (not `Deserialize`) and `V3Store::insert_project(ValidatedV3ProjectSeed)`. Construction must validate the complete paired native checkpoint, frozen outline/details, actual matching native approval bindings, current bundled skill and saved palette. A crate-private checked factory is not a public command accepting a trusted boolean.
+- Produce `V3VisualBasis { hash_algorithm, spec, design, skill, palette }` using `VersionHash`; structural values use `native-json-sha256-v1`, actual image bytes use SHA-256. Spec/design hashes are per-page values, their version IDs are the paired details version; palette version is the saved style revision. Preserve the whole paired frozen checkpoint and origin snapshot digest as evidence.
+- Produce strict camelCase/deny-unknown structs: `V3ProjectSummary`, `V3ProjectSnapshot`, `V3PageState`, `V3VisualVersion`, `V3Approval`, `V3FeedbackDraft`, `V3Origin` and tagged `V3VisualProvenance::Presales | LegacyImported`. Missing imported image/provenance stays explicitly absent.
+
+- [ ] **Step 1: Add focused red tests using real in-memory/file SQLite.** Cover empty/reopen, foreign/queue-only/v3-version/extra-table rejection before mutation, duplicate project rejection, frozen-pair tampering and deterministic per-page basis. Use existing paired fixtures; do not claim a hand-written status is approval.
+
+```rust
+#[test]
+fn queue_only_owner_cannot_open_v3_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v3.sqlite3");
+    drop(V3Store::open(&path).unwrap());
+    let before = std::fs::read(&path).unwrap();
+    assert!(QueueStore::open(&path).is_err());
+    assert_eq!(before, std::fs::read(&path).unwrap());
+}
+```
+
+- [ ] **Step 2: Run `cargo test --offline --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_v3_store`; record the missing implementation failure.**
+- [ ] **Step 3: Implement a closed v3 schema profile, application ID `0x44545633`, user version `1`.** Retain exact queue-only identity `0x44545133`/2 and its eight objects. Shared strict schema validation accepts only an internally declared ownership profile, never caller-provided additional SQL. V3 includes queue objects plus `v3_projects`, `v3_pages`, `v3_versions`, `v3_receipts`, `v3_approvals`, `v3_feedback`, `v3_import_receipts`, `v3_delivery_snapshots`, `v3_artifacts`. Use foreign keys and unique request/attempt/version sequence keys. Queue/settings access for subsequent tasks is crate-private; do not expose a mutable queue that bypasses page admission to the frontend.
+
+```rust
+// Closed profile selection, not caller-defined schema extension.
+enum DatabaseProfile { QueueOnly, PresalesV3 }
+// Opening validates existing identity + exact SQL before setting WAL pragmas.
+// Creating inserts the entire profile and its identity in one transaction.
+```
+
+- [ ] **Step 4: Run the new store, existing queue/lifecycle/result staging and paired storage tests; run fmt and diff checks.** Confirm old queue DB stays rejected by v3 and vice versa.
+- [ ] **Step 5: Commit `feat: add isolated v3 project catalog and database ownership`.** Write task report with schema/API decisions, RED/GREEN evidence and exact command results. This is a foundation, not user feature completion.
+
+### Task 2: Atomic admission, publication, history and approvals
+
+**Files:**
+- Create `apps/desktop/src-tauri/src/presales_v3/{events,publication,feedback}.rs`.
+- Create private v3 `prompt.rs` and a shared technical `apps/worker/src/presales/visual-prompt.contract.json`; extend the existing skill compiler to emit `skill.bundle.generated.json` for native consumption without modifying skill sources or their hash. Refactor only the presales branch of `apps/worker/src/visual-prompt.ts` to consume the same technical policy; keep legacy prompt behavior unchanged.
+- Modify v3 contracts/store plus crate-private transaction seams in `presales_queue/{store,lifecycle,result_staging}.rs`.
+- Test `apps/desktop/src-tauri/tests/presales_v3_events.rs`.
+
+**Interfaces:**
+- Consume Task 1 `V3Store`, validated saved per-page basis and existing `ResultVault`/`VerifiedPngResult`.
+- Produce store methods `enqueue_pages`, `commit_result`, `approve_version`, `save_feedback`, `adopt_version`, `restore_approval`, `create_delivery_snapshot` plus typed inputs/outputs in v3 contracts. `enqueue_pages` input includes project, batch/request/attempt IDs, page IDs, expected page revisions, optional parent version and feedback; derive the target/basis natively. `approve_version` includes exact version/image/basis, page revision and two true manual checks. No arbitrary pipeline replacement command.
+- Prompt admission uses one shared, explicitly versioned technical policy and the existing compiled visual skill. Native code derives visible content/design projections from the checked saved pair, excluding speaker notes and provenance-only text; the UI cannot supply an arbitrary prompt, claimed hashes or image paths. Parent/reference identities resolve from native immutable artifact evidence. Add a common synthetic golden input that independently checks Rust/TypeScript instruction sections and parsed payload parity. JSON object key ordering is not itself a semantic mismatch; the actual native final prompt is persisted verbatim in the queue target.
+- Add page-local revision/intent and complete history/draft projections as necessary within the undeployed v3 schema. A page draft CAS must not make an unrelated in-flight generation stale. Keep queue-only schema/behavior unchanged. Partial file-local helper subdivisions are allowed for admission, approval and delivery responsibilities; do not grow a single monolith.
+
+- [ ] **Step 1: Write red tests for three-page interleaved completion/approval, request replay, corrupt/missing vault file, same-page duplicate, changed basis, five revisions, draft keys, historical inspection versus adoption, cancellation/abandonment and delivery invalidation.**
+
+```rust
+// Given two queued pages A and B: publish B, approve B, then publish A.
+// Assert B's exact effective approval survives and both receipts exist.
+// Replaying A publication returns its original version ID and version count.
+// A byte-corrupted staged PNG cannot create any candidate or mark success.
+```
+
+- [ ] **Step 2: Run `cargo test --offline --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --test presales_v3_events`; capture RED.**
+- [ ] **Step 3: Implement admission and publication using short IMMEDIATE transactions.** Admission writes queue and page revision intent together and invalidates only that page's eligibility. Exact request replay is idempotent; another active request returns its identity without replacing feedback. Publication revalidates vault bytes, current epoch/attempt, target, revision intent, no durable cancel intent, immutable basis and current page; insert version+receipt, update active version/project revision and queue success together. Check receipt first for exact replay. A local commit failure retains verified files and ResultReady for save-only retry. A stale same-page event fails; unrelated-page project revisions do not replace the whole snapshot. At most three short local conflict retries, never another image call.
+
+```rust
+// Pseudocode defining the atomic boundary:
+// verified = vault.recover(binding)?;
+// tx = connection.transaction_with_behavior(Immediate)?;
+// return_exact_receipt_or_validate_live_attempt(&tx, &verified)?;
+// insert_immutable_version_and_receipt(&tx, &verified)?;
+// update_only_target_page_and_invalidate_delivery(&tx)?;
+// persist_queue_success_and_audit(&tx)?; tx.commit()?;
+```
+
+- [ ] **Step 4: Implement independent draft CAS and version-bound approval.** Preserve historical approval records; selecting for display is read-only. Adoption/restoration checks no unfinished affected request and all byte/basis evidence. Create immutable delivery maps only when each active version has exact effective approval; never `.at(-1)`.
+- [ ] **Step 5: Run events/store/queue/vault suites, fmt/diff checks; commit `feat: publish and review independent slide versions atomically`.**
+
+## Stage 3: Explicit validated legacy-copy and v3 service boundary
+
+The following four sequential, independently reviewed tasks replace the original single Task 3 dispatch. All Stage 3 interfaces and constraints below remain binding; no partial phase constitutes the usable copy feature.
+
+**Files:**
+- Create `apps/desktop/src-tauri/src/presales_v3/{import,service}.rs` and `apps/worker/src/presales/legacy-copy.ts`.
+- Add focused private v3 `draft.rs`, `legacy_snapshot.rs`, `validator_process.rs` helpers and explicit draft/history-only tables in the closed v3 schema; extend the catalog with tagged kinds instead of weakening the frozen seed. Reuse paired pure validation through narrow crate-private seams in `presales/storage.rs`.
+- Add a private v3 `activity.rs` tracker and only narrowly necessary legacy `tauri_worker.rs`/`tauri_codex.rs` send/receive/start/stop seams to establish source activity from native-owned correlated process evidence; preserve their wire protocol and ordinary behavior.
+- Modify `database.rs`, `workbench.rs`, `paths.rs`, Worker RPC only for read-only snapshot validation/copy bridge.
+- Test `tests/presales_v3_import.rs` and `apps/worker/src/presales/legacy-copy.test.ts`.
+
+**Interfaces:**
+- Consume Task 1 seed/catalog and Task 2 immutable version/event contracts.
+- Produce `prepare_legacy_copy`, `publish_legacy_copy`, `load_v3_project`, `list_project_catalog` through `V3WorkbenchService`; opaque prepared-copy ID binds source ID/revision/snapshot digest, mode and immutable copied artifact index. Modes are `format_copy` and `presales_content_revision`.
+- Worker `validateLegacyCopySnapshot(snapshot)` uses complete existing v1/v2 `validateNativePipelineCheckpoint`; returns a digest-bound result over exact supplied bytes, not a caller asserted validity flag.
+- Production full-replay evidence comes only from a dedicated native-owned offline validator child using the bundled Worker in a separate mode. Private correlated requests bind the actual child's generation and exact snapshot bytes to a non-deserializable validated token. Legacy WebView send/start/stop commands cannot inject into or replace that child. This transport becomes the v3 Worker host in Task 4.
+- Separate destination identity from verbatim source evidence using an immutable native import receipt. Format copies without a current genuine frozen presales pair are history-only for generation; proven legacy delivery approval can survive only through an explicit `originApprovalRef` plus complete image/content/palette evidence. Do not manufacture new approvals or skill hashes. Content-revision copies start in explicit v3 draft storage without inherited approvals; validated paired draft saves and genuine joint approvals promote to the frozen catalog atomically. Preserve the original import lineage through promotion.
+- Source snapshot acquisition must not open/migrate the original through writable legacy APIs. Capture bounded, descriptor-verified stable copies of the main database and any WAL into an owned temporary location, validate/recover only that private copy, and recheck source file identities/content plus source revision before publication. Retry boundedly or fail on activity/inconsistent snapshots; do not use immutable SQLite mode on a changing original or ignore a live WAL. Synthetic tests cover WAL and concurrent source changes.
+- Capture/publication use short native activity guards, not a frontend idle claim. Register outgoing operations before writes; resolve activity only from correlated child responses and actual terminal-turn evidence. Start acknowledgements or process exit do not prove remote work ended. Unclassified or unresolved remote work blocks conservatively and survives restart in v3-owned evidence when necessary. Do not keep a lease across user confirmation that locks legacy work indefinitely; later source changes instead invalidate the prepared copy. No original project records are repaired or rewritten to make a copy eligible.
+- Add explicit page-scoped reference-asset attachment through native validated file selection, immutable copied bytes and a saved intended use (such as the cockpit subject). References are not factual content authority. Bind reference set/usage to admission and provenance; reject changes during affected-page unfinished work and invalidate only that page's eligibility on an explicit reference change. No automatic read of previously mentioned customer image paths in development tests.
+
+- Stage 3 acceptance rejects active/unknown source work, tampered source after prepare, malformed replay, missing active image, unsafe paths and half-failed copy publication; compare original DB/artifact bytes before and after.
+
+```ts
+expect(() => validateLegacyCopySnapshot({ schemaVersion: 3 })).toThrow();
+// A syntactically valid v1/v2 snapshot with an impossible approval replay fails.
+// Successful copy receives a distinct ID; source bytes and approvals are unchanged.
+```
+
+- Stage 3 publication stages copies under a sibling v3 root, verifies sizes/hashes, saves original snapshot and lineage, then publishes catalog/index/import receipt in one v3 transaction after all required assets succeed. Missing history is visible missing metadata, never eligible. Format-only copy preserves only proven original approval via `originApprovalRef`; content revision carries sources/analysis to draft and requires new paired approvals. Existing legacy without real presales companion is not assigned invented design/skill hashes: view history and use the content-revision path for new presales generation.
+
+### Task 3a: Offline replay authority and immutable legacy snapshot
+
+**Files:** Create `apps/worker/src/presales/legacy-copy.ts`, its tests, native `presales_v3/{legacy_snapshot,validator_process}.rs` and focused native/process tests. Modify module registration and Worker CLI/RPC only to add a distinct offline validator mode. Narrow descriptor-read helper reuse in `paths.rs` is allowed; no legacy transport activity interception yet.
+
+**Interfaces and boundaries:**
+- `validateLegacyCopySnapshot` validates exact bounded pipeline bytes with the complete existing v1/v2 `validateNativePipelineCheckpoint` and returns a strict versioned SHA-256-bound result. Reject schema 3 and impossible replay; no runtime restore or provider calls.
+- A dedicated bundled Worker child is owned only by native code. Correlated requests bind process generation, request ID, exact byte digest, result schema and validation version. Successful response yields a private non-Deserialize replay token; no frontend result/digest/boolean establishes authority. Bound complete UTF-8 message assembly, pending bytes and timeouts; stale/wrong/oversized/invalid responses fail closed. Task 4 extends this same host.
+- Snapshot acquisition copies descriptor-verified regular main DB and any WAL into a uniquely owned private temporary directory. Enforce named tested bounds before allocation; reject symlinks/special files, changing identities/bytes and inconsistent captures. Validate/recover only private copies; never open/migrate the original SQLite connection, ignore a live WAL, or use immutable mode on a changing original. Return immutable source file evidence and a native recheck method for later publication.
+- Complete absence of optional legacy paired tables is distinguishable from corrupt partial evidence. This phase is private validation infrastructure, not a public import command and not proof source activity is idle. Task 3b supplies activity guards, Task 3c supplies publication authority.
+
+- [ ] **Step 1:** RED tests for full v1/v2 replay, exact byte binding, malformed/wrong/stale process response, split Chinese UTF-8, bounds, WAL-contained latest revision, symlinks, source changes and original bytes remaining unchanged.
+- [ ] **Step 2:** Run focused `legacy-copy.test.ts` and native snapshot/validator tests; record expected missing-implementation failures.
+- [ ] **Step 3:** Implement only these private interfaces, reuse existing validators and owned-directory cleanup patterns. Use synthetic real SQLite/files and an actual offline child process harness; no Codex/account/model process.
+- [ ] **Step 4:** Run covering tests plus Worker typecheck, Rust fmt and diff checks, self-review and commit `feat: validate immutable legacy snapshots offline`. Report exact exported seams, process executable resolution and RED/GREEN evidence.
+
+### Task 3b: Native legacy activity evidence and copy guards
+
+**Files:** Create `presales_v3/activity.rs` and focused tests; modify only necessary `tauri_worker.rs`, `tauri_codex.rs`, `tauri_workbench.rs`/native service hooks, process receiver/registration and closed v3-owned activity schema seams. No original database schema/content changes.
+
+**Interfaces and boundaries:** Native tracker registers outgoing work before process writes, consumes actual child responses and terminal notifications with exact correlation/generation, and provides short capture/publication guards. Start/turn acknowledgement is not terminal; process exit is not remote cancellation. Unresolved remote evidence survives restart in v3-owned records; unclassified potentially active requests block conservatively. UI cannot assert idle or clear unknown work. Preserve legacy wire protocol, account/config behavior and ordinary tasks. Prepared-copy review never holds a long lease; publication reacquires/rechecks and source changes invalidate preparation.
+
+- Explicitly exempt only known non-project account/login/init/capability reads; an idle created thread must not block forever. Handle terminal-before-start-ACK correlation. Record native coverage at new visual-request begin and uniquely bind observed project/prompt/turn evidence without persisting raw prompts or account data; historical unobserved imagegen records with missing receipts remain named unknown, while covered pre-dispatch capability failures or genuinely terminal turns need not poison later copies. Upload-only absence is local, not remote uncertainty.
+- Source mutation hooks must share the short copy guard: a local Worker response can precede the frontend's native pipeline/file save, so transport tracking alone cannot fence publication. Keep lock ordering explicit; never hold a lease awaiting an optional frontend save. Stable snapshot/rechecks from Task 3a remain required. Only existing observed adapter methods need precise successful recovery; unknown raw methods remain conservatively blocked instead of adding a broad protocol implementation.
+- Use bounded raw-chunk framing with distinct full-frame ceilings: 96 MiB for Codex image responses and 1 GiB for aggregate legacy Worker QA messages. These are new explicit aggregate limits, not a promise to accept formerly unbounded batches. Preflight outgoing size before activity registration/write, assemble complete UTF-8 without preallocating the ceiling or doubling past the bound, and expose named overflow/loss errors. Confirm actual owned-child termination before resolving pure-local Worker activity; remote Codex uncertainty remains distinct. Test realistic large successful replies and small injected overflow limits, not 1 GiB test allocations. Task 8 measures normal-project memory; maximum-input memory remains unclaimed.
+
+- [ ] **Step 1:** RED synthetic/process tests for active/unknown source rejection, genuinely evidenced idle, request-before-write registration, write failure certainty, terminal-vs-start ACK, process replacement/exit/restart, spoofed/stale response, and new work racing capture/publication.
+- [ ] **Step 2:** Implement a narrow reusable tracker and native transport integration; do not rewrite the legacy adapter or infer an unobserved remote cancellation. Named blocking reasons remain visible when proof is absent.
+- [ ] **Step 3:** Run tracker/legacy process regression tests including default and native-feature builds as relevant; commit `feat: guard legacy copies with native activity evidence`. Task 4 reuses the tracker rather than inventing another authority.
+
+### Stage 3c: Atomic explicit copy catalog and import service
+
+The following shared contract is implemented by sequential reviewed Tasks 3c1 and 3c2. Task 3c1 alone is not a usable copy feature; no Stage 3c requirement is dropped by this split.
+
+**Files:** Create `presales_v3/{import,service}.rs`, exact closed draft/history/import tables and contracts, tests `presales_v3_import.rs`; reuse Tasks 3a/3b and narrow pure paired/style validation seams. Extend existing v3 basis/store/history/review/publication/delivery only through explicit receipt-backed imported branches, preserving all native generated-version checks.
+
+**Interfaces and boundaries:** `V3WorkbenchService::{prepare_legacy_copy,publish_legacy_copy,load_v3_project,list_project_catalog}`. Prepare returns opaque native ID plus review summary, never a caller validity assertion. Modes are `format_copy` and `presales_content_revision`. Separate fresh destination identity from verbatim source evidence through immutable receipt binding IDs, exact snapshot digest, verified asset index and source revision. Recheck activity, raw source DB/WAL identity/bytes, selected revision and files before atomic publication. No source hardlinks or rewrites.
+
+- Introduce a real tagged `v3_catalog` identity root and separate draft/history evidence tables; `v3_projects.frozen_json` remains genuine frozen evidence, never a non-frozen sentinel. Upgrade only the exact immediate pre-Task-3c V3 schema from commit `7066c841df3d08850ba05a38b7ad55881b2916bc` (application ID `0x44545633`, user version `1`, including `v3_legacy_activity`) to closed V3 user version `2`. Unknown/foreign/partial schemas fail before mutation. Rebuild affected V3-only foreign-key tables as needed in one atomic migration, preserving existing project/history/queue/approval/delivery/activity row IDs and JSON verbatim, including unresolved remote activity. Derive new catalog metadata only from checked existing native projects; do not reset/repair/replay status. Validate exact target schema, foreign keys and integrity before commit; any failure rolls back. Add recognized-upgrade/reopen, unknown-future/partial rejection, unresolved activity, representative native history preservation and injected rollback tests. No general migration framework or original workbench schema change.
+- Format copy with genuinely current frozen paired evidence may use the strict native seed after full replay validation; missing/obsolete presales companion is explicit history-only for new generation. Retain only proven original effective approvals as `originApprovalRef` with image/content/palette evidence, never a newly fabricated approval. Missing history is visible; missing required active image blocks eligible publication. Task 2 history/approval/delivery readers must verify imported evidence honestly.
+- Imported version/asset/reference IDs are destination-owned and map explicitly to unchanged source IDs, so copying the same source twice cannot collide or cross-bind. Distinguish native approvals from origin references in effective-selection and delivery contracts. Resolve imported immutable assets by verified import receipt, never fall back to imports when native queue evidence fails. A current frozen pair allows new generation but does not establish the old image's design/skill provenance. Extract style/visual receipts from the same captured database image; retain their original hash algorithms and exact raw evidence.
+- Persist only the selected project's exact raw pipeline/companion/style/receipt evidence and selected immutable assets in the copy. The captured main/WAL database may contain unrelated projects: keep those full database bytes private and transient for validation/recheck, retaining file digests in the receipt rather than depositing the whole shared database in a project directory or sending it to a model. Test with two synthetic source projects that the destination envelope/asset index contains no unrelated project rows or bytes.
+- Content revision inserts an explicit draft catalog entry with copied verified sources/analysis/brief/palette, no inherited approval/active delivery, original outline as comparison/draft, and immutable origin. It is not a frozen seed; paired authoring/promotion is Task 3d.
+- In content-revision mode, retain original visual history as immutable origin comparison through the import receipt, exact source evidence and verified asset map (including explicit missing-history metadata), not as live destination `v3_pages`/`v3_versions`. New authored page IDs/count/order are established at promotion without deleting, relabeling or fabricating a one-to-one mapping for old visuals. Format-copy mode still exposes checked imported page/version history through its proper readers. This separation preserves history while avoiding live visual foreign keys to an unfinished draft.
+- [ ] **Step 1:** RED tests for both modes, distinct destination identity, absent/partial paired evidence, origin approval proof, missing assets, source changed after prepare, active/unknown guard, atomic failure and reopen; compare original DB/WAL/artifacts byte-for-byte.
+- [ ] **Step 2:** Implement staged immutable copies and atomic index/receipt/catalog publication with no half-visible project on failure. Keep validated tokens private and public read models tagged frozen/draft/history-only.
+- [ ] **Step 3:** Run import/snapshot/activity/storage/event regressions; commit `feat: create validated parallel-review project copies`.
+
+### Task 3c1: Exact catalog schema upgrade and selected snapshot evidence
+
+**Files:** Focused `presales_queue/v3_schema_upgrade.rs` and exact prior-schema declarations/fixture; `presales_queue/schema.rs`; necessary native-only `presales_v3/store.rs` compatibility and tagged catalog contracts; selected-envelope extraction in `presales_v3/legacy_snapshot.rs` or a focused private helper. Synthetic migration/extraction tests. No incomplete public copy-service entry points.
+
+**Interfaces and boundaries:** Implement the Stage 3c exact V3-only v1→v2 upgrade with a real tagged catalog root and separate frozen/draft/history schema; preserve existing native project/history/queue/approval/delivery/activity row identities and JSON. Recognize only exact prior schema from `7066c841df3d08850ba05a38b7ad55881b2916bc`, reject unknown/foreign/partial variants before mutation. Connection-local foreign-key enforcement may be disabled before the immediate transaction solely for table rebuilding; recheck source schema under the writer lock, validate exact target schema/foreign keys/integrity before commit, and restore/verify enforcement before returning the connection. Roll back every failure and discard a connection whose restoration is uncertain. No original workbench/source DB mutation, generic migration framework or non-frozen sentinel in frozen evidence.
+
+- Extract exact selected-project pipeline/companion/style/receipt rows from the same verified READONLY memory database image. Preserve raw selected cell bytes and bind the envelope to capture identity/digests. Full shared main/WAL bytes remain private/transient; unrelated project data must not enter the selected envelope. Do not introduce import validity booleans or a second source connection.
+- [ ] **Step 1:** RED/green exact recognized upgrade/reopen, foreign/partial/unknown-future rejection, real unresolved native activity preservation and representative checked native history/approval/queue preservation tests.
+- [ ] **Step 2:** Add injected post-DDL/row-copy rollback and two-project selected-envelope isolation/raw-byte preservation regressions; confirm original source bytes remain unchanged.
+- [ ] **Step 3:** Run affected migration/store/snapshot/activity/native history regressions and native build/fmt/diff checks, self-review, commit `feat: upgrade v3 catalog and capture selected import evidence`. Report exact migration, envelope APIs, warning debt and verification; full importer remains Task 3c2.
+
+### Task 3c2: Full immutable copy publication and imported history
+
+**Files:** `presales_v3/{import,service}.rs` plus focused asset/receipt/origin-proof helpers; native/import-specific extensions to basis/store/history/review/publication/delivery/contracts, using Task 3c1's exact catalog schema and selected envelope. Synthetic service/import/history tests.
+
+**Interfaces and boundaries:** Implement the complete Stage 3c shared contract through `V3WorkbenchService::{prepare_legacy_copy,publish_legacy_copy,load_v3_project,list_project_catalog}` and explicit `format_copy` / `presales_content_revision` modes. Consume the private Task 3a full-replay token, Task 3b short native guards and Task 3c1 selected snapshot envelope. Opaque preparation IDs do not replace final source/activity/file rechecks. Only selected immutable assets/evidence enter destination storage; publish catalog/index/receipt/history/eligibility atomically after byte verification. No original modification, fabricated approvals, source-ID rewriting or full shared-database copying.
+
+- Implement distinct destination identities and repeat-copy mappings, typed origin approval references, missing-history metadata, required-active-image rejection, honest tagged frozen/history-only/draft states, same-snapshot style/receipt evidence and explicit legacy-versus-native hash algorithms. Current pairs enable new generation but do not manufacture old image design/skill provenance. All original native-generated version/queue/receipt checks stay intact; imports are an explicit checked branch, never a fallback after native validation fails.
+- Content revision only initializes a verified explicit draft with preserved origin/source/analysis/brief/palette and no inherited effective approval or delivery. Draft authoring/promotion/reference management remains Task 3d.
+- Agree the draft-to-promotion interface with Task 3d: content-revision original visual history stays in immutable receipt/comparison evidence and the verified asset index, not live authored page/version rows. Preserve available comparison images and explicit missing-history metadata; do not infer new page bindings or approvals. The existing V3 SQL v2 catalog/draft/artifact locations support this without another physical schema migration.
+- [ ] **Step 1:** RED genuine full-replay source fixtures and the Stage 3c service/identity/asset/origin-approval matrix, including two copies, mixed imported/native history, stale source/activity, missing/changed files and rollback/reopen.
+- [ ] **Step 2:** Implement complete staged copy plus atomic publication and checked imported review/delivery routes; no half-visible project or loss of historical decisions.
+- [ ] **Step 3:** Run affected import/snapshot/activity/store/event/approval/delivery regressions and build/fmt/diff checks, self-review, commit `feat: create validated parallel-review project copies`. Report production construction path and limitations; no UI/runtime acceptance claim.
+
+### Task 3d: V3 paired drafts, promotion and page reference assets
+
+**Files:** Create focused `presales_v3/draft.rs` and reference-asset helpers/tests; extend service/contracts/closed schema and narrow shared pure presales lifecycle validation. Update native prompt/history/eligibility and shared technical policy only as needed to carry real references; preserve bundled skill source/hash.
+
+**Interfaces and boundaries:** Explicit native v3 draft creation/save/joint approval with revision CAS; real outline+plan and details+design pairs validated together. Reuse pure paired validators, not writable legacy checkpoint APIs or arbitrary pipeline replacement. Sources/analysis are preserved verified evidence; new draft approvals belong to the new project. Promote only with real frozen pairs, matching approval bindings, current skill and saved palette; consume the private checked seed, preserve original lineage and atomically change catalog state. This task resolves unused private-seed warnings through real callers, not suppression.
+
+- Include actual AI authoring, not manual editors alone: native service captures a checked stage-tagged request from destination draft revision, verified source/analysis locators, saved brief/preferences/palette, current skill and (for details) the exact jointly approved outline+plan. Extract/share pure paired prompt assembly and complete-envelope parsers; never fabricate a legacy pipeline or call legacy checkpoint/project-directory/raw-WebView writers. Worker execution belongs to Task 4, UI actions to Task 6. A returned envelope is unapproved proposed content and cannot approve or promote itself.
+- Add a minimal destination draft-context save with revision CAS before the first joint outline approval: edit this copy's brief/project prompt requirements and save a validated palette, including explicit manual colors when the origin has no palette. Immutable origin evidence and copied approved preference snapshot remain separate and unchanged; do not write global memory. A manual palette is labeled manual; template-derived claims require the actual imported verified template binding, not caller assertions. Context/palette changes invalidate existing unapproved pairs and stale any captured AI result; after joint outline approval reject these changes rather than silently unfreezing or rebinding approved content. No new template picker/parser or arbitrary settings framework belongs here. Task 6 consumes this service seam.
+- Persist authoring attempts in one narrow closed `v3_text_operations` table with typed stage/status, immutable target/digest, operation/attempt identities, project/revision, sequence, epoch/provider identity, result/commit evidence and timestamps; use an unfinished-project unique index. Perform only an exact V3 v2→v3 additive migration, preserving all prior evidence and QueueOnly ownership. Existing v2 draft/frozen/reference documents still fit their JSON locations; the added schema is specifically durable authoring scheduling, not a generic task framework. Fresh databases and the existing exact v1 upgrade path must converge on the exact current schema without dropping unresolved activity or queue rows.
+- V3 image/text admission shares one durable monotonic sequence allocated inside the same immediate writer transaction from the maximum AUTOINCREMENT high-water mark of `queue_jobs` and `v3_text_operations`, then explicitly inserted into the chosen table; do not edit `sqlite_sequence`. Preserve old image sequences, check overflow and cross-table request/attempt collisions, allocate nothing for idempotent reuse and keep batch input order. QueueOnly allocation remains unchanged. Task 4 consumes these records through one combined claim/recovery boundary; no interim text dispatch bypasses it.
+- Correlate result stage/operation/attempt/epoch/target and retain bounded immutable parsed result evidence. Save a complete pair and operation commit receipt in one transaction only if its exact captured draft basis/revision still matches. Manual save or approval may make a late response stale: retain the result with an explicit conflict, never overwrite newer work or auto-regenerate. Pending/failed/unknown and staged-local-commit states survive reload; cancellation/abandonment evidence must prevent late content publication. Actual joint approval remains a separate user action.
+- Use an explicit typed v3-authored draft/frozen evidence variant with a private validated factory. Preserve source analysis artifact identity as origin evidence; do not rewrite a legacy pipeline's project ID, regenerate its original artifact hash, or label a pipeline-shaped projection as full-replay-validated v1/v2. Extract focused pure pair/basis/lifecycle helpers with unchanged legacy adapters, validate actual destination actions/approvals and exact origin links, and adapt frozen readers/seed construction through an explicit variant without weakening native/imported branches. “Draft reopen” here means closing and reloading persisted drafts, not revoking approvals or editing already frozen content; a new content-revision request remains distinct from unrestricted visual-image revisions.
+- Page reference attachment takes native validated file-selection authority and intended use, copies immutable verified bytes, and stores per-page binding. Reference content is design context, not facts or instructions; preserve original image bytes/watermark. Never automatically read the user's previously mentioned clipboard path. Reference-set/purpose changes reject unfinished affected work, invalidate only that page's current eligibility, and are captured in new queue target/provenance. Old versions keep old references; adoption/approval cannot silently bypass a current reference mismatch. Task 5 transmits these actual assets.
+- Since the existing Rust app has no native file-picker capability, Task 3d supplies a non-Deserialize selected-reference token and crate-private selection callback that validates the selected descriptor/path/PNG bytes; attachment consumes that token. Synthetic tests exercise this callback, not a frontend validity boolean. Task 4's real native picker is the required production caller and Task 6 invokes its typed command; until that wiring is tested, do not claim end-to-end reference selection or add fake callers/warning suppression.
+- [ ] **Step 1:** RED real-pair lifecycle tests for save/CAS, stale/mismatched pair, mapping failure, exact joint approvals, draft reopen and atomic promotion; no image generation before promotion (AI pair authoring is permitted in drafts). Add checked text-context/complete-pair save tests, stale AI result versus manual save/approval, idempotent result commit, exact additive migration/rollback and shared admission ordering tests. Add reference tests for native selection, path/byte validation, page scope, purpose, in-flight rejection, exact prompt/provenance and stale approval.
+- [ ] **Step 2:** Implement focused lifecycle/reference/service seams. New content must be human-reviewable in Task 6; no invented skills/designs/approvals for old projects.
+- [ ] **Step 3:** Run covering draft/reference/import/store/prompt/shared-golden tests, typecheck/fmt/generator/unchanged-skill checks; commit `feat: author paired presales drafts with page references`.
+
+### Task 4: Application-owned asynchronous queue runtime
+
+**Files:**
+- Create `apps/desktop/src-tauri/src/presales_v3/{commands,supervisor}.rs`, `apps/worker/src/presales/runtime.ts`.
+- Implement the dedicated native-owned Worker host and its private correlated provider boundary; no v3 authority or image bytes go through legacy WebView raw stdout/send/restart commands. Task 5 owns the actual separate supervisor-owned `CodexAppServerProcess` consumer and Worker AppServerTransport proxy together with the common validated provider adapter; do not add a dormant unused Codex owner here merely to satisfy a future seam.
+- Modify `lib.rs`, `tauri_worker.rs`, Worker `sidecar-cli.ts`, `sidecar-rpc.ts`, protocol contracts and tests.
+- Test `apps/worker/src/presales/runtime.test.ts`, native `tests/presales_v3_supervisor.rs` and actual process harness.
+
+**Interfaces:**
+- Consume service admission/publication and queue epoch/lifecycle/claim operations.
+- Produce typed short native commands for load/list/enqueue/approve/draft/history/settings/pause/cancel/abandon and `presales-queue-changed` events carrying revision, never full image bytes.
+- Add a real native reference-image picker command: only the native user-selection result invokes Task 3d's private selected-reference factory; cancellation is a non-mutating outcome, and attachment still rechecks page identity/revision/current work. A renderer-supplied arbitrary path/base64 payload/boolean is not selection authority. Keep picker behavior behind a narrow test seam; no real picker/customer file access during synthetic tests. Task 6 invokes this command rather than inventing a trusted file token.
+- Resolve Task 3c2's preparation-capacity observation before asynchronous copy exposure: reserve a bounded RAII preparation slot before capture/replay/staging (including in-flight work) or enforce serialized native preparation admission. The existing completed-preparation map limit alone does not bound concurrent expensive preparations; release reservations on every error/cancel/discard path without holding the source admission fence through model-free validation or user review.
+- Worker messages `presales/start` acknowledge promptly, emit provider identity/progress/result events asynchronously and service correlated native requests while a generation runs. Rust owns dispatch and global slots, Worker does not invent a second concurrency limit.
+- Execute typed outline/details authoring from Task 3d through the same private host and stock-account route guard as images. A single transactional claim counts image plus text remote-active/unknown/cancel-unconfirmed work and selects the earliest eligible shared sequence; revalidate queued draft basis and explicitly terminate stale work without a model call. Keep separate checked Image/Text targets and parsers, not separate schedulers. Share pause/lower-limit behavior and increment/recover the global epoch once for both kinds; staged text results recover by local CAS only. Persist thread/turn identity promptly, retain uncertainty and never convert interrupt acknowledgement to proven terminal state. Task 5's route policy protects the common provider boundary; image-specific reference capability remains separate.
+- The same bundled Worker executable serves an explicit v3 mode, but its child handle and provider are separate from the legacy adapter instances. UI reconnect cannot restart active v3 jobs. Share the existing account login, not process lifetime; record combined memory in acceptance. Bound UTF-8 line assembly and private message buffers, consume PNG data natively and emit only small UI change events.
+- Resolve the deferred active-page lookup scan through a narrow crate-private indexed queue query (the existing partial index covers all unfinished statuses), cross-checking selected SQL project/page identity against the decoded target. Retain complete selected-project history/receipt validation and final transaction rechecks; do not silently introduce latest-only or truncated history. Incidental parsing of unrelated terminal queue rows is not a whole-database integrity audit. Cover query-plan/index use, all statuses/scopes, selected-row corruption and the competing-parent regression. Catalog/full-history read costs remain a separate measured acceptance concern; see the task-queue-scale-map scratch report.
+
+- [ ] **Step 1: Add RED fake-provider tests at concurrency 1/2/4 with five pages completing out of order; prove stdin remains responsive and a native callback can complete during a slow job.**
+- Include mixed image/text FIFO and combined slot occupancy at 1/2/4, unknown text across restart, stale/cancelled/abandoned late text result, and complete AI outline+plan → explicit approval → AI details+design without automatic approval. Capture actual prompt/verified context and test both halves of each parsed envelope; UI preview must share the submitted builder.
+
+```ts
+// Dispatch A and B, hold both providers, issue snapshot/settings RPC.
+// Snapshot must resolve before either provider is released.
+// Finish B then A; each emitted completion retains its original request/attempt.
+```
+
+- [ ] **Step 2: Run runtime/supervisor focused tests and record RED.**
+- [ ] **Step 3: Start one managed v3 service/supervisor per app instance, recover epoch before dispatch, use bounded async Worker jobs and immediate provider-identity persistence.** Decode stdout as complete UTF-8 lines across byte boundaries. Bound event buffers and ignore old process generations. Cancel acknowledgement must be evidence-based; unknown errors retain slots. Lowering concurrency leaves already running jobs alone; pause stops claims only. Closing WebView routes does not cancel work; exiting app cannot promise continued generation.
+- [ ] **Step 4: Run fake-provider plus process crash/restart/cancel/late-result tests; commit `feat: run durable multi-page generation outside the webview`.**
+
+### Task 5: Real Codex image execution and reference capability
+
+**Files:**
+- Modify `apps/worker/src/{app-server,codex-image-turn}.ts` and `apps/worker/src/presales/runtime.ts`.
+- Extend Task 4's private native supervisor/Worker protocol and `codex_process.rs` with the genuine dedicated v3 Codex process owner and correlated AppServerTransport proxy. Legacy start/send/stop/reconnect must not address it; share the existing account, never its frontend-owned process lifetime. No Codex spawn is needed before this task's actual adapter exists. Verify isolation, bounded UTF-8 frames, identity-before-completion and owned-process shutdown with synthetic child processes, not a dormant or fake production caller.
+- Create `apps/worker/src/presales/image-provider.ts` and focused tests.
+- Own the narrow native verified-asset resolver and registered preview command consumed by Task 6b, reusing the same native artifact authority as provider image inputs. Keep all native registration/runtime changes in this task so the disjoint Task 6b frontend can integrate concurrently after Task 4 is reviewed.
+- Document actual supported protocol in `docs/presales-image-provider.md`.
+
+**Interfaces:**
+- Consume persisted QueueTarget and resolved immutable parent/reference paths from native artifact authority; provide runtime image runner with start identity, progress, cancellation evidence and PNG bytes.
+- Supply the actual outline/details text runner to the same Task 4 provider boundary using Task 3d's captured whole-pair prompt, bounded complete-envelope output and identity/progress/cancel/result callbacks. It uses the same account-route guard, native FIFO/slots/epoch and dedicated provider owner as images, not a second scheduler or the legacy bare-output writer.
+- Produce capability `{ generation: boolean, referenceEditing: boolean, reason?: string }`. Capability is not inferred merely from a Pro account.
+- Expose this minimal capability as additive `capabilities` on `presales_v3_queue`; retain `dispatchAvailable` for common runtime readiness and distinguish text readiness from image-tool support. No raw account/config/provider payloads reach the renderer. The verified lazy preview command `presales_v3_read_image` takes only `projectId`, `slideId`, `versionId`, `assetId`, `sha256` and returns `{mimeType: "image/png", base64}` after exact native ownership, immutable identity/hash, path and existing PNG-size/content checks; it accepts no path or provider reply. Missing-image history remains readable without calling it. Native source/parent/reference resolution still uses checked private paths, not renderer preview data as authority.
+- V3 uses a documented stock ChatGPT-account route policy, not merely a provider-ID check. Validate account/auth requirement, pin the dedicated child and thread to the built-in provider/model, reject known custom/ambiguous route configuration privately, and invalidate capability leases on account updates/restarts before further dispatch. Per-child removal of credential override variables must not read/log their values or remove normal proxy/CA configuration. Do not change shared login, forced-login settings, credential storage or CODEX_HOME. `allowProviderModelFallback:false` controls model choice, not billing; never invent endpoint-attestation fields or claim live route verification from fake tests. See task-5-route-map.md for installed-schema limits and guard options.
+- Actual parent/reference localImage inputs and selected-model image modality are necessary for reference actions; no hashes-only substitute or silent text-only fallback. Keep protocol-contract support distinct from live-unverified reference influence, and keep unsupported actions explicitly gated.
+
+- [ ] **Step 1: Verify current local App Server schema and official documentation; preserve ChatGPT login, no API Key.** Record actual input/event names and what is not proven. Do not read tokens or personal credentials.
+- [ ] **Step 2: Add RED tests that exact prompt/basis and genuine image references reach the provider call and notes/source provenance are not baked into visible text.**
+
+```ts
+// Fake protocol captures actual turn input, not just a metadata flag.
+// If reference input is unsupported, edit action rejects with capability reason.
+// A new text-only generation must never be described as modifying a parent image.
+```
+
+- [ ] **Step 3: Implement protocol-backed image provider and immutable result resolution.** Each job has separate thread/turn identity. Use only verified input and completion formats. Distinguish completed-without-image, image failure, usage limit and unknown outcome. Persist identity before observing completion, never retry uncertain provider calls as new generations.
+- [ ] **Step 4: Run captured-protocol/fake-provider tests and record any unverified live capability; commit `feat: connect queue jobs to capability-checked Codex images`.**
+
+### Task 6a: Independent multi-page gallery presentation
+
+**Files/ownership:** New files only under `apps/desktop/src/presales/gallery/`. Do not edit App routing, shared DTOs/adapters, prompt builders, Rust, Worker, package configuration or other tasks' files. Reuse existing React/components/styles by read-only imports where appropriate.
+
+**Interfaces:** A small explicit presentation model and callback interface supplied by a host, not a second workflow authority or invented native command. Inputs contain ordered pages, exact page/version/image identity and revisions, active delivery selection, historical versions/missing-resource reasons, saved keyed feedback, page-specific job/action eligibility, shared queue settings and capability reasons. The host owns authoritative reconciliation and persistence; Task 6b maps real native DTOs/commands into it.
+
+- Implement a Chinese gallery/review surface with independently selected page/history, current-delivery badge, optional feedback, separate generate/edit/adopt/restore/approve actions, exact-version manual checks, per-page/action pending state and persistent-feedback callbacks. Other pages remain operable while one page generates or awaits a command. Manual revisions have no UI count ceiling; new drafts are never auto-submitted.
+- Gallery input updates must not jump selection, clear unrelated feedback, auto-adopt history or auto-check approval. Save/conflict errors retain typed text; expose dirty-state callback for Task 6b's existing navigation guard. Support saved feedback restored after unmount/remount by the supplied host data; do not claim native persistence until integration.
+- Add multi-selection, generate-all-missing, explicit batch/replacement confirmation, concurrency 1–4, pause and narrowly gated job actions. Unknown/cancel-unconfirmed work has a reason, never an automatic retry. Historical missing images remain inspectable as metadata; unsupported reference/edit actions explain their capability limit. File paths/tokens are never accepted as native selection authority by the component.
+- Load selected preview/visible thumbnails through an injected image loader, with immutable identity/SHA cache keys, bounded caching, stale-promise rejection and IntersectionObserver/lazy behavior. Never eagerly decode all historical images. Keep technical JSON/hashes secondary, not the review surface.
+- **TDD/QA:** Inject deferred callbacks and authoritative synthetic updates. Cover A running/B candidate/C queued; approve/edit B while A runs; history inspection versus explicit adoption/restoration; feedback save/error/conflict and reload; five manual revisions without a ceiling; missing images; no offscreen image load; batch confirmation and disabled reasons. Run focused component tests, typecheck and rendered browser QA at desktop and a narrow desktop viewport. Browser plugin absent: use the established muted Playwright, memory-fulfilled artificial origin with all other requests aborted, no local HTTP server or native/provider calls. Keep screenshots/temporary browser script outside source as prescribed by the frontend testing skill.
+- Commit only owned gallery files after the controller's commit gate. Report component/presentation evidence, not native/runtime/whole-product completion. This task can run independently alongside later backend work because it neither reads nor writes their mutable implementation contracts. Task 6b consumes this gallery rather than rebuilding it.
+
+### Task 6b: Multi-page integration, native history/feedback and paired presales editing
+
+Task 6b retains the full Task 6 user-facing contract below. Reuse the reviewed Task 6a presentation and tests, then implement actual native adapter/read-model, tagged routes, persistence, event reconciliation, copy UI and paired authoring. Synthetic gallery callbacks do not count as these integrations.
+
+After Tasks 4 and 6a pass their reviews, Task 6b frontend implementation may run alongside Task 5's backend/provider work. Task 6b owns frontend files only; Task 5 owns native/Worker files and the capability/verified-preview boundary above. Use these explicit public contracts, keep serial commit gates and independent scoped reviews, and require both tasks to pass before integrated acceptance. No second queue, provider authority or guessed native command is introduced.
+
+**Files:**
+- Create `apps/desktop/src/presales/{adapter,read-model,workspace,feedback-editor}.ts[x]` with focused tests/styles.
+- Modify `App.tsx`, collection read models and adapter seams for tagged project routing and explicit copy UI; retain legacy workspace.
+- Connect shared pure paired helpers and Task 3d/4's actual native AI authoring operations to outline/details editors; do not use legacy checkpoint writers or mistake a prompt helper for an implemented generation RPC.
+
+**Interfaces:**
+- Consume native v3 snapshot/commands and runtime capability/settings events.
+- Produce `PresalesWorkspacePage` with independent page/version selection, per-page draft/approval and all-page queue controls. All writes have native revision checks and reconcile authoritative state on conflicts.
+
+- [ ] **Step 1: RED component tests: navigate away and return during jobs, approve B while A/C run, switch inspected history without changing delivery, save per-version feedback, five revisions, disabled action explains why, missing-image history remains browsable.**
+
+```tsx
+// Render three-page snapshot: A running, B candidate, C queued.
+// B's feedback and approval remain enabled; A cannot dispatch twice.
+// Selecting B-v1 does not invoke adoptVersion; explicit adoption does.
+```
+
+- [ ] **Step 2: Run new component tests and record RED.**
+- [ ] **Step 3: Implement Chinese UI: page gallery with thumbnails/status, concurrency selector 1–4, selected/all missing generation, per-job progress/retry/save-result/cancel controls, persistent feedback, history selector, explicit current-delivery badge and exact-version approval checks.** Use accessible buttons and explain running/unknown/missing basis states. No global busy lock or automatic selection jump when another page finishes. Draft save failures retain text and visibly prevent silent navigation loss. Show copied-project origin and explicit copy confirmation.
+- Include page-scoped reference attachment and intended-use display so an approved cockpit reference can actually reach generation; user chooses the file and page, and the UI never invents its provenance.
+- [ ] **Step 4: Wire content/design paired draft save and joint approval to existing human-readable outline/details editors.** New presales drafts use bundled rules and actual template palette. Editing a visible bound string invalidates dependent draft design, not silent mismatch. Speaker notes remain an explicitly separate field. No user-facing JSON-only review.
+- Provide real generate-outline-pair and generate-details-pair actions, persisted operation status and exact-context preview. Model completion fills a complete reviewable pair without granting approval. A stale result cannot replace newer manual edits; display the saved result/conflict and preserve user text. Manual pair editing is an additional route, not a substitute for AI authoring.
+- Before first outline approval, allow the copy's project brief/prompt context and validated palette to be saved through Task 3d's native destination-context command. Explain missing palette and offer explicit manual choice without claiming template extraction; copied verified template colors remain automatic. Show the post-approval lock and conflict reason rather than discarding edits or mutating origin/global preferences.
+- [ ] **Step 5: Run UI/read-model regression tests and browser QA using synthetic app state; commit `feat: add independent multi-page review and revision workspace`.**
+
+### Task 7: Frozen active-version delivery integration
+
+**Files:**
+- Create `apps/worker/src/presales/delivery.ts` and tests.
+- Modify v3 service/commands and UI export action to consume immutable delivery snapshot; reuse existing exporter/QA interfaces without changing legacy selection.
+
+**Interfaces:**
+- Consume `create_delivery_snapshot` with exact active image/content/design/palette approval bindings.
+- Produce `prepareV3Delivery(snapshot)` returning ordered approved page inputs to existing `PptxExporter`; export result and QA report retain snapshot ID and selected-version map.
+
+- [ ] **Step 1: RED tests ensure an older selected approved version exports instead of the newest historical image, and revising any selected page invalidates current delivery eligibility.**
+
+```ts
+// History [v1, v2, v3], active+approved v2 -> exporter input is exactly v2.
+// Frozen delivery D remains immutable; newer work does not mutate D's map.
+// Missing clean background/editable geometry blocks editable export honestly.
+```
+
+- [ ] **Step 2: Run delivery tests and record RED.**
+- [ ] **Step 3: Connect frozen inputs to exporter/QA; retain approved text and real image/geometry evidence.** No OCR replacement of approved content, no duplicate baked text, no fake editable success. Preserve template placement and actual approval snapshot. Unsupported image-to-editable conversion clearly blocks that export while retaining image/history access.
+- [ ] **Step 4: Run synthetic PPTX/QA regression if dependencies available; commit `feat: bind v3 delivery to exact approved slide versions`.**
+
+### Task 8: Integrated acceptance and development build handoff
+
+**Files:**
+- Add integration tests/fixtures under existing desktop and Worker test locations.
+- Create `docs/verification-2026-09-11-presales-v3-workbench.md`.
+- Update README/current developer usage with real app build/run paths and limitations.
+
+**Interfaces:** Consume all preceding task interfaces; no new workflow authority.
+
+- [ ] **Step 1: Run synthetic five-page acceptance including out-of-order 1/2/4 concurrency, cross-page approval, five revision rounds, restart recovery, saved feedback, exact history selection, missing resources and unknown/cancelled remote outcomes.**
+- Use a genuine paired Chinese presales fixture: construction goals, architecture (or overview), two module pages and a linked personnel/scenario page. The architecture/overview module set must match the later module/scenario coverage; complete visible bindings, notes separation, saved palette and page-scoped reference inputs must pass the shared native/Worker validators. Reuse existing fixture helpers, but do not treat the legacy `golden-project.ts` cover/summary/KPI/table/chart background-only deck or five ID-renamed copies of one scenario as presales narrative coverage. Synthetic image output proves orchestration/UI behavior, not real model visual quality.
+
+```text
+new/explicit-copy -> paired outline approval -> paired details approval
+-> enqueue five -> B completes first -> approve B while A/C run
+-> revise B five times with independent draft histories
+-> restart -> view saved versions/drafts -> exact delivery snapshot
+```
+
+- [ ] **Step 2: Run complete TypeScript tests/typecheck/lint, Rust tests including acceptance feature, fmt, skill generation check, build and diff checks.** Record counts/commands without extrapolating synthetic results into real provider success.
+- [ ] **Step 3: Perform a broad branch review from `5f0d06c5826fb63cdfd0156e6a4354125da0aba5`, address findings and narrowly re-review the fix set.**
+- [ ] **Step 4: Build an isolated development `.app` without overwriting the user's installed/running app; visually verify synthetic pages.** Read-only check output mute; no sounds. Live account ImageGen, Keynote editing and true peak memory are separate acceptance claims requiring actual observations; list any not yet performed.
+  Before any synthetic GUI launch, verify separate database/workspace initialization and synthetic account/provider transport with no automatic live account connection; a different bundle name alone is not isolation. Use a narrow acceptance-only seam if needed, never personal HOME/CODEX_HOME or configuration changes. Reuse the existing native process-tree sampler and record operation windows, owned process roles and exclusions. Label sampled synthetic runtime/app-tree RSS honestly; reparented WebKit helpers, absent real provider memory and unsampled spikes are not covered by a process-tree pass. If safe GUI initialization or complete memory observation is unavailable, keep that acceptance claim pending rather than launching against the user's normal state.
+- [ ] **Step 5: Commit verification and usage; hand off the actual usable build and clear remaining external acceptance limits.** Do not call any preceding internal test milestone the finished multi-page feature.

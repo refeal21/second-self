@@ -1,0 +1,224 @@
+use super::store::{bump_project, decode, encode, load_on, message, page_on, write_on};
+use super::*;
+use crate::presales_queue::{
+    store::{enqueue_v3_on, read_active_job, read_batch_outcome},
+    EnqueueBatch, EnqueueJob, EnqueueOutcome, ResultVault,
+};
+use rusqlite::{params, Connection, OptionalExtension};
+
+impl V3Store {
+    /// The writer lock orders this decision against both new admission and its
+    /// exact replay. A withdrawn input can never become a delayed admission.
+    pub fn reconcile_image_admission(
+        &mut self,
+        input: EnqueuePages,
+    ) -> Result<ImageAdmissionResolution, String> {
+        let encoded = validate_admission_input(&input)?;
+        write_on(&mut self.connection, |tx| {
+            let snapshot = load_on(tx, &input.project_id)?;
+            for page in &input.pages {
+                page_on(&snapshot, &page.slide_id)?;
+            }
+            if withdrawn_on(tx, &input)? {
+                return Ok(ImageAdmissionResolution::Withdrawn {
+                    input: input.clone(),
+                });
+            }
+            if let Some(outcome) = replay_on(tx, &input)? {
+                return Ok(ImageAdmissionResolution::Admitted {
+                    input: input.clone(),
+                    outcome,
+                });
+            }
+            tx.execute("INSERT INTO v3_admission_withdrawals(batch_id,project_id,input_json) VALUES (?1,?2,?3)", params![input.batch_id,input.project_id,encoded]).map_err(message)?;
+            Ok(ImageAdmissionResolution::Withdrawn {
+                input: input.clone(),
+            })
+        })
+    }
+    /// Inputs name saved pages and versions. Native code owns all prompt and image evidence.
+    pub fn enqueue_pages(
+        &mut self,
+        input: EnqueuePages,
+        vault: Option<&ResultVault>,
+    ) -> Result<EnqueueOutcome, String> {
+        let encoded = validate_admission_input(&input)?;
+        let (snapshot, active_pages) = {
+            let tx = self.connection.unchecked_transaction().map_err(message)?;
+            if let Some(outcome) = replay_on(&tx, &input)? {
+                tx.commit().map_err(message)?;
+                return Ok(outcome);
+            }
+            let snapshot = load_on(&tx, &input.project_id)?;
+            let mut active_pages = std::collections::HashSet::new();
+            for request in &input.pages {
+                if active_job(&tx, &input.project_id, &request.slide_id)?.is_some() {
+                    active_pages.insert(request.slide_id.clone());
+                }
+            }
+            tx.commit().map_err(message)?;
+            (snapshot, active_pages)
+        };
+        // Resolve byte evidence outside the short write transaction. Every identity
+        // is checked again against the transaction's immutable saved versions.
+        let mut parents = std::collections::HashMap::new();
+        for request in &input.pages {
+            if active_pages.contains(&request.slide_id) {
+                continue;
+            }
+            if let Some(id) = &request.parent_version_id {
+                let page = page_on(&snapshot, &request.slide_id)?;
+                // A concurrent admission may win during verification. Defer any
+                // parent error until the write snapshot confirms this is still new.
+                let image = vault
+                    .ok_or_else(|| "parent visual requires native result vault".to_string())
+                    .and_then(|vault| {
+                        super::publication::verify_version(&self.connection, page, id, vault)
+                    });
+                parents.insert((request.slide_id.clone(), id.clone()), image);
+            }
+        }
+        write_on(&mut self.connection, |tx| {
+            if let Some(outcome) = replay_on(tx, &input)? {
+                return Ok(outcome);
+            }
+            let snapshot = load_on(tx, &input.project_id)?;
+            let mut ids = std::collections::HashSet::new();
+            let mut jobs = Vec::new();
+            for request in &input.pages {
+                if !ids.insert(&request.slide_id) {
+                    return Err("duplicate page in admission".into());
+                }
+                let page = page_on(&snapshot, &request.slide_id)?;
+                let target =
+                    if let Some(active) = active_job(tx, &input.project_id, &request.slide_id)? {
+                        active.target
+                    } else {
+                        if page.revision != request.expected_revision {
+                            return Err("page revision conflict".into());
+                        }
+                        let parent = match &request.parent_version_id {
+                            None => None,
+                            Some(id) => {
+                                let version = super::publication::version_on(page, id)?;
+                                let image = parents
+                                    .get(&(page.slide_id.clone(), id.clone()))
+                                    .ok_or("missing verified parent")?
+                                    .as_ref()
+                                    .map_err(Clone::clone)?;
+                                if version.image.as_ref() != Some(image) {
+                                    return Err("parent evidence changed".into());
+                                }
+                                Some(image.clone())
+                            }
+                        };
+                        super::prompt::target(&snapshot, page, parent, &request.feedback)?
+                    };
+                jobs.push(EnqueueJob {
+                    request_id: request.request_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    target,
+                });
+            }
+            let outcome = enqueue_v3_on(
+                tx,
+                EnqueueBatch {
+                    batch_id: input.batch_id.clone(),
+                    jobs,
+                },
+            )?;
+            tx.execute(
+                "INSERT INTO v3_admissions (batch_id,input_json) VALUES (?1,?2)",
+                params![input.batch_id, encoded],
+            )
+            .map_err(message)?;
+            let mut changed = false;
+            for (request, job) in input.pages.iter().zip(&outcome.jobs) {
+                if job.request_id != request.request_id {
+                    continue;
+                }
+                let revision = request
+                    .expected_revision
+                    .checked_add(1)
+                    .ok_or("page revision exhausted")?;
+                if tx.execute("UPDATE v3_pages SET revision=?1, intent_request_id=?2, approved_version_id=NULL WHERE project_id=?3 AND slide_id=?4 AND revision=?5",
+                    params![revision, job.request_id, input.project_id, request.slide_id, request.expected_revision]).map_err(message)? != 1 { return Err("page revision conflict".into()); }
+                tx.execute("INSERT INTO v3_intents (request_id, project_id, slide_id, page_revision, target_json) VALUES (?1,?2,?3,?4,?5)",
+                    params![job.request_id, input.project_id, request.slide_id, revision, encode(&job.target)?]).map_err(message)?;
+                changed = true;
+            }
+            if changed {
+                bump_project(tx, &input.project_id)?;
+            }
+            Ok(outcome)
+        })
+    }
+}
+
+fn validate_admission_input(input: &EnqueuePages) -> Result<String, String> {
+    let encoded = encode(input)?;
+    if input.pages.is_empty() || input.pages.len() > 100 || encoded.len() > 2 * 1024 * 1024 {
+        return Err("admission requires 1..=100 pages within 2 MiB".into());
+    }
+    crate::presales_queue::store::validate_identifier(&input.batch_id, "batch_id")?;
+    let mut slides = std::collections::HashSet::new();
+    for page in &input.pages {
+        if !slides.insert(&page.slide_id) {
+            return Err("duplicate page in admission".into());
+        }
+        crate::presales_queue::store::validate_identifier(&page.request_id, "request_id")?;
+        crate::presales_queue::store::validate_identifier(&page.attempt_id, "attempt_id")?;
+    }
+    Ok(encoded)
+}
+
+fn withdrawn_on(connection: &Connection, input: &EnqueuePages) -> Result<bool, String> {
+    let saved: Option<String> = connection
+        .query_row(
+            "SELECT input_json FROM v3_admission_withdrawals WHERE batch_id=?1",
+            [&input.batch_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(message)?;
+    match saved {
+        None => Ok(false),
+        Some(saved) if decode::<EnqueuePages>(&saved)? == *input => Ok(true),
+        Some(_) => Err("batch withdrawal has different input".into()),
+    }
+}
+
+fn replay_on(
+    connection: &Connection,
+    input: &EnqueuePages,
+) -> Result<Option<EnqueueOutcome>, String> {
+    // Called before expensive byte verification AND again inside the final
+    // writer transaction, closing a withdrawal during preflight.
+    if withdrawn_on(connection, input)? {
+        return Err("batch was withdrawn before admission".into());
+    }
+    let original = connection
+        .query_row(
+            "SELECT input_json FROM v3_admissions WHERE batch_id=?1",
+            [&input.batch_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(message)?;
+    let Some(original) = original else {
+        return Ok(None);
+    };
+    if decode::<EnqueuePages>(&original)? != *input {
+        return Err("batch was already admitted with different input".into());
+    }
+    load_on(connection, &input.project_id)?;
+    read_batch_outcome(connection, &input.batch_id).map(Some)
+}
+
+pub(super) fn active_job(
+    connection: &Connection,
+    project_id: &str,
+    slide_id: &str,
+) -> Result<Option<crate::presales_queue::QueueJob>, String> {
+    read_active_job(connection, project_id, slide_id)
+}

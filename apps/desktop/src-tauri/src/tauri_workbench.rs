@@ -57,9 +57,11 @@ pub fn ppt_visual_records_service(
     service.visual_records(&project_id)
 }
 
+use crate::presales::ProjectCheckpoint;
 use crate::workbench::{
     ApprovalResult, AttachSourceInput, CreateProjectInput, DesktopInitialState,
-    PipelineCommitInput, ProjectSummary, RegenerateResult, SlideMutationInput, WorkbenchService,
+    PairedCheckpointCommitInput, PipelineCommitInput, ProjectSummary, RegenerateResult,
+    SlideMutationInput, WorkbenchService,
 };
 
 #[derive(Serialize)]
@@ -80,6 +82,21 @@ pub fn ppt_load_pipeline_service(
     project_id: String,
 ) -> Result<serde_json::Value, String> {
     service.load_pipeline(&project_id)
+}
+
+#[tauri::command]
+pub fn ppt_load_checkpoint(
+    state: State<'_, WorkbenchService>,
+    project_id: String,
+) -> Result<ProjectCheckpoint, String> {
+    ppt_load_checkpoint_service(&state, project_id)
+}
+
+pub fn ppt_load_checkpoint_service(
+    service: &WorkbenchService,
+    project_id: String,
+) -> Result<ProjectCheckpoint, String> {
+    service.load_project_checkpoint(&project_id)
 }
 
 #[tauri::command]
@@ -166,6 +183,21 @@ pub fn ppt_commit_pipeline_service(
     input: PipelineCommitInput,
 ) -> Result<serde_json::Value, String> {
     service.commit_pipeline(input)
+}
+
+#[tauri::command]
+pub fn ppt_commit_checkpoint(
+    state: State<'_, WorkbenchService>,
+    input: PairedCheckpointCommitInput,
+) -> Result<ProjectCheckpoint, String> {
+    ppt_commit_checkpoint_service(&state, input)
+}
+
+pub fn ppt_commit_checkpoint_service(
+    service: &WorkbenchService,
+    input: PairedCheckpointCommitInput,
+) -> Result<ProjectCheckpoint, String> {
+    service.commit_project_checkpoint(input)
 }
 
 #[derive(Serialize)]

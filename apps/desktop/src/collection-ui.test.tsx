@@ -178,7 +178,7 @@ describe('fresh approval and memory routes', () => {
     render(<App adapter={fixture.adapter} initialRoute="approvals" />);
     await user.click(await screen.findByRole('link', { name: '前往审核' }));
 
-    expect(window.location.hash).toBe('#/workspace/project-review');
+    expect(window.location.hash).toBe('#/workspace/legacy/project-review');
     expect(fixture.adapter.loadProjectPipeline).toHaveBeenCalledWith('project-review');
     expect(screen.getByRole('heading', { name: '真实审核项目' })).toBeInTheDocument();
   });

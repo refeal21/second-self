@@ -1,0 +1,466 @@
+{
+  "analysis": {
+    "findings": [
+      {
+        "id": "finding-sensing",
+        "text": "合成需求：园区需要可追踪的告警接入。",
+        "sourceIds": [
+          "source-a"
+        ]
+      },
+      {
+        "id": "finding-response",
+        "text": "合成需求：人员通过接单、反馈、复核协作。",
+        "sourceIds": [
+          "source-a"
+        ]
+      }
+    ],
+    "dataPoints": [],
+    "sourceMap": [
+      {
+        "sourceId": "source-a",
+        "title": "合成园区运营访谈",
+        "locator": "验收示例第1节"
+      }
+    ]
+  },
+  "pair": {
+    "schemaVersion": 1,
+    "outline": {
+      "schemaVersion": 1,
+      "outline": {
+        "title": "合成园区双模块协同运营方案",
+        "slides": [
+          {
+            "id": "goals",
+            "title": "园区协同运营建设目标",
+            "purpose": "明确告警发现、处置协同和复盘的建设边界",
+            "sourceIds": [
+              "source-a"
+            ],
+            "findingIds": [
+              "finding-sensing",
+              "finding-response"
+            ],
+            "dataPointIds": []
+          },
+          {
+            "id": "architecture",
+            "title": "感知与处置双模块总体架构",
+            "purpose": "展示两个模块从告警输入到闭环反馈的关系",
+            "sourceIds": [
+              "source-a"
+            ],
+            "findingIds": [
+              "finding-sensing",
+              "finding-response"
+            ],
+            "dataPointIds": []
+          },
+          {
+            "id": "sensing",
+            "title": "感知接入：让告警可识别可追踪",
+            "purpose": "说明感知模块的输入、处理和输出",
+            "sourceIds": [
+              "source-a"
+            ],
+            "findingIds": [
+              "finding-sensing",
+              "finding-response"
+            ],
+            "dataPointIds": []
+          },
+          {
+            "id": "response",
+            "title": "协同处置：把任务交到现场",
+            "purpose": "说明处置模块如何完成责任交接与闭环",
+            "sourceIds": [
+              "source-a"
+            ],
+            "findingIds": [
+              "finding-sensing",
+              "finding-response"
+            ],
+            "dataPointIds": []
+          },
+          {
+            "id": "scenario",
+            "title": "人员协作场景：从设备告警到复核闭环",
+            "purpose": "将双模块串入同一人员操作场景",
+            "sourceIds": [
+              "source-a"
+            ],
+            "findingIds": [
+              "finding-sensing",
+              "finding-response"
+            ],
+            "dataPointIds": []
+          }
+        ]
+      },
+      "plan": {
+        "schemaVersion": 1,
+        "modules": [
+          {
+            "id": "sensing",
+            "name": "感知接入",
+            "findingIds": [
+              "finding-sensing"
+            ]
+          },
+          {
+            "id": "response",
+            "name": "协同处置",
+            "findingIds": [
+              "finding-response"
+            ]
+          }
+        ],
+        "pages": [
+          {
+            "slideId": "goals",
+            "pageType": "goals",
+            "keyMessage": "明确告警发现、处置协同和复盘的建设边界",
+            "moduleIds": []
+          },
+          {
+            "slideId": "architecture",
+            "pageType": "architecture",
+            "keyMessage": "展示两个模块从告警输入到闭环反馈的关系",
+            "moduleIds": [
+              "sensing",
+              "response"
+            ]
+          },
+          {
+            "slideId": "sensing",
+            "pageType": "module",
+            "keyMessage": "说明感知模块的输入、处理和输出",
+            "moduleIds": [
+              "sensing"
+            ]
+          },
+          {
+            "slideId": "response",
+            "pageType": "module",
+            "keyMessage": "说明处置模块如何完成责任交接与闭环",
+            "moduleIds": [
+              "response"
+            ]
+          },
+          {
+            "slideId": "scenario",
+            "pageType": "scenario",
+            "keyMessage": "将双模块串入同一人员操作场景",
+            "moduleIds": [
+              "sensing",
+              "response"
+            ]
+          }
+        ]
+      }
+    },
+    "details": {
+      "schemaVersion": 1,
+      "specs": [
+        {
+          "id": "goals",
+          "title": "园区协同运营建设目标",
+          "body": [
+            "统一接入园区告警，建立可追溯事件台账",
+            "联动值班调度与现场人员，减少信息断点",
+            "以过程留痕支撑复盘，不承诺未经验证的指标"
+          ],
+          "findingIds": [
+            "finding-sensing",
+            "finding-response"
+          ],
+          "dataPointIds": [],
+          "tables": [],
+          "charts": [],
+          "shapes": [],
+          "sourceMap": [
+            {
+              "sourceId": "source-a",
+              "title": "合成园区运营访谈",
+              "locator": "验收示例第1节"
+            }
+          ],
+          "imageGenerationBrief": "深蓝标题配三列目标卡片，分别用信号、人员、记录图形表达。"
+        },
+        {
+          "id": "architecture",
+          "title": "感知与处置双模块总体架构",
+          "body": [
+            "感知接入模块：汇聚告警并标记来源与位置",
+            "协同处置模块：分派任务并记录现场反馈",
+            "事件台账贯穿两模块，复盘结果回流告警规则"
+          ],
+          "findingIds": [
+            "finding-sensing",
+            "finding-response"
+          ],
+          "dataPointIds": [],
+          "tables": [],
+          "charts": [],
+          "shapes": [],
+          "sourceMap": [
+            {
+              "sourceId": "source-a",
+              "title": "合成园区运营访谈",
+              "locator": "验收示例第1节"
+            }
+          ],
+          "imageGenerationBrief": "上层呈现告警输入，中层左右排列两个模块，下层共享事件台账；箭头清晰。"
+        },
+        {
+          "id": "sensing",
+          "title": "感知接入：让告警可识别可追踪",
+          "body": [
+            "输入设备告警及人工上报，保留来源",
+            "合并同类事件并标注位置、时间和状态",
+            "输出可派发事件，异常来源进入人工核验"
+          ],
+          "findingIds": [
+            "finding-sensing",
+            "finding-response"
+          ],
+          "dataPointIds": [],
+          "tables": [],
+          "charts": [],
+          "shapes": [],
+          "sourceMap": [
+            {
+              "sourceId": "source-a",
+              "title": "合成园区运营访谈",
+              "locator": "验收示例第1节"
+            }
+          ],
+          "imageGenerationBrief": "以告警卡片为输入、去重节点为中间、事件卡片为输出，侧置人工核验分支。"
+        },
+        {
+          "id": "response",
+          "title": "协同处置：把任务交到现场",
+          "body": [
+            "值班员根据事件位置派发任务",
+            "现场人员确认接单并回传处理记录",
+            "复核人员核验结果，未通过则退回补充"
+          ],
+          "findingIds": [
+            "finding-sensing",
+            "finding-response"
+          ],
+          "dataPointIds": [],
+          "tables": [],
+          "charts": [],
+          "shapes": [],
+          "sourceMap": [
+            {
+              "sourceId": "source-a",
+              "title": "合成园区运营访谈",
+              "locator": "验收示例第1节"
+            }
+          ],
+          "imageGenerationBrief": "三条角色泳道呈现值班员、现场人员、复核人员，退回箭头与正常闭环分开。"
+        },
+        {
+          "id": "scenario",
+          "title": "人员协作场景：从设备告警到复核闭环",
+          "body": [
+            "设备异常触发告警",
+            "值班员核验位置并创建事件",
+            "感知接入模块形成可派发事件",
+            "事件进入协同处置待办",
+            "现场人员接单并完成处置",
+            "复核人员确认闭环并保存记录"
+          ],
+          "findingIds": [
+            "finding-sensing",
+            "finding-response"
+          ],
+          "dataPointIds": [],
+          "tables": [],
+          "charts": [],
+          "shapes": [],
+          "sourceMap": [
+            {
+              "sourceId": "source-a",
+              "title": "合成园区运营访谈",
+              "locator": "验收示例第1节"
+            }
+          ],
+          "imageGenerationBrief": "六步故事板串联控制室与设备现场，两个模块用一致颜色标签标记，突出人员动作。"
+        }
+      ],
+      "designs": [
+        {
+          "slideId": "goals",
+          "layout": "三列建设目标卡片",
+          "visualFocus": "发现、协同、复盘三项目标",
+          "speakerNotes": "讲者备注：明确告警发现、处置协同和复盘的建设边界。仅用于说明合成演示，不作为上屏文字。",
+          "textBindings": [
+            {
+              "id": "title",
+              "path": "/title"
+            },
+            {
+              "id": "body-0",
+              "path": "/body/0"
+            },
+            {
+              "id": "body-1",
+              "path": "/body/1"
+            },
+            {
+              "id": "body-2",
+              "path": "/body/2"
+            }
+          ],
+          "scene": null
+        },
+        {
+          "slideId": "architecture",
+          "layout": "上下分层架构与双模块连接线",
+          "visualFocus": "告警流向协同处置，反馈回流感知",
+          "speakerNotes": "讲者备注：展示两个模块从告警输入到闭环反馈的关系。仅用于说明合成演示，不作为上屏文字。",
+          "textBindings": [
+            {
+              "id": "title",
+              "path": "/title"
+            },
+            {
+              "id": "body-0",
+              "path": "/body/0"
+            },
+            {
+              "id": "body-1",
+              "path": "/body/1"
+            },
+            {
+              "id": "body-2",
+              "path": "/body/2"
+            }
+          ],
+          "scene": null
+        },
+        {
+          "slideId": "sensing",
+          "layout": "横向输入处理输出流程",
+          "visualFocus": "保留来源的可派发事件",
+          "speakerNotes": "讲者备注：说明感知模块的输入、处理和输出。仅用于说明合成演示，不作为上屏文字。",
+          "textBindings": [
+            {
+              "id": "title",
+              "path": "/title"
+            },
+            {
+              "id": "body-0",
+              "path": "/body/0"
+            },
+            {
+              "id": "body-1",
+              "path": "/body/1"
+            },
+            {
+              "id": "body-2",
+              "path": "/body/2"
+            }
+          ],
+          "scene": null
+        },
+        {
+          "slideId": "response",
+          "layout": "角色泳道与审核回路",
+          "visualFocus": "接单、反馈和复核责任清楚",
+          "speakerNotes": "讲者备注：说明处置模块如何完成责任交接与闭环。仅用于说明合成演示，不作为上屏文字。",
+          "textBindings": [
+            {
+              "id": "title",
+              "path": "/title"
+            },
+            {
+              "id": "body-0",
+              "path": "/body/0"
+            },
+            {
+              "id": "body-1",
+              "path": "/body/1"
+            },
+            {
+              "id": "body-2",
+              "path": "/body/2"
+            }
+          ],
+          "scene": null
+        },
+        {
+          "slideId": "scenario",
+          "layout": "连续六步人物场景故事板",
+          "visualFocus": "值班员到现场人员再到复核人员的交接",
+          "speakerNotes": "讲者备注：将双模块串入同一人员操作场景。仅用于说明合成演示，不作为上屏文字。",
+          "textBindings": [
+            {
+              "id": "title",
+              "path": "/title"
+            },
+            {
+              "id": "body-0",
+              "path": "/body/0"
+            },
+            {
+              "id": "body-1",
+              "path": "/body/1"
+            },
+            {
+              "id": "body-2",
+              "path": "/body/2"
+            },
+            {
+              "id": "body-3",
+              "path": "/body/3"
+            },
+            {
+              "id": "body-4",
+              "path": "/body/4"
+            },
+            {
+              "id": "body-5",
+              "path": "/body/5"
+            }
+          ],
+          "scene": {
+            "steps": [
+              {
+                "id": "detect",
+                "moduleId": "sensing",
+                "actor": "值班员",
+                "location": "控制室",
+                "triggerRef": "body-0",
+                "actionRef": "body-1",
+                "responseRef": "body-2",
+                "outcomeRef": "body-3"
+              },
+              {
+                "id": "resolve",
+                "moduleId": "response",
+                "actor": "现场人员与复核人员",
+                "location": "设备现场及控制室",
+                "triggerRef": "body-3",
+                "actionRef": "body-4",
+                "responseRef": "body-5",
+                "outcomeRef": "body-5"
+              }
+            ],
+            "edges": [
+              {
+                "from": "detect",
+                "to": "resolve"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

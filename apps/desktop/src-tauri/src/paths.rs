@@ -238,6 +238,170 @@ fn strict_relative_components(candidate: &Path) -> Result<Vec<std::ffi::OsString
     Ok(result)
 }
 
+/// Immutable evidence of a descriptor-verified, bounded regular file read.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FileReadEvidence {
+    pub device: u64,
+    pub inode: u64,
+    pub byte_length: u64,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
+    pub sha256: String,
+}
+
+pub(crate) struct VerifiedFileRead {
+    pub evidence: FileReadEvidence,
+    pub bytes: Vec<u8>,
+}
+
+/// Missing files return None; unsafe parents, links and special files are errors.
+/// A later read also proves that an optional WAL has not appeared or vanished.
+pub(crate) fn read_bounded_workspace_file(
+    root: &Path,
+    relative: &Path,
+    limit: usize,
+) -> Result<Option<VerifiedFileRead>, String> {
+    let components = strict_relative_components(relative)?;
+    #[cfg(unix)]
+    {
+        use sha2::{Digest, Sha256};
+        use std::{
+            ffi::CString,
+            io::Read,
+            os::{
+                fd::{AsRawFd, FromRawFd, OwnedFd},
+                unix::{ffi::OsStrExt, fs::MetadataExt},
+            },
+        };
+        let root = fs::canonicalize(root).map_err(|e| e.to_string())?;
+        let name = CString::new(root.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        // SAFETY: C string is terminated; every acquired descriptor has one owner.
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: fd is freshly opened above.
+        let mut directory = unsafe { OwnedFd::from_raw_fd(fd) };
+        for component in &components[..components.len() - 1] {
+            let name = CString::new(component.as_bytes()).map_err(|e| e.to_string())?;
+            // SAFETY: parent remains open and name is terminated.
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(format!(
+                    "unsafe read parent: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            // SAFETY: fd is freshly opened above.
+            directory = unsafe { OwnedFd::from_raw_fd(fd) };
+        }
+        let name =
+            CString::new(components.last().unwrap().as_bytes()).map_err(|e| e.to_string())?;
+        // NONBLOCK ensures a FIFO cannot block before its file type is checked.
+        // SAFETY: parent remains open and name is terminated.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(format!("unsafe read file: {error}"))
+            };
+        }
+        // SAFETY: fd is freshly opened above.
+        let mut file = unsafe { fs::File::from_raw_fd(fd) };
+        let before = file.metadata().map_err(|e| e.to_string())?;
+        if !before.is_file() {
+            return Err("read requires a regular file".into());
+        }
+        if before.len() > limit as u64 {
+            return Err("file exceeds snapshot byte limit".into());
+        }
+        let identity = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        // Allocate only the checked descriptor length. A growing file cannot
+        // trigger Vec growth past the configured bound before rejection.
+        let mut bytes = vec![0; before.len() as usize];
+        file.read_exact(&mut bytes)
+            .map_err(|e| format!("source_changed during descriptor read: {e}"))?;
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra).map_err(|e| e.to_string())? != 0 {
+            return Err("source_changed during descriptor read".into());
+        }
+        let after = file.metadata().map_err(|e| e.to_string())?;
+        let mut linked = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: output points to writable stat storage; path is relative to held parent.
+        let result = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                linked.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err("source_changed during descriptor read".into());
+        }
+        // SAFETY: successful fstatat initialized linked.
+        let linked = unsafe { linked.assume_init() };
+        if bytes.len() > limit
+            || bytes.len() as u64 != before.len()
+            || identity(&before) != identity(&after)
+            || linked.st_dev as u64 != before.dev()
+            || linked.st_ino as u64 != before.ino()
+        {
+            return Err("source_changed during descriptor read".into());
+        }
+        Ok(Some(VerifiedFileRead {
+            evidence: FileReadEvidence {
+                device: before.dev(),
+                inode: before.ino(),
+                byte_length: before.len(),
+                modified_seconds: before.mtime(),
+                modified_nanoseconds: before.mtime_nsec(),
+                changed_seconds: before.ctime(),
+                changed_nanoseconds: before.ctime_nsec(),
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+            },
+            bytes,
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, components, limit);
+        Err("snapshot reads require descriptor-relative filesystem support".into())
+    }
+}
+
 #[cfg(unix)]
 fn write_at_workspace_fd(
     workspace: &Path,

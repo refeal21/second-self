@@ -5,7 +5,7 @@ use std::{
     process::{Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -23,6 +23,7 @@ use crate::{
     paths::{
         atomic_write_workspace_file, create_workspace_project_tree, write_new_workspace_artifact,
     },
+    presales::{native_value_hash, validate_pair, PresalesDraftPair, ProjectCheckpoint},
 };
 
 const ARTIFACT_DIRECTORIES: [&str; 7] = [
@@ -40,6 +41,8 @@ static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub struct WorkbenchService {
     database: Mutex<Database>,
     workspace_root: Mutex<PathBuf>,
+    database_path: PathBuf,
+    activity: Arc<crate::presales_v3::activity::LegacyActivityTracker>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -89,6 +92,18 @@ pub struct PipelineCommitInput {
     pub visual_request_id: Option<String>,
     pub visual_provider: Option<crate::visual_style::VisualProvider>,
     pub expected_style_revision: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PairedCheckpointCommitInput {
+    pub commit: PipelineCommitInput,
+    pub presales: PresalesDraftPair,
+}
+
+struct PreparedPipelineCommit {
+    artifacts: Vec<PersistedArtifact>,
+    writes: Vec<(PathBuf, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -204,7 +219,7 @@ impl WorkbenchService {
             .map_err(|error| format!("Workspace cannot be created: {error}"))?;
         let workspace_root = fs::canonicalize(requested_workspace)
             .map_err(|error| format!("Workspace cannot be resolved: {error}"))?;
-        let database = Database::open(database_path)
+        let database = Database::open(&database_path)
             .map_err(|error| format!("Local database cannot be opened: {error}"))?;
         if database
             .setting("workspace_path")
@@ -229,9 +244,16 @@ impl WorkbenchService {
             .map_err(|error| format!("Stored workspace cannot be created: {error}"))?;
         let stored_workspace = fs::canonicalize(stored_workspace)
             .map_err(|error| format!("Stored workspace cannot be resolved: {error}"))?;
+        let database_path = fs::canonicalize(database_path).map_err(|error| error.to_string())?;
+        let activity = crate::presales_v3::activity::LegacyActivityTracker::new(
+            crate::presales_v3::V3Store::open(database_path.with_file_name("presales-v3.sqlite3"))?,
+        )
+        .map_err(|error| format!("legacy_activity_initialization_failed: {error}"))?;
         Ok(Self {
             database: Mutex::new(database),
             workspace_root: Mutex::new(stored_workspace),
+            database_path,
+            activity: Arc::new(activity),
         })
     }
 
@@ -309,6 +331,7 @@ impl WorkbenchService {
     }
 
     pub fn create_project(&self, input: CreateProjectInput) -> Result<ProjectSummary, String> {
+        let _activity = self.activity.mutation_guard()?;
         let name = non_empty(input.name, "Project name")?;
         let goal = non_empty(input.goal, "Project goal")?;
         let id = next_identifier("project");
@@ -333,15 +356,24 @@ impl WorkbenchService {
     }
 
     pub fn load_pipeline(&self, project_id: &str) -> Result<Value, String> {
+        let checkpoint = self.load_project_checkpoint(project_id)?;
+        if checkpoint.presales.is_some() {
+            return Err("Presales projects require the paired checkpoint command".into());
+        }
+        Ok(checkpoint.pipeline)
+    }
+
+    pub fn load_project_checkpoint(&self, project_id: &str) -> Result<ProjectCheckpoint, String> {
         self.database()?
-            .get_project(project_id)
-            .map_err(database_error)?
-            .map(|project| project.pipeline)
-            .ok_or_else(|| "Unknown project".to_string())
+            .load_project_checkpoint(project_id)
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => "Unknown project".into(),
+                error => database_error(error),
+            })
     }
 
     pub fn project_directory(&self, project_id: &str) -> Result<String, String> {
-        self.load_pipeline(project_id)?;
+        self.load_project_checkpoint(project_id)?;
         let path = self.workspace()?.join(project_id);
         let canonical = fs::canonicalize(path)
             .map_err(|error| format!("Project directory cannot be resolved: {error}"))?;
@@ -602,6 +634,7 @@ impl WorkbenchService {
     }
 
     pub fn attach_source(&self, input: AttachSourceInput) -> Result<Value, String> {
+        let _activity = self.activity.mutation_guard()?;
         let file_name = non_empty(input.file_name, "Source file name")?;
         if Path::new(&file_name)
             .file_name()
@@ -664,6 +697,7 @@ impl WorkbenchService {
     }
 
     pub fn commit_pipeline(&self, input: PipelineCommitInput) -> Result<Value, String> {
+        let _activity = self.activity.mutation_guard()?;
         let workspace = self.workspace()?;
         let database = self.database()?;
         let current = database
@@ -678,80 +712,21 @@ impl WorkbenchService {
         if current_revision != input.expected_revision {
             return Err("stale pipeline revision".into());
         }
-        crate::visual_style::validate_native_visual_shape(&input.pipeline)?;
-        validate_revision_commit(
-            &current.pipeline,
-            &input.pipeline,
-            &input.project_id,
-            input.expected_revision,
-        )?;
-        validate_revision_artifacts(&current.pipeline, &input.pipeline, &input.writes)?;
-        validate_prompt_context_commit(
-            &current.pipeline,
-            &input.pipeline,
-            &input.project_id,
-            input.expected_revision,
-            !input.writes.is_empty(),
-        )?;
-        crate::visual_style::validate_visual_writes(&input.pipeline, &input.writes)?;
-        let mut artifacts = Vec::with_capacity(input.writes.len());
-        let mut validated_writes = Vec::with_capacity(input.writes.len());
-        let mut write_paths = std::collections::HashSet::new();
-        for (index, write) in input.writes.iter().enumerate() {
-            let bytes = decode_base64(&write.contents_base64)?;
-            if bytes.len() != write.byte_length || sha256(&bytes) != write.sha256 {
-                return Err(
-                    "Worker artifact length or SHA-256 does not match its write intent".into(),
-                );
-            }
-            validate_worker_relative_path(&write.relative_path)?;
-            if write.relative_path.starts_with("visuals/style-templates/") {
-                return Err(
-                    "Template assets can only be saved through visual style confirmation".into(),
-                );
-            }
-            if !write_paths.insert(write.relative_path.clone()) {
-                return Err("Duplicate artifact write path".into());
-            }
-            if frozen_artifact_paths(&current.pipeline).contains(&write.relative_path) {
-                return Err("Frozen or historical artifacts are immutable".into());
-            }
-            validated_writes.push((
-                Path::new(&input.project_id).join(&write.relative_path),
-                bytes,
-            ));
-            artifacts.push(PersistedArtifact {
-                id: format!(
-                    "{}-artifact-{}-{}",
-                    input.project_id,
-                    input.expected_revision + 1,
-                    index + 1
-                ),
-                version_id: write.version_id.clone(),
-                path: write.relative_path.clone(),
-                kind: write.kind.clone(),
-                created_at: input
-                    .pipeline
-                    .pointer("/project/updatedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .into(),
-            });
-        }
+        let prepared = prepare_pipeline_commit(&current.pipeline, &input, false, false)?;
         let mut new_artifacts = Vec::new();
         if !database
             .replace_pipeline_with_visual_artifacts(
                 &input.project_id,
                 input.expected_revision,
                 &input.pipeline,
-                &artifacts,
+                &prepared.artifacts,
                 crate::visual_style::VisualCommitContext {
                     request_id: input.visual_request_id.as_deref(),
                     provider: input.visual_provider.as_ref(),
                     expected_style_revision: input.expected_style_revision,
                 },
                 || {
-                    for (path, bytes) in &validated_writes {
+                    for (path, bytes) in &prepared.writes {
                         if input.pipeline["schemaVersion"] == 2
                             || input.visual_request_id.is_some()
                             || path.starts_with(Path::new(&input.project_id).join("visuals"))
@@ -775,6 +750,66 @@ impl WorkbenchService {
         Ok(input.pipeline)
     }
 
+    pub fn commit_project_checkpoint(
+        &self,
+        input: PairedCheckpointCommitInput,
+    ) -> Result<ProjectCheckpoint, String> {
+        let _activity = self.activity.mutation_guard()?;
+        let workspace = self.workspace()?;
+        let database = self.database()?;
+        let current = database
+            .load_project_checkpoint(&input.commit.project_id)
+            .map_err(database_error)?;
+        let current_revision = current
+            .pipeline
+            .get("revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "Persisted pipeline revision is invalid".to_string())?;
+        if current_revision != input.commit.expected_revision {
+            return Err("stale pipeline revision".into());
+        }
+        let first_pair = current.presales.is_none();
+        let mut prepared =
+            prepare_pipeline_commit(&current.pipeline, &input.commit, true, first_pair)?;
+        let analysis = current
+            .pipeline
+            .pointer("/analysis/output")
+            .ok_or("Paired checkpoint requires source analysis")?;
+        validate_pair(&input.presales, analysis)?;
+        append_companion_artifacts(
+            &mut prepared,
+            current.presales.as_ref().map(|value| &value.draft),
+            &input.presales,
+            &input.commit,
+        )?;
+        let mut new_artifacts = Vec::new();
+        let saved = database
+            .replace_checkpoint_with_artifacts(
+                &input.commit.project_id,
+                input.commit.expected_revision,
+                &input.commit.pipeline,
+                &input.presales,
+                &prepared.artifacts,
+                crate::visual_style::VisualCommitContext {
+                    request_id: input.commit.visual_request_id.as_deref(),
+                    provider: input.commit.visual_provider.as_ref(),
+                    expected_style_revision: input.commit.expected_style_revision,
+                },
+                || {
+                    for (path, bytes) in &prepared.writes {
+                        new_artifacts.push(write_new_workspace_artifact(&workspace, path, bytes)?);
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(database_error)?
+            .ok_or_else(|| "stale pipeline revision".to_string())?;
+        for artifact in new_artifacts {
+            artifact.commit();
+        }
+        Ok(saved)
+    }
+
     pub fn persistence_counts(&self, project_id: &str) -> Result<PersistenceCounts, String> {
         self.database()?
             .persistence_counts(project_id)
@@ -782,6 +817,7 @@ impl WorkbenchService {
     }
 
     pub fn rename_project(&self, id: &str, name: String) -> Result<String, String> {
+        let _activity = self.activity.mutation_guard()?;
         let name = non_empty(name, "Project name")?;
         let changed = self
             .database()?
@@ -921,6 +957,7 @@ impl WorkbenchService {
     }
 
     pub fn decide_approval(&self, id: &str, decision: &str) -> Result<String, String> {
+        let _activity = self.activity.mutation_guard()?;
         let changed = self
             .database()?
             .decide_approval(id, decision, &now_string())
@@ -937,6 +974,7 @@ impl WorkbenchService {
     }
 
     pub fn decide_memory(&self, id: &str, decision: &str) -> Result<String, String> {
+        let _activity = self.activity.mutation_guard()?;
         let changed = self
             .database()?
             .decide_memory(id, decision, &now_string())
@@ -953,6 +991,7 @@ impl WorkbenchService {
     }
 
     pub fn propose_memory(&self, title: String, content: String) -> Result<String, String> {
+        let _activity = self.activity.mutation_guard()?;
         let title = non_empty(title, "Memory proposal title")?;
         let content = non_empty(content, "Memory proposal content")?;
         self.database()?
@@ -974,6 +1013,7 @@ impl WorkbenchService {
         codex_path: String,
         pdf_renderer_path: String,
     ) -> Result<String, String> {
+        let _activity = self.activity.mutation_guard()?;
         let workspace = PathBuf::from(non_empty(workspace_path, "Workspace path")?);
         if !workspace.is_absolute() {
             return Err("Workspace path must be absolute".into());
@@ -1055,6 +1095,7 @@ impl WorkbenchService {
     }
 
     fn persist_mutation(&self, id: &str, mutation: &ProjectMutation) -> Result<(), String> {
+        let _activity = self.activity.mutation_guard()?;
         let database = self.database()?;
         if database
             .get_project(id)
@@ -1077,6 +1118,74 @@ impl WorkbenchService {
         self.database
             .lock()
             .map_err(|_| "Database state lock poisoned".to_string())
+    }
+
+    pub(crate) fn activity(&self) -> &Arc<crate::presales_v3::activity::LegacyActivityTracker> {
+        &self.activity
+    }
+
+    pub(crate) fn native_source(
+        &self,
+        project_id: &str,
+    ) -> Result<crate::presales_v3::activity::NativeSource, String> {
+        let root = PathBuf::from(self.project_directory(project_id)?);
+        Ok(crate::presales_v3::activity::NativeSource::new(
+            self.database_path.clone(),
+            project_id.into(),
+            root,
+        ))
+    }
+
+    /// Copy intake must not query the live SQLite connection: even a read may
+    /// update WAL shared-memory read marks. The captured read-only image checks
+    /// project existence and exact identity after this filesystem-only lookup.
+    pub(crate) fn native_copy_source(
+        &self,
+        project_id: &str,
+    ) -> Result<crate::presales_v3::activity::NativeSource, String> {
+        if project_id.is_empty()
+            || project_id.len() > 160
+            || !project_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err("Invalid source project identity".into());
+        }
+        let workspace = self.workspace()?;
+        let path = workspace.join(project_id);
+        let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err("Source project must be a native directory".into());
+        }
+        let root = fs::canonicalize(path).map_err(|e| e.to_string())?;
+        if !root.starts_with(&workspace) {
+            return Err("Source project is outside workspace".into());
+        }
+        Ok(crate::presales_v3::activity::NativeSource::new(
+            self.database_path.clone(),
+            project_id.into(),
+            root,
+        ))
+    }
+
+    /// Used only while the caller already holds admission and has loaded and
+    /// validated this native project inside the legacy transaction. Avoids
+    /// re-entering the legacy DB mutex during visual-request begin.
+    pub(crate) fn native_source_for_checked_project(
+        &self,
+        project: &StoredProject,
+    ) -> Result<crate::presales_v3::activity::NativeSource, String> {
+        let workspace = self.workspace()?;
+        let root = fs::canonicalize(workspace.join(&project.id))
+            .map_err(|error| format!("Project directory cannot be resolved: {error}"))?;
+        if !root.is_dir() || !root.starts_with(&workspace) {
+            return Err("Project directory is outside the workspace".into());
+        }
+        Ok(crate::presales_v3::activity::NativeSource::new(
+            self.database_path.clone(),
+            project.id.clone(),
+            root,
+        ))
     }
 
     pub(crate) fn workspace(&self) -> Result<PathBuf, String> {
@@ -1302,6 +1411,258 @@ fn validate_revision_artifacts(
         }
     }
     Ok(())
+}
+
+fn prepare_pipeline_commit(
+    current: &Value,
+    input: &PipelineCommitInput,
+    paired: bool,
+    first_pair: bool,
+) -> Result<PreparedPipelineCommit, String> {
+    crate::visual_style::validate_native_visual_shape(&input.pipeline)?;
+    validate_revision_commit(
+        current,
+        &input.pipeline,
+        &input.project_id,
+        input.expected_revision,
+    )?;
+    if paired {
+        for write in &input.writes {
+            validate_worker_relative_path(&write.relative_path)?;
+            if is_presales_artifact_path(&write.relative_path) {
+                return Err("Presales companion artifact paths are native-owned".into());
+            }
+        }
+    }
+    validate_revision_artifacts(current, &input.pipeline, &input.writes)?;
+    if paired {
+        validate_paired_v1_artifacts(current, &input.pipeline, &input.writes, first_pair)?;
+    }
+    validate_prompt_context_commit(
+        current,
+        &input.pipeline,
+        &input.project_id,
+        input.expected_revision,
+        !input.writes.is_empty(),
+    )?;
+    crate::visual_style::validate_visual_writes(&input.pipeline, &input.writes)?;
+
+    let mut artifacts = Vec::with_capacity(input.writes.len());
+    let mut writes = Vec::with_capacity(input.writes.len());
+    let mut paths = std::collections::HashSet::new();
+    for (index, write) in input.writes.iter().enumerate() {
+        let bytes = decode_base64(&write.contents_base64)?;
+        if bytes.len() != write.byte_length || sha256(&bytes) != write.sha256 {
+            return Err("Worker artifact length or SHA-256 does not match its write intent".into());
+        }
+        validate_worker_relative_path(&write.relative_path)?;
+        if paired && is_presales_artifact_path(&write.relative_path) {
+            return Err("Presales companion artifact paths are native-owned".into());
+        }
+        if write.relative_path.starts_with("visuals/style-templates/") {
+            return Err(
+                "Template assets can only be saved through visual style confirmation".into(),
+            );
+        }
+        if !paths.insert(write.relative_path.clone()) {
+            return Err("Duplicate artifact write path".into());
+        }
+        if frozen_artifact_paths(current).contains(&write.relative_path) {
+            return Err("Frozen or historical artifacts are immutable".into());
+        }
+        writes.push((
+            Path::new(&input.project_id).join(&write.relative_path),
+            bytes,
+        ));
+        artifacts.push(PersistedArtifact {
+            id: artifact_id(input, index),
+            version_id: write.version_id.clone(),
+            path: write.relative_path.clone(),
+            kind: write.kind.clone(),
+            created_at: commit_created_at(input),
+        });
+    }
+    Ok(PreparedPipelineCommit { artifacts, writes })
+}
+
+fn validate_paired_v1_artifacts(
+    current: &Value,
+    next: &Value,
+    writes: &[ArtifactWriteInput],
+    first_pair: bool,
+) -> Result<(), String> {
+    if next["schemaVersion"] != 1 {
+        return Ok(());
+    }
+    let revision = next["revision"]
+        .as_i64()
+        .ok_or("Paired pipeline revision is invalid")?;
+    let mut expected = Vec::new();
+    if first_pair || current.pointer("/outline/value") != next.pointer("/outline/value") {
+        expected.push((
+            format!("outline/outline-r{revision}.json"),
+            "outline",
+            next.pointer("/outline/version/id")
+                .and_then(Value::as_str)
+                .ok_or("Paired outline version is invalid")?,
+            next.pointer("/outline/value")
+                .ok_or("Paired outline content is missing")?,
+        ));
+    }
+    if (first_pair && next.pointer("/slideSpecs/value").is_some())
+        || current.pointer("/slideSpecs/value") != next.pointer("/slideSpecs/value")
+    {
+        expected.push((
+            format!("slide-specs/slide-specs-r{revision}.json"),
+            "slide-specs",
+            next.pointer("/slideSpecs/version/id")
+                .and_then(Value::as_str)
+                .ok_or("Paired slide-spec version is invalid")?,
+            next.pointer("/slideSpecs/value")
+                .ok_or("Paired slide-spec content is missing")?,
+        ));
+    }
+    if writes.len() != expected.len() {
+        return Err("Paired v1 commit must include its exact changed-content artifact set".into());
+    }
+    for (path, kind, version_id, value) in expected {
+        let write = writes
+            .iter()
+            .find(|write| write.relative_path == path)
+            .ok_or("Paired v1 changed-content artifact is missing")?;
+        let decoded: Value = serde_json::from_slice(&decode_base64(&write.contents_base64)?)
+            .map_err(|_| "Paired v1 changed-content artifact must be valid JSON")?;
+        let expected_value = if kind == "slide-specs" {
+            serde_json::json!({
+                "outlineVersionId": next["outline"]["version"]["id"],
+                "specs": value
+            })
+        } else {
+            value.clone()
+        };
+        if write.kind != kind
+            || write.version_id != version_id
+            || decoded != expected_value
+            || write.slide_id.is_some()
+            || write.metadata.is_some()
+        {
+            return Err("Paired v1 changed-content artifact does not match its checkpoint".into());
+        }
+    }
+    Ok(())
+}
+
+fn append_companion_artifacts(
+    prepared: &mut PreparedPipelineCommit,
+    prior: Option<&PresalesDraftPair>,
+    next: &PresalesDraftPair,
+    input: &PipelineCommitInput,
+) -> Result<(), String> {
+    let revision = input.expected_revision + 1;
+    let plan = next.outline.get("plan").ok_or("Presales plan is missing")?;
+    if prior.map(|pair| &pair.outline["plan"]) != Some(plan) {
+        append_native_artifact(
+            prepared,
+            input,
+            format!(
+                "outline/presales/plan-r{revision}-{}.json",
+                native_value_hash(plan)?
+            ),
+            "presales-plan",
+            input
+                .pipeline
+                .pointer("/outline/version/id")
+                .and_then(Value::as_str)
+                .ok_or("Presales outline version is missing")?,
+            plan,
+        )?;
+    }
+    let designs = next
+        .details
+        .as_ref()
+        .and_then(|details| details.get("designs"));
+    let prior_designs = prior
+        .and_then(|pair| pair.details.as_ref())
+        .and_then(|details| details.get("designs"));
+    if designs.is_some() && prior_designs != designs {
+        let designs = designs.unwrap();
+        append_native_artifact(
+            prepared,
+            input,
+            format!(
+                "slide-specs/presales/designs-r{revision}-{}.json",
+                native_value_hash(designs)?
+            ),
+            "presales-designs",
+            input
+                .pipeline
+                .pointer("/slideSpecs/version/id")
+                .and_then(Value::as_str)
+                .ok_or("Presales detail version is missing")?,
+            designs,
+        )?;
+    }
+    Ok(())
+}
+
+fn append_native_artifact(
+    prepared: &mut PreparedPipelineCommit,
+    input: &PipelineCommitInput,
+    relative_path: String,
+    kind: &str,
+    version_id: &str,
+    value: &Value,
+) -> Result<(), String> {
+    if prepared
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.path == relative_path)
+    {
+        return Err("Duplicate artifact write path".into());
+    }
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| format!("Presales companion cannot be serialized: {error}"))?;
+    let ordinal = prepared.artifacts.len();
+    prepared
+        .writes
+        .push((Path::new(&input.project_id).join(&relative_path), bytes));
+    prepared.artifacts.push(PersistedArtifact {
+        id: artifact_id(input, ordinal),
+        version_id: version_id.into(),
+        path: relative_path,
+        kind: kind.into(),
+        created_at: commit_created_at(input),
+    });
+    Ok(())
+}
+
+fn artifact_id(input: &PipelineCommitInput, index: usize) -> String {
+    format!(
+        "{}-artifact-{}-{}",
+        input.project_id,
+        input.expected_revision + 1,
+        index + 1
+    )
+}
+
+fn commit_created_at(input: &PipelineCommitInput) -> String {
+    input
+        .pipeline
+        .pointer("/project/updatedAt")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .into()
+}
+
+fn is_presales_artifact_path(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(
+        (components.next(), components.next()),
+        (
+            Some(std::path::Component::Normal(first)),
+            Some(std::path::Component::Normal(second))
+        ) if (first == "outline" || first == "slide-specs") && second == "presales"
+    )
 }
 
 fn validate_revision_commit(

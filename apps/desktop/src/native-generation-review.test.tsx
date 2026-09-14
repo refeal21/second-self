@@ -351,8 +351,15 @@ describe('native generation lifecycle review', () => {
 
   it('keeps details generation visibly running and disabled after leaving and remounting', async () => {
     const test = harness();
+    const styleLoad = deferred<VisualStyleState>();
+    test.adapter.loadVisualStyle = vi.fn(() => styleLoad.promise);
     const first = test.mount();
-    fireEvent.click(await screen.findByRole('button', { name: '生成逐页细化' }));
+    const start = await screen.findByRole('button', { name: '生成逐页细化' });
+    expect(start).toBeDisabled();
+    styleLoad.resolve({ revision: 0, profile: null, locked: false });
+    await waitFor(() => expect(start).toBeEnabled());
+    fireEvent.click(start);
+    expect(test.adapter.generateDetails).toHaveBeenCalledOnce();
     expect(screen.getByRole('button', { name: '正在生成逐页细化…' })).toBeDisabled();
     first.unmount();
     test.mount();
@@ -363,8 +370,15 @@ describe('native generation lifecycle review', () => {
 
   it('applies a completed pipeline while mounted and when completion happened off-page', async () => {
     const test = harness();
+    const styleLoad = deferred<VisualStyleState>();
+    test.adapter.loadVisualStyle = vi.fn(() => styleLoad.promise);
     const first = test.mount();
-    fireEvent.click(await screen.findByRole('button', { name: '生成逐页细化' }));
+    const start = await screen.findByRole('button', { name: '生成逐页细化' });
+    expect(start).toBeDisabled();
+    styleLoad.resolve({ revision: 0, profile: null, locked: false });
+    await waitFor(() => expect(start).toBeEnabled());
+    fireEvent.click(start);
+    expect(test.adapter.generateDetails).toHaveBeenCalledOnce();
     test.finish();
     const details = await screen.findByRole('textbox', { name: '第 1 页正文第 1 段' }) as HTMLTextAreaElement;
     await waitFor(() => expect(details.value).toContain('关键结论'));

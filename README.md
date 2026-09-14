@@ -4,6 +4,10 @@ Second Self 是一个仅在本机运行的 macOS 工作台。它把通用 Codex 
 
 当前仓库是第一版工程与验收基线：生产窗口读取 Rust/SQLite 的真实持久化状态；Rust 监管内嵌 Worker 与 Codex App Server；五页中文 Golden Project 已覆盖合法审批链、批准 PNG 的安全预览、分层可编辑 OOXML 导出和 LibreOffice 全页 QA。浏览器开发模式包含明确标记的演示数据，不代表桌面端已保存的项目。
 
+售前 v3 开发分支增加独立页面队列（默认并发 4，可设 1–4）、成对的大纲/方案与细化/设计审批、逐页历史、反馈草稿及明确的历史采用/审批恢复。旧项目须在产品内显式创建副本；v1/v2 数据不自动改写。当前 v3 任意整页图的可编辑重建仍不支持：交付入口核对精确版本快照后返回“不支持可编辑转换”，不会生成伪 PPTX 或声称 QA 通过。上述 Golden Project 是旧导出器回归，不能证明 v3 自由版式转换。
+
+最终源码 `d5bcdd5` 的自包含 SEA 与 `Digital Twin Workbench V3 Dev.app` 已构建，保留在本工作树 `artifacts/build/presales-v3-dev/`；包内 v3 离线协议冒烟通过。构建指纹、签名限制和五页合成验收见 [售前 v3 验证记录](docs/verification-2026-09-11-presales-v3-workbench.md)，操作路径见 [开发与打包](docs/run-build.md#售前-v3-本轮独立开发产物)。保留包已做本地 ad-hoc 资源封装并通过严格签名验证，但没有 Developer ID 签名或公证。不同名称只避免覆盖文件，不隔离运行数据：它保留标准 bundle identifier，手动启动仍初始化常规工作区并自动连接账户。本轮未启动原生 GUI。
+
 ## 第一版边界
 
 - macOS 13+、Apple Silicon、单人本地使用。

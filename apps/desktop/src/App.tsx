@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from 'react';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { isTauri } from '@tauri-apps/api/core';
 import {
   createDesktopAdapter,
   type ApprovalSummary,
@@ -26,6 +27,8 @@ import {
 } from './workbench-store.js';
 import './styles.css';
 import { NativeWorkspacePage } from './native-workspace.js';
+import { PresalesWorkspacePage } from './presales/workspace.js';
+import { createPresalesAdapter, type PresalesAdapter, type V3CatalogEntry, type V3PreparedCopy } from './presales/adapter.js';
 import { installNativeCloseGuard } from './native-window-close.js';
 import { formatProjectTime, parseProjectTime, projectStatus, sortProjectsByUpdatedAt } from './task-presentation.js';
 
@@ -38,6 +41,7 @@ type Route =
   | 'memory'
   | 'settings';
 type Notice = { kind: 'status' | 'error'; text: string } | null;
+type WorkspaceTarget = { kind: 'legacy' | 'presalesV3'; projectId: string; pageId?: string; versionId?: string };
 
 const nativeUnsavedNavigationMessage =
   '大纲、逐页细化、结构修订或生成说明尚未保存。离开将丢弃这些修改，是否继续？';
@@ -67,9 +71,11 @@ const workspaceStages = [
 
 export function App({
   adapter: providedAdapter,
+  presalesAdapter: providedPresalesAdapter,
   initialRoute,
 }: {
   adapter?: DesktopAdapter;
+  presalesAdapter?: PresalesAdapter;
   initialRoute?: Route;
 }) {
   // The native adapter owns child processes and subscriptions. Construct it
@@ -79,6 +85,7 @@ export function App({
   const [adapter] = useState(
     () => providedAdapter ?? createDesktopAdapter(),
   );
+  const [presalesAdapter] = useState<PresalesAdapter | null>(() => providedPresalesAdapter ?? (adapter.mode === 'tauri' && isTauri() ? createPresalesAdapter() : null));
   const [route, setRoute] = useState<Route>(
     () => initialRoute ?? routeFromHash() ?? 'dashboard',
   );
@@ -88,7 +95,10 @@ export function App({
     createWorkbenchState,
   );
   const [task, setTask] = useState<TaskSummary | null>(null);
-  const [workspaceProjectId, setWorkspaceProjectId] = useState(projectIdFromHash);
+  const [workspaceTarget, setWorkspaceTarget] = useState<WorkspaceTarget | null>(workspaceTargetFromHash);
+  const [presalesCatalog, setPresalesCatalog] = useState<V3CatalogEntry[]>([]);
+  const [presalesOrigins, setPresalesOrigins] = useState<Record<string, { sourceProjectId: string; sourceRevision: number }>>({});
+  const [presalesApprovals, setPresalesApprovals] = useState<ApprovalSummary[]>([]);
   const [listRefresh, setListRefresh] = useState(0);
   const [collectionRefresh, setCollectionRefresh] = useState(0);
   const [collectionsReady, setCollectionsReady] = useState(adapter.mode === 'demo');
@@ -105,7 +115,7 @@ export function App({
   }, []);
   const selectedProject =
     workbench.projects.find(
-      (project) => project.id === (workspaceProjectId ?? workbench.selectedProjectId),
+      (project) => project.id === (workspaceTarget?.kind === 'legacy' ? workspaceTarget.projectId : workbench.selectedProjectId),
     ) ?? null;
 
   useEffect(() => {
@@ -125,7 +135,7 @@ export function App({
         state: window.history.state,
       };
       setRoute(routeFromHash() ?? 'dashboard');
-      setWorkspaceProjectId(projectIdFromHash());
+      setWorkspaceTarget(workspaceTargetFromHash());
       setNotice(null);
     };
     window.addEventListener('popstate', onPopState);
@@ -249,20 +259,45 @@ export function App({
   }, [adapter, route, listRefresh]);
 
   useEffect(() => {
+    if (!presalesAdapter || !['projects', 'approvals'].includes(route)) return;
+    let active = true;
+    void presalesAdapter.list().then(async entries => {
+      if (!active) return;
+      setPresalesCatalog(entries);
+      const loaded = await Promise.all(entries.map(entry => presalesAdapter.load(entry.summary.projectId).catch(() => null)));
+      if (!active) return;
+      setPresalesOrigins(Object.fromEntries(loaded.flatMap(item => item ? [[item.project.summary.projectId, { sourceProjectId: item.project.origin.sourceProjectId, sourceRevision: item.project.origin.sourceRevision }] as const] : [])));
+      if (route === 'approvals') {
+        if (active) setPresalesApprovals(loaded.flatMap(item => item?.kind === 'frozen' ? item.project.pages.flatMap(page => {
+          const current = page.versions.find(version => version.versionId === page.currentVersionId);
+          const original = current?.provenance && typeof current.provenance === 'object' && (current.provenance as { kind?: string }).kind === 'legacyImported';
+          return current?.image && !original && (!page.approval || page.approval.versionId !== current.versionId) ? [{ id: `presales-v3:${item.project.summary.projectId}:${page.slideId}:${current.versionId}`, projectId: item.project.summary.projectId, pageId: page.slideId, versionId: current.versionId, title: item.project.summary.name, detail: `第 ${page.ordinal + 1} 页视觉版本待审核`, author: '售前 v3', time: current.createdAt, workspaceKind: 'presalesV3' as const }] : [];
+        }) : []));
+      }
+    }).catch(error => { if (active) setNotice({ kind: 'error', text: `售前 v3 目录未载入：${toMessage(error)}` }); });
+    return () => { active = false; };
+  }, [presalesAdapter, route, listRefresh, collectionRefresh]);
+  useEffect(() => {
+    if (!presalesAdapter) return;
+    return presalesAdapter.subscribe(() => { if (route === 'projects' || route === 'approvals') setCollectionRefresh(value => value + 1); });
+  }, [presalesAdapter, route]);
+
+  useEffect(() => {
     if (!task) return;
     return adapter.subscribeTask(task.id, setTask);
   }, [adapter, task?.id]);
 
-  const navigate = (next: Route, projectId?: string) => {
+  const navigate = (next: Route, project?: string | WorkspaceTarget) => {
     if (nativeWorkspaceDirty.current) {
       if (!window.confirm(nativeUnsavedNavigationMessage)) return;
       nativeWorkspaceDirty.current = false;
     }
     setNotice(null);
     setRoute(next);
-    setWorkspaceProjectId(next === 'workspace' ? projectId ?? null : null);
-    window.history.pushState({ route: next }, '', next === 'workspace' && projectId
-      ? `#/workspace/${encodeURIComponent(projectId)}` : `#/${next}`);
+    const target = next === 'workspace' ? typeof project === 'string' ? { kind: 'legacy' as const, projectId: project } : project ?? null : null;
+    setWorkspaceTarget(target);
+    window.history.pushState({ route: next }, '', next === 'workspace' && target
+      ? `#/workspace/${target.kind === 'presalesV3' ? 'presales-v3' : 'legacy'}/${encodeURIComponent(target.projectId)}${target.kind === 'presalesV3' && target.pageId ? `?page=${encodeURIComponent(target.pageId)}${target.versionId ? `&version=${encodeURIComponent(target.versionId)}` : ''}` : ''}` : `#/${next}`);
     acceptedLocation.current = {
       href: window.location.href,
       state: window.history.state,
@@ -293,7 +328,10 @@ export function App({
     route === 'workspace' ? (
       <div className="workspace-app">
         <Sidebar adapter={adapter} route="projects" navigate={navigate} />
-        {selectedProject ? (
+        {workspaceTarget?.kind === 'presalesV3' && presalesAdapter ? <PresalesWorkspacePage
+          key={`v3:${workspaceTarget.projectId}`} adapter={presalesAdapter} projectId={workspaceTarget.projectId}
+          initialPageId={workspaceTarget.pageId} initialVersionId={workspaceTarget.versionId}
+          onDirtyChange={handleNativeWorkspaceDirtyChange} /> : workspaceTarget?.kind !== 'presalesV3' && selectedProject ? (
           adapter.mode === 'tauri' ? <NativeWorkspacePage
             key={selectedProject.id}
             adapter={adapter}
@@ -346,6 +384,9 @@ export function App({
         {route === 'projects' && (
           <ProjectsPage
             adapter={adapter}
+            presalesAdapter={presalesAdapter}
+            presalesCatalog={presalesCatalog}
+            presalesOrigins={presalesOrigins}
             projects={workbench.projects}
             availability={workbench.collections.projects}
             retryProjects={() => setListRefresh((value) => value + 1)}
@@ -357,7 +398,7 @@ export function App({
         {route === 'approvals' && (
           <ApprovalsPage
             adapter={adapter}
-            items={workbench.approvals}
+            items={[...workbench.approvals, ...presalesApprovals]}
             availability={workbench.collections.approvals}
             pending={workbench.pendingApprovals}
             dispatch={dispatch}
@@ -572,7 +613,7 @@ function DashboardPage({
                     <td><div className="work-name">
                       <span className="work-icon file"><Icon name="file" /></span>
                       <span>
-                        <a href={`#/workspace/${encodeURIComponent(item.id)}`} title={item.name}
+                        <a href={`#/workspace/legacy/${encodeURIComponent(item.id)}`} title={item.name}
                           onClick={(event) => {
                             if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
                             event.preventDefault(); openProject(item.id);
@@ -1069,6 +1110,9 @@ function TasksPage({
 
 function ProjectsPage({
   adapter,
+  presalesAdapter,
+  presalesCatalog,
+  presalesOrigins,
   projects,
   availability,
   retryProjects,
@@ -1077,11 +1121,14 @@ function ProjectsPage({
   report,
 }: {
   adapter: DesktopAdapter;
+  presalesAdapter: PresalesAdapter | null;
+  presalesCatalog: V3CatalogEntry[];
+  presalesOrigins: Record<string, { sourceProjectId: string; sourceRevision: number }>;
   projects: WorkbenchProject[];
   availability: CollectionAvailability;
   retryProjects: () => void;
   dispatch: (action: WorkbenchAction) => void;
-  navigate: (route: Route, projectId?: string) => void;
+  navigate: (route: Route, project?: string | WorkspaceTarget) => void;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
   ) => Promise<void>;
@@ -1089,6 +1136,19 @@ function ProjectsPage({
   const [name, setName] = useState('');
   const [goal, setGoal] = useState('');
   const [isCreating, setIsCreating] = useState(false);
+  const [prepared, setPrepared] = useState<{ sourceName: string; value: V3PreparedCopy } | null>(null);
+  const preparedRef = useRef<V3PreparedCopy | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; if (preparedRef.current && presalesAdapter) void presalesAdapter.discardCopy(preparedRef.current.preparationId).catch(() => {}); preparedRef.current = null; }; }, [presalesAdapter]);
+  const [copyBusy, setCopyBusy] = useState(false);
+  const [copyError, setCopyError] = useState<string | null>(null);
+  const prepareCopy = async (project: WorkbenchProject, mode: 'format_copy' | 'presales_content_revision') => {
+    if (!presalesAdapter) return;
+    setCopyBusy(true); setCopyError(null);
+    try { const value = await presalesAdapter.prepareCopy(project.id, mode); if (!mountedRef.current) { await presalesAdapter.discardCopy(value.preparationId); return; } preparedRef.current = value; setPrepared({ sourceName: project.name, value }); }
+    catch (error) { setCopyError(toMessage(error)); }
+    finally { setCopyBusy(false); }
+  };
   const create = async (event: FormEvent) => {
     event.preventDefault();
     if (!name.trim() || !goal.trim()) return;
@@ -1122,14 +1182,8 @@ function ProjectsPage({
           </div>
           <ProjectListFeedback availability={availability} hasProjects={projects.length > 0} retry={retryProjects} />
           {sortProjectsByUpdatedAt(projects).map((project) => (
-            <button
-              className="project-row"
-              key={project.id}
-              onClick={() => {
-                dispatch({ type: 'project-selected', projectId: project.id });
-                navigate('workspace', project.id);
-              }}
-            >
+            <div className="presales-project-row" key={project.id}>
+            <button type="button" className="project-row" onClick={() => { dispatch({ type: 'project-selected', projectId: project.id }); navigate('workspace', project.id); }}>
               <span className="file-avatar"><Icon name="file" /></span>
               <span>
                 <strong>{project.name}</strong>
@@ -1140,8 +1194,14 @@ function ProjectsPage({
               </span>
               <Icon name="arrowRight" />
             </button>
+            {presalesAdapter && <div className="presales-copy-actions"><button type="button" disabled={copyBusy} onClick={() => void prepareCopy(project, 'format_copy')}>格式副本</button><button type="button" disabled={copyBusy} onClick={() => void prepareCopy(project, 'presales_content_revision')}>内容修订副本</button></div>}
+            </div>
           ))}
-          {!projects.length && availability === 'loaded' && (
+          {presalesCatalog.map(entry => <button type="button" className="project-row" key={`v3:${entry.summary.projectId}`} onClick={() => navigate('workspace', { kind: 'presalesV3', projectId: entry.summary.projectId })}>
+            <span className="file-avatar"><Icon name="file" /></span><span><strong>{entry.summary.name}</strong><small>售前 v3 · {entry.kind === 'draft' ? '内容修订草稿' : entry.kind === 'history_only' ? '历史只读' : '冻结页面'} · {entry.summary.pageCount} 页{presalesOrigins[entry.summary.projectId] ? ` · 源 ${presalesOrigins[entry.summary.projectId]!.sourceProjectId} 修订 ${presalesOrigins[entry.summary.projectId]!.sourceRevision}` : ''}</small></span><Icon name="arrowRight" />
+          </button>)}
+          {copyError && <p role="alert">{copyError}</p>}
+          {!projects.length && !presalesCatalog.length && availability === 'loaded' && (
             <div className="empty-inline">
               {collectionMessage(
                 availability,
@@ -1180,6 +1240,7 @@ function ProjectsPage({
           </form>
         </section>
       </div>
+      {prepared && <div className="presales-gallery__modal-backdrop"><div role="dialog" aria-modal="true" aria-label="确认售前副本" className="presales-gallery__modal"><h2>确认创建售前 v3 副本</h2><p>来源：{prepared.sourceName}（{prepared.value.sourceProjectId}，修订 {prepared.value.sourceRevision}）</p><p>目标：{prepared.value.destination.name} · {prepared.value.kind === 'draft' ? '内容修订草稿' : prepared.value.kind === 'history_only' ? '仅历史对照' : '冻结页面副本'}</p><p>原项目及审批不会修改。</p>{prepared.value.reasons.map(reason => <p key={reason}>{reason}</p>)}{copyError && <p role="alert">{copyError}</p>}<div className="presales-gallery__actions"><button disabled={copyBusy} onClick={() => void (async () => { setCopyBusy(true); try { await presalesAdapter!.discardCopy(prepared.value.preparationId); preparedRef.current = null; setPrepared(null); } catch (error) { setCopyError(toMessage(error)); } finally { setCopyBusy(false); } })()}>取消并丢弃准备</button><button disabled={copyBusy} onClick={() => void (async () => { setCopyBusy(true); setCopyError(null); try { const published = await presalesAdapter!.publishCopy(prepared.value.preparationId); preparedRef.current = null; setPrepared(null); navigate('workspace', { kind: 'presalesV3', projectId: published.project.summary.projectId }); } catch (error) { setCopyError(toMessage(error)); } finally { setCopyBusy(false); } })()}>确认发布副本</button></div></div></div>}
     </div>
   );
 }
@@ -1739,7 +1800,7 @@ function ApprovalsPage({
   pending: Record<string, number>;
   dispatch: (action: WorkbenchAction) => void;
   nextMutationToken: () => number;
-  navigate: (route: Route, projectId?: string) => void;
+  navigate: (route: Route, project?: string | WorkspaceTarget) => void;
   refreshCollections: () => void;
   report: (
     action: () => Promise<{ status?: string; message?: string }>,
@@ -1788,10 +1849,10 @@ function ApprovalsPage({
               {item.projectId ? (
                 <a
                   className="button button-primary"
-                  href={`#/workspace/${encodeURIComponent(item.projectId)}`}
+                  href={`#/workspace/${item.workspaceKind === 'presalesV3' ? 'presales-v3' : 'legacy'}/${encodeURIComponent(item.projectId)}${item.workspaceKind === 'presalesV3' && item.pageId ? `?page=${encodeURIComponent(item.pageId)}${item.versionId ? `&version=${encodeURIComponent(item.versionId)}` : ''}` : ''}`}
                   onClick={(event) => {
                     event.preventDefault();
-                    navigate('workspace', item.projectId);
+                    navigate('workspace', { kind: item.workspaceKind === 'presalesV3' ? 'presalesV3' : 'legacy', projectId: item.projectId!, pageId: item.pageId, versionId: item.versionId });
                   }}
                 >
                   前往审核
@@ -2140,9 +2201,25 @@ function routeFromHash(): Route | null {
 
 function projectIdFromHash(): string | null {
   if (!window.location.hash.startsWith('#/workspace/')) return null;
-  const id = window.location.hash.slice('#/workspace/'.length);
+  const id = window.location.hash.slice('#/workspace/'.length).split('?')[0]!;
   // A malformed/empty ID must not silently open the default project.
   try { return decodeURIComponent(id) || '\0'; } catch { return '\0'; }
+}
+
+function workspaceTargetFromHash(): WorkspaceTarget | null {
+  const id = projectIdFromHash();
+  if (id === null) return null;
+  const raw = window.location.hash.slice('#/workspace/'.length).split('?')[0]!;
+  const params = new URLSearchParams(window.location.hash.split('?')[1] ?? '');
+  if (raw.startsWith('presales-v3/')) {
+    try { return { kind: 'presalesV3', projectId: decodeURIComponent(raw.slice('presales-v3/'.length)) || '\0', pageId: params.get('page') ?? undefined, versionId: params.get('version') ?? undefined }; }
+    catch { return { kind: 'presalesV3', projectId: '\0' }; }
+  }
+  if (raw.startsWith('legacy/')) {
+    try { return { kind: 'legacy', projectId: decodeURIComponent(raw.slice('legacy/'.length)) || '\0' }; }
+    catch { return { kind: 'legacy', projectId: '\0' }; }
+  }
+  return { kind: 'legacy', projectId: id };
 }
 
 function toMessage(error: unknown): string {

@@ -73,6 +73,31 @@ pub fn build_codex_app_server_command(binary_path: &Path) -> Command {
     command
 }
 
+pub(crate) fn build_private_codex_app_server_command(binary_path: &Path, cwd: &Path) -> Command {
+    let mut command = build_codex_app_server_command(binary_path);
+    command
+        .args(["-c", "model_provider=\"openai\""])
+        .current_dir(cwd);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    // Child-only removals: never inspect values, clear proxy/CA, or rewrite login.
+    for name in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "OPENAI_BASE_URL",
+        "OPENAI_FEDERATION_RULE_ID",
+        "OPENAI_IDENTITY_TOKEN_FILE",
+        "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexProcessExit {
     pub code: Option<i32>,
@@ -82,6 +107,7 @@ pub struct CodexProcessExit {
 pub struct CodexAppServerProcess {
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<ChildStdin>>,
+    private_group: bool,
 }
 
 impl CodexAppServerProcess {
@@ -91,7 +117,54 @@ impl CodexAppServerProcess {
         on_stderr_line: impl Fn(String) + Send + 'static,
         on_exit: impl FnOnce(CodexProcessExit) + Send + 'static,
     ) -> Result<Self, String> {
-        let mut command = build_codex_app_server_command(binary_path);
+        Self::spawn_observed(binary_path, on_stdout_line, || {}, on_stderr_line, on_exit)
+    }
+
+    pub(crate) fn spawn_observed(
+        binary_path: &Path,
+        on_stdout_line: impl Fn(String) + Send + 'static,
+        on_stdout_loss: impl Fn() + Send + 'static,
+        on_stderr_line: impl Fn(String) + Send + 'static,
+        on_exit: impl FnOnce(CodexProcessExit) + Send + 'static,
+    ) -> Result<Self, String> {
+        Self::spawn_command(
+            build_codex_app_server_command(binary_path),
+            crate::legacy_frames::CODEX_FRAME_LIMIT,
+            false,
+            on_stdout_line,
+            on_stdout_loss,
+            on_stderr_line,
+            on_exit,
+        )
+    }
+
+    pub(crate) fn spawn_private(
+        binary_path: &Path,
+        cwd: &Path,
+        on_stdout_line: impl Fn(String) + Send + 'static,
+        on_stdout_loss: impl Fn() + Send + 'static,
+        on_exit: impl FnOnce(CodexProcessExit) + Send + 'static,
+    ) -> Result<Self, String> {
+        Self::spawn_command(
+            build_private_codex_app_server_command(binary_path, cwd),
+            64 * 1024 * 1024,
+            true,
+            on_stdout_line,
+            on_stdout_loss,
+            |_| {},
+            on_exit,
+        )
+    }
+
+    fn spawn_command(
+        mut command: Command,
+        frame_limit: usize,
+        private_group: bool,
+        on_stdout_line: impl Fn(String) + Send + 'static,
+        on_stdout_loss: impl Fn() + Send + 'static,
+        on_stderr_line: impl Fn(String) + Send + 'static,
+        on_exit: impl FnOnce(CodexProcessExit) + Send + 'static,
+    ) -> Result<Self, String> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -111,16 +184,19 @@ impl CodexAppServerProcess {
             .take()
             .ok_or_else(|| "Codex stderr was unavailable".to_string())?;
         let child = Arc::new(Mutex::new(child));
+        let (stdout_done, stdout_drained) = std::sync::mpsc::channel();
 
         thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                on_stdout_line(line);
-            }
+            read_bounded_lines(
+                BufReader::new(stdout),
+                frame_limit,
+                on_stdout_line,
+                on_stdout_loss,
+            );
+            let _ = stdout_done.send(());
         });
         thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                on_stderr_line(line);
-            }
+            read_bounded_lines(BufReader::new(stderr), 64 * 1024, on_stderr_line, || {});
         });
 
         let monitored_child = Arc::clone(&child);
@@ -131,11 +207,17 @@ impl CodexAppServerProcess {
                 .try_wait();
             match status {
                 Ok(Some(status)) => {
+                    if private_group {
+                        let _ = stdout_drained.recv();
+                    }
                     on_exit(process_exit(status));
                     break;
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(25)),
                 Err(_) => {
+                    if private_group {
+                        let _ = stdout_drained.recv();
+                    }
                     on_exit(CodexProcessExit {
                         code: None,
                         signal: None,
@@ -148,10 +230,14 @@ impl CodexAppServerProcess {
         Ok(Self {
             child,
             stdin: Arc::new(Mutex::new(stdin)),
+            private_group,
         })
     }
 
     pub fn write_line(&self, line: &str) -> Result<(), String> {
+        if line.contains(['\n', '\r']) {
+            return Err("Codex JSON-RPC request must be exactly one line".into());
+        }
         let mut stdin = self
             .stdin
             .lock()
@@ -167,6 +253,12 @@ impl CodexAppServerProcess {
             .child
             .lock()
             .map_err(|_| "Codex child lock poisoned".to_string())?;
+        #[cfg(unix)]
+        if self.private_group {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+        }
         if child
             .try_wait()
             .map_err(|error| error.to_string())?
@@ -177,6 +269,51 @@ impl CodexAppServerProcess {
                 .map_err(|error| format!("Failed to stop Codex App Server: {error}"))?;
         }
         Ok(())
+    }
+
+    pub(crate) fn stop_and_wait(&self) {
+        let _ = self.stop();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Bound allocation before reading more bytes. EOF without a frame delimiter,
+/// invalid UTF-8 and dropped oversized frames are evidence loss, never terminal.
+pub(crate) fn read_bounded_lines(
+    mut reader: impl BufRead,
+    limit: usize,
+    line: impl Fn(String),
+    lost: impl Fn(),
+) {
+    let mut decoder = crate::legacy_frames::FrameDecoder::new(limit);
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => {
+                if decoder.finish().is_err() {
+                    lost();
+                }
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                lost();
+                return;
+            }
+        };
+        let size = available.len();
+        decoder.push(available, |frame| {
+            match frame.ok().and_then(|b| std::str::from_utf8(b).ok()) {
+                Some(value) => {
+                    let value = value.strip_suffix('\n').unwrap_or(value);
+                    line(value.strip_suffix('\r').unwrap_or(value).to_owned());
+                }
+                None => lost(),
+            }
+        });
+        reader.consume(size);
     }
 }
 

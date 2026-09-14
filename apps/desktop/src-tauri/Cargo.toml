@@ -19,6 +19,11 @@ path = "src/bin/production-harness.rs"
 required-features = ["acceptance-harness"]
 
 [[bin]]
+name = "queue-harness"
+path = "src/bin/queue-harness.rs"
+required-features = ["acceptance-harness"]
+
+[[bin]]
 name = "process-rss-sampler"
 path = "src/bin/process-rss-sampler.rs"
 required-features = ["acceptance-harness"]
@@ -37,12 +42,20 @@ tauri-utils = "2.9.3"
 
 [dependencies]
 libc = "0.2"
+png = "=0.18.1"
 base64 = "0.22"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
-rusqlite = { version = "0.37.0", features = ["bundled"] }
+rusqlite = { version = "0.37.0", features = ["bundled", "serialize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 tauri = { version = "2.8.5", features = [] }
 tauri-plugin-opener = "2.5.0"
 tauri-plugin-shell = "2.3.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSResponder", "NSWindow", "NSApplication", "block2"] }
+block2 = "0.6.2"

@@ -106,7 +106,7 @@ fn identifier(id: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn validate_profile(profile: &VisualStyleProfile) -> Result<(), String> {
+pub(crate) fn validate_profile(profile: &VisualStyleProfile) -> Result<(), String> {
     for color in [
         &profile.primary_color,
         &profile.background_color,
@@ -531,6 +531,7 @@ impl WorkbenchService {
         &self,
         input: SaveVisualStyleInput,
     ) -> Result<VisualStyleState, String> {
+        let _activity = self.activity().mutation_guard()?;
         identifier(&input.project_id)?;
         validate_profile(&input.profile)?;
         let workspace = self.workspace()?;
@@ -592,6 +593,7 @@ impl WorkbenchService {
         &self,
         input: VisualGenerationRequest,
     ) -> Result<VisualGenerationRecord, String> {
+        let mut activity = self.activity().mutation_guard()?;
         identifier(&input.id)?;
         identifier(&input.project_id)?;
         identifier(&input.slide_id)?;
@@ -605,7 +607,17 @@ impl WorkbenchService {
             return Err("Invalid or oversized visual generation request".into());
         }
         let db = self.database()?;
-        let tx = db.connection.unchecked_transaction().map_err(err)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &db.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(err)?;
+        if crate::presales::storage::enabled(&tx, &input.project_id).map_err(err)? {
+            return Err(
+                "Presales visual generation requires design-aware receipts unavailable in this increment"
+                    .into(),
+            );
+        }
         let p = db
             .get_project(&input.project_id)
             .map_err(err)?
@@ -616,6 +628,7 @@ impl WorkbenchService {
             return Err("stale style revision".into());
         }
         let spec = approved_spec(&p.pipeline, &input.slide_id)?;
+        let source = self.native_source_for_checked_project(&p)?;
         let record = VisualGenerationRecord {
             prompt_sha256: hash(input.prompt.as_bytes()),
             spec_sha256: hash(&serde_json::to_vec(&spec).map_err(err)?),
@@ -634,6 +647,8 @@ impl WorkbenchService {
         )
         .map_err(err)?;
         tx.commit().map_err(err)?;
+        drop(db);
+        activity.cover_visual(source, &record)?;
         Ok(record)
     }
     pub fn visual_records(&self, id: &str) -> Result<Vec<VisualGenerationRecord>, String> {

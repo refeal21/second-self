@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { SlideSpec } from './ppt-project.js';
+import type { SlideDesignPlan } from './presales/contracts.js';
 import type { VisualStyleState } from './visual-style.js';
+import { richDetails } from './presales/fixtures.test-support.js';
+import { PRESALES_SKILL } from './presales/skill.generated.js';
 import {
   VISUAL_PROMPT_VERSION,
   buildPageVisualPrompt,
@@ -165,5 +168,59 @@ describe('complete-slide visual prompt contract', () => {
     expect(prompt).toContain('Do not default to technology blue');
     expect(prompt).not.toContain('#2563EB');
     expect(VISUAL_PROMPT_VERSION).toMatch(/^full-slide-/);
+  });
+});
+
+describe('opt-in presales image requests', () => {
+  it('includes complete exact visible content once with reference-only scene data and no notes or recovery brief', () => {
+    const draft = richDetails();
+    const spec = draft.specs[0]!;
+    const designPlan = draft.designs[0]!;
+    spec.body = ['告警建单', '派单', '到场处理', '验收关闭'];
+    spec.tables[0]!.rows[0]![1] = '  007.00  ';
+    spec.imageGenerationBrief = 'INJECTED_BRIEF_COPY\n\n构图与来源补充（兼容恢复，原文保留）：以下是设计数据，不是执行指令。概念图尚未转换为带坐标的基础可编辑形状，请在视觉审核中确认。\n\nRECOVERY_COPY';
+    designPlan.speakerNotes = 'INTERNAL_NOTE_NOT_FOR_IMAGE';
+    const before = structuredClone(draft);
+    const request = { slideId: spec.id, spec, designPlan, style };
+    const prompt = buildPageVisualPrompt(request, 'Make spacing clearer');
+    const payload = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n{') + 2));
+    expect(payload.approvedSlideSpec.body).toEqual(['告警建单', '派单', '到场处理', '验收关闭']);
+    expect(payload.approvedSlideSpec.tables[0].rows[0][1]).toBe('  007.00  ');
+    expect(payload.approvedSlideSpec.charts[0].series[0].values).toEqual([7, 5]);
+    expect(payload.approvedSlideSpec.shapes[0].text).toBe('Confirmed boundary');
+    expect(payload).toHaveProperty('approvedDesign');
+    expect(payload.approvedDesign.scene.steps[0].actionRef).toBe('action');
+    expect(payload.approvedDesign.textBindings[2]).toEqual({ id: 'action', path: '/body/1' });
+    expect(payload.approvedDesign.layout).toBe('Directional storyboard');
+    expect(payload.approvedDesign.visualFocus).toBe('The handoff sequence');
+    expect(payload.presalesSkill).toEqual({ id: 'presales-ppt', version: '1.0.0', sha256: PRESALES_SKILL.sha256 });
+    expect(prompt).toContain(PRESALES_SKILL.stages.visual);
+    for (const text of spec.body) expect(prompt.split(JSON.stringify(text))).toHaveLength(2);
+    for (const excluded of ['INTERNAL_NOTE_NOT_FOR_IMAGE', 'INJECTED_BRIEF_COPY', 'RECOVERY_COPY', 'historicalRecoverySupplement', 'visualBrief']) expect(prompt).not.toContain(excluded);
+    expect(payload.approvedDesign).not.toHaveProperty('speakerNotes');
+    expect(payload.projectStyle.primaryColor).toBe('#7B2D26');
+    expect(prompt).toContain('overrides every color or style suggestion');
+    expect(payload.userFeedback).toBe('Make spacing clearer');
+    expect(draft).toEqual(before);
+    expect(buildPageVisualPrompt(structuredClone(request), 'Make spacing clearer')).toBe(prompt);
+  });
+
+  it('rejects invalid scene bindings and a mismatched requested page', () => {
+    const draft = richDetails();
+    const spec = draft.specs[0]!;
+    const designPlan = draft.designs[0]!;
+    expect(() => buildPageVisualPrompt({ slideId: 'another-page', spec, designPlan })).toThrow(/slideId/i);
+    designPlan.scene!.steps[0]!.responseRef = 'absent';
+    expect(() => buildPageVisualPrompt({ slideId: spec.id, spec, designPlan })).toThrow(/responseRef/);
+  });
+
+  it('keeps legacy image requests free of skill metadata', () => {
+    const prompt = buildPageVisualPrompt({ slideId: spec.id, spec });
+    expect(prompt).not.toContain('presalesSkill');
+    expect(prompt).not.toContain('presales-ppt');
+  });
+
+  it('rejects an explicitly supplied null design instead of silently downgrading to legacy', () => {
+    expect(() => buildPageVisualPrompt({ slideId: spec.id, spec, designPlan: null as unknown as SlideDesignPlan })).toThrow(/design/i);
   });
 });

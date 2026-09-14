@@ -1,0 +1,67 @@
+.presales-gallery{color:#232733;background:#f7f8fb;min-height:100vh;padding:28px;font-family:Inter,'PingFang SC','Microsoft YaHei',sans-serif}
+.presales-gallery *{box-sizing:border-box}
+.presales-gallery button,.presales-gallery input,.presales-gallery textarea{font:inherit}
+.presales-gallery button{cursor:pointer}
+.presales-gallery button:disabled{cursor:not-allowed;opacity:.46}
+.presales-gallery h1,.presales-gallery h2,.presales-gallery h3,.presales-gallery p{margin:0}
+.presales-gallery__header,.presales-gallery__toolbar,.presales-gallery__detail-head,.presales-gallery__actions{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.presales-gallery__header{align-items:flex-start;margin-bottom:22px}
+.presales-gallery__header h1{font-size:29px;letter-spacing:-.04em;margin:5px 0}
+.presales-gallery__header p:not(.presales-gallery__eyebrow){color:#69707d;font-size:13px}
+.presales-gallery__eyebrow{color:#5964c8;font-size:11px;font-weight:800;letter-spacing:.13em}
+.presales-gallery__queue{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:10px 12px;border:1px solid #e2e5ec;border-radius:12px;background:white}
+.presales-gallery__queue label{font-size:12px;color:#57606d}
+.presales-gallery__queue input{width:50px;margin-left:5px;padding:5px;border:1px solid #cbd1dd;border-radius:6px}
+.presales-gallery__queue button,.presales-gallery__toolbar button,.presales-gallery__actions button{border:1px solid #cfd5e3;background:white;border-radius:8px;padding:8px 11px;color:#394459;font-size:12px;font-weight:650}
+.presales-gallery__toolbar{justify-content:flex-start;border:1px solid #e2e5ec;background:white;padding:11px 14px;border-radius:11px;margin-bottom:14px;font-size:12px;color:#69707d}
+.presales-gallery__layout{display:grid;grid-template-columns:260px minmax(0,1fr);gap:14px;min-width:0}
+.presales-gallery__pages,.presales-gallery__detail{background:white;border:1px solid #e2e5ec;border-radius:12px;min-width:0}
+.presales-gallery__pages{padding:9px;align-self:start;max-height:calc(100vh - 190px);overflow:auto}
+.presales-gallery__page{display:grid;grid-template-columns:20px minmax(0,1fr);gap:5px;align-items:start;padding:7px;border-radius:9px}
+.presales-gallery__page.is-active{background:#eef0ff}
+.presales-gallery__page>input{margin-top:12px}
+.presales-gallery__page>button{min-width:0;display:flex;gap:9px;align-items:center;text-align:left;border:0;background:transparent;color:#263048;padding:3px}
+.presales-gallery__page>button span{min-width:0}
+.presales-gallery__page strong,.presales-gallery__page small,.presales-gallery__page em{display:block}
+.presales-gallery__page strong{font-size:13px}
+.presales-gallery__page small,.presales-gallery__page em{font-size:11px;color:#727b8c;font-style:normal;margin-top:3px}
+.presales-gallery__reason{grid-column:2;color:#a35e37!important}
+.presales-gallery__page .presales-gallery__image{width:55px;height:40px;flex:none}
+.presales-gallery__detail{padding:20px;overflow:hidden}
+.presales-gallery__detail-head{align-items:flex-start;margin-bottom:14px}
+.presales-gallery__detail-head h2{font-size:21px;margin:4px 0}
+.presales-gallery__detail-head p:not(.presales-gallery__eyebrow){color:#737b8a;font-size:12px}
+.presales-gallery__job{font-size:11px;color:#6559ae;background:#f0ecff;padding:6px 8px;border-radius:99px}
+.presales-gallery__stage{border:1px solid #dfe4ed;background:#f1f3f8;border-radius:10px;overflow:hidden}
+.presales-gallery__stage>.presales-gallery__image{height:min(43vw,390px);min-height:240px}
+.presales-gallery__image{display:grid;place-items:center;overflow:hidden;color:#9aa2af;font-size:11px}
+.presales-gallery__image img{display:block;width:100%;height:100%;object-fit:contain}
+.presales-gallery__missing{min-height:230px;display:grid;place-content:center;text-align:center;gap:6px;color:#707989}
+.presales-gallery__missing strong{color:#465166}
+.presales-gallery__stage-caption{display:flex;justify-content:space-between;gap:10px;padding:11px 13px;background:white;color:#455065;font-size:12px}
+.presales-gallery__stage-caption span{color:#777f8d}
+.presales-gallery__history,.presales-gallery__review{margin-top:18px;border-top:1px solid #e8ebf1;padding-top:16px}
+.presales-gallery__history h3,.presales-gallery__review h3{font-size:14px;margin-bottom:9px}
+.presales-gallery__history>div{display:flex;gap:7px;flex-wrap:wrap}
+.presales-gallery__history button{border:1px solid #d9deea;border-radius:7px;background:white;color:#4e5869;font-size:11px;padding:7px}
+.presales-gallery__history button.is-active{background:#edf0ff;border-color:#9ca7eb;color:#3340a8}
+.presales-gallery__actions{justify-content:flex-start;margin-top:13px}
+.presales-gallery__actions .presales-gallery__primary{background:#3949bd;color:white;border-color:#3949bd}
+.presales-gallery__reasons{display:flex;flex-wrap:wrap;gap:5px 13px;margin-top:12px;color:#856442;font-size:11px}
+.presales-gallery__feedback{display:block;color:#586273;font-size:12px}
+.presales-gallery__feedback textarea{display:block;resize:vertical;width:100%;min-height:68px;margin-top:7px;padding:10px;border:1px solid #d8deea;border-radius:8px;color:#263048}
+.presales-gallery__check{display:flex;align-items:center;gap:5px;color:#4c5668;font-size:12px}
+.presales-gallery [role=alert]{color:#9d3939;font-size:12px;margin-top:8px}
+.presales-gallery__modal-backdrop{position:fixed;inset:0;z-index:20;display:grid;place-items:center;background:#1b213d78;padding:20px}
+.presales-gallery__modal{width:min(420px,100%);background:white;padding:22px;border-radius:14px;box-shadow:0 20px 80px #11182733}
+.presales-gallery__modal h2{font-size:18px;margin-bottom:12px}
+.presales-gallery__modal p{font-size:13px;color:#667083;line-height:1.5;margin-top:8px}
+@media(max-width:850px){.presales-gallery{padding:15px}
+.presales-gallery__layout{grid-template-columns:1fr}
+.presales-gallery__pages{display:flex;overflow-x:auto;max-height:none}
+.presales-gallery__page{min-width:200px}
+.presales-gallery__detail{padding:14px}
+.presales-gallery__stage>.presales-gallery__image{height:300px;min-height:0}
+}
+
+.presales-gallery__image img { min-width: 0; min-height: 0; max-height: 100%; }

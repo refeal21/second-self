@@ -88,9 +88,45 @@ file 'apps/desktop/src-tauri/target/release/bundle/macos/Digital Twin Workbench.
 codesign -dv --verbose=4 'apps/desktop/src-tauri/target/release/bundle/macos/Digital Twin Workbench.app' 2>&1
 ```
 
-应看到主程序和 `digital-twin-worker` 都是 arm64 Mach-O。签名应为 ad-hoc/linker-signed、没有 TeamIdentifier；这不是 Developer ID 签名，也没有 Apple 公证。当前个人 bundle 的 `codesign --verify --deep --strict` 会因为未密封资源退出 1，因此不要把此构建当作可公开分发的安装包或声称通过严格发布签名验证。
+应逐次检查主程序和 `digital-twin-worker` 的架构与签名，不从旧包推断新包结果。2026-09-14 的 V3 Dev 两者均为 arm64 Mach-O。原始 Tauri 输出主程序为 linker-signed，整包严格验证因资源未密封退出 1；随后仅对保留开发副本执行本地 `codesign --force --sign -`，整包 `--verify --deep --strict` 与 Worker `--verify --strict` 均退出 0。主程序和 Worker 无 entitlements，未增加能力；现为 ad-hoc，无 TeamIdentifier，没有 Developer ID 签名或 Apple 公证，不能等同公开分发/Gatekeeper 验收。
 
 Worker SEA 使用当前 Node 22 可执行文件构建，同时把该 Node 发行版的完整 `LICENSE`（其中包含依赖许可证和第三方声明）以及精确版本复制到 `.app/Contents/Resources/licenses/node-runtime/`。若构建机器上的匹配 LICENSE 缺失，构建会直接失败。
+
+## 售前 v3 本轮独立开发产物
+
+2026-09-14 在 `.worktrees/presales-batch`，针对已复审源码 `d5bcdd55f0f04b42410f71515849c8f1af86758f` 执行成功：
+
+```bash
+PATH=/Users/yangjinlong/.local/opt/node/bin:/Users/yangjinlong/.cargo/bin:/Users/yangjinlong/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin/fallback:$PATH \
+  pnpm --dir apps/desktop exec tauri build --bundles app --config '{"productName":"Digital Twin Workbench V3 Dev"}'
+```
+
+命令重新构建了 Node v22.21.1 自包含 Worker SEA、前端和原生 release。实际原始输出为 `apps/desktop/src-tauri/target/release/bundle/macos/Digital Twin Workbench V3 Dev.app`；通过 `ditto` 复制到之前不存在的 `artifacts/build/presales-v3-dev/Digital Twin Workbench V3 Dev.app`，现在是已保留产物。没有安装到 `/Applications` 或替换旧包。完整文件指纹与命令退出状态见 `artifacts/qa/presales-v3/final-package-inspection.json`；构建日志为同目录 `final-package-build.log`。
+
+本次在读取主程序/Worker entitlements 均为空后，仅对该保留副本封装；原始 Tauri 输出不改动：
+
+```bash
+codesign --force --sign - 'artifacts/build/presales-v3-dev/Digital Twin Workbench V3 Dev.app'
+node scripts/inspect-presales-dev-bundle.mjs \
+  "$PWD/artifacts/build/presales-v3-dev/Digital Twin Workbench V3 Dev.app"
+```
+
+检查脚本只读、不签名或启动应用；检查时需使用与构建相同的 Node 发行版（含匹配 LICENSE）。本机使用 `/Users/yangjinlong/.local/opt/node/bin/node`。其他包如有 entitlements，不应盲目套用本轮无 entitlements 的签名步骤。
+
+可离线复核包内 v3 模式，不启动 GUI、不读取真实账户：
+
+```bash
+node scripts/smoke-packaged-presales-worker.mjs \
+  "$PWD/artifacts/build/presales-v3-dev/Digital Twin Workbench V3 Dev.app/Contents/MacOS/digital-twin-worker"
+```
+
+脚本给私有 native proxy 返回限定的合成账户/配置/能力响应，检查 status、能力撤销和协议拒绝；另一个 `--presales-validate` 进程校验真实创建的内存 checkpoint 的精确字节。不会调用真实 native provider、thread/turn、图片生成或 PPTX 转换。
+
+该包仍使用 `com.digitaltwin.workbench`，并非合成 GUI 沙箱。手动启动时，原生 setup 会打开标准应用数据目录下的 `workbench.sqlite3` 和 `presales-v3.sqlite3`，初始化 `~/Documents/DigitalTwinWorkspace`，前端会自动连接常规 Codex 账户路径。不同包名称不隔离数据库、工作区或账户。本轮未执行该启动操作；用户决定手动试用前应先让旧任务结束、关闭旧应用并备份数据库及项目工作区，不要同时运行两包。V3 队列存储精确升级至 schema 4（新增已核对撤回记录），QueueOnly 仍为 schema 2；这不等于把旧项目内容自动迁移为 v3。原生窗口视觉与 app-tree RSS、真实 ImageGen、Keynote 编辑和真实峰值内存均需另行观察。
+
+当前使用路径：PPT 项目 → 现有项目的「内容修订副本」（编写新售前叙事；「格式副本」仅保留已有合格配对与历史）→ 明确「确认发布副本」→ 成对审批大纲/方案及细化/设计 →「发布新页面」→ 多页图库「生成全部缺失页」或「批量生成所选页」（默认并发 4）→ 对具体版本「保存反馈」后「编辑此版本」，或完成两项人工检查后批准。浏览历史不等于采用；需要明确采用指定版本，符合条件时恢复其原审批。交付仍核对精确版本并明确报告不支持任意整页图的可编辑转换。
+
+无需启动应用的合成验收命令、浏览器截图和 RSS 测量边界在 [v3 验证记录](verification-2026-09-11-presales-v3-workbench.md)。不要用此开发包的旧 Golden Project 成绩替代 v3 可编辑转换验收。
 
 ## 只读账号冒烟测试
 

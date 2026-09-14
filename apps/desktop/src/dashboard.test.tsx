@@ -61,7 +61,7 @@ describe('recent work dashboard', () => {
     render(<App adapter={adapter} />);
     await user.click(await screen.findByText('目标项目说明'));
     expect(await screen.findByRole('heading', { name: '目标项目' })).toBeInTheDocument();
-    expect(window.location.hash).toBe('#/workspace/target-project');
+    expect(window.location.hash).toBe('#/workspace/legacy/target-project');
     expect(screen.getByRole('textbox', { name: '本次任务说明' })).toBeInTheDocument();
   });
 

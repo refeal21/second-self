@@ -1,6 +1,9 @@
 import type { NativePptPipeline, NativePromptContext } from '../../worker/src/native-pipeline.js';
 import { DETAIL_SPEC_CONTRACT } from '../../worker/src/slide-spec-contract.js';
 import type { VisualStyleState } from '../../worker/src/visual-style.js';
+import { PRESALES_SKILL_METADATA, type PresalesPromptOptions } from '../../worker/src/presales/planning.js';
+import { parseOutlineEnvelope } from '../../worker/src/presales/validation.js';
+import { buildPairedAuthoringPrompt } from '../../worker/src/presales/authoring.js';
 
 export type PptPromptStage = 'analysis' | 'outline' | 'details';
 
@@ -23,8 +26,30 @@ export function promptContextError(pipeline: NativePptPipeline, context: NativeP
 }
 
 /** The preview and the real model request share this builder. No browser-only prompt copy. */
-export function buildPptPrompt(pipeline: NativePptPipeline, stage: PptPromptStage, style?: VisualStyleState): string {
+export function buildPptPrompt(pipeline: NativePptPipeline, stage: PptPromptStage, style?: VisualStyleState, presales?: PresalesPromptOptions): string {
   const context = getPromptContext(pipeline);
+  const presalesStage = presales !== undefined && stage !== 'analysis' ? stage : null;
+  if (presalesStage === 'details') {
+    if (!presales?.outline || !pipeline.outline) throw new Error('Presales details require the paired approved outline');
+    if (!pipeline.analysis) throw new Error('Presales details require the current analysis');
+    const paired = parseOutlineEnvelope(presales.outline, pipeline.analysis.output);
+    // Parsing creates a canonical key order without normalizing content or arrays.
+    // Matching context is defense in depth, not native joint approval authorization.
+    const current = parseOutlineEnvelope({ ...paired, outline: pipeline.outline.value }, pipeline.analysis.output);
+    if (JSON.stringify(paired.outline) !== JSON.stringify(current.outline)) {
+      throw new Error('Paired outline must exactly match the caller pipeline outline');
+    }
+  }
+  if (presalesStage) {
+    if (!pipeline.analysis) throw new Error('Paired authoring requires current analysis');
+    return buildPairedAuthoringPrompt(presalesStage, {
+      name:pipeline.project.name,brief:pipeline.project.goal,context,
+      sources:pipeline.sources.map(source=>({original:source,asset:{relativePath:source.relativePath}})),
+      analysis:{original:pipeline.analysis,asset:{relativePath:pipeline.analysis.artifactRelativePath}},
+      preferences:pipeline.preferenceSnapshot,palette:style??{revision:0,profile:null,locked:false},
+      skill:PRESALES_SKILL_METADATA,approvedOutline:presales?.outline??null,
+    });
+  }
   const input = {
     project: { name: pipeline.project.name, goal: pipeline.project.goal },
     taskBrief: context.taskBrief,

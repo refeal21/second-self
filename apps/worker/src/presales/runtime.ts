@@ -1,5 +1,7 @@
 /** Private application-owned mode. Native owns claims, slots, epochs and files. */
-import type { JsonRpcMessage } from '../app-server.js';
+import { CodexAppServerClient, type JsonRpcMessage } from '../app-server.js';
+import { PrivateCodexProvider, type ImageCapabilities, type NativeInputs } from './image-provider.js';
+import { PrivateAppServerTransport } from './private-transport.js';
 import { buildPairedAuthoringPrompt, parsePairedAuthoringResult, type PairedAuthoringContext } from './authoring.js';
 
 type VersionHash={version:string;sha256:string};
@@ -21,6 +23,8 @@ export type RuntimeResult={kind:'image';pngBase64:string}|{kind:'text';text:stri
 export type ProviderIdentity={threadId:string;turnId:string|null};
 export interface RuntimeProvider {
   readonly available:boolean;
+  readonly capabilities?:ImageCapabilities;
+  prepare?():Promise<void>;
   execute(work:RuntimeJob,callbacks:{identity(identity:ProviderIdentity):Promise<void>;progress(detail:string):void}):Promise<RuntimeResult>;
   interrupt(work:RuntimeJob):Promise<{acknowledged:boolean}>;
 }
@@ -34,7 +38,17 @@ export class PresalesRuntime {
   private generation:number|null=null;
   private sequence=0;
   private closed=false;
-  constructor(provider:RuntimeProvider|undefined,private readonly emit:(line:string)=>void){this.provider=provider??closedProvider;}
+  private transport:PrivateAppServerTransport|null=null;
+  constructor(provider:RuntimeProvider|undefined,private readonly emit:(line:string)=>void,production=false){
+    if(!provider&&production){
+      const native=(method:string,params:unknown)=>this.native(method,{generation:this.generation,...params as object});
+      this.transport=new PrivateAppServerTransport(native);
+      const transport=this.transport;
+      this.provider=new PrivateCodexProvider(new CodexAppServerClient(transport,15_000),async work=>await native('native/provider/inputs',{work}) as NativeInputs,()=>transport.cwd(),()=>{
+        if(!this.closed&&this.generation!==null)this.send({method:'presales/capabilities',params:{generation:this.generation,available:this.provider.available,capabilities:this.provider.capabilities}});
+      });
+    }else this.provider=provider??closedProvider;
+  }
   private send(message:unknown):void {
     if(this.closed) throw new Error('Private runtime is closed');
     const line=JSON.stringify(message);
@@ -52,6 +66,13 @@ export class PresalesRuntime {
   }
   async handle(message:JsonRpcMessage):Promise<void>{
     if(this.closed) throw new Error('Private runtime is closed');
+    if(message.method==='presales/provider/line'||message.method==='presales/provider/lost'){
+      const p=message.params as {generation?:number;line?:string};
+      if(!this.transport||p?.generation!==this.generation)throw Error('Private provider generation mismatch');
+      if(message.method==='presales/provider/lost')this.transport.lost();
+      else if(typeof p.line==='string')this.transport.receive(p.line);else throw Error('Private provider line missing');
+      return;
+    }
     if(typeof message.id==='string' && message.id.startsWith('native:') && message.method===undefined){
       const pending=this.pending.get(message.id);
       if(!pending) throw new Error('Unknown native reply');
@@ -66,7 +87,12 @@ export class PresalesRuntime {
       if(this.generation===null) this.generation=params!.generation!;
       if(this.generation!==params!.generation) throw new Error('Old process generation');
       switch(message.method){
-        case 'presales/status': this.send({id:message.id,result:{available:this.provider.available,active:this.active.size,generation:this.generation}});return;
+        case 'presales/status': {
+          const reply=()=>{if(!this.closed)this.send({id:message.id,result:{available:this.provider.available,capabilities:this.provider.capabilities,active:this.active.size,generation:this.generation}});};
+          reply();
+          if(this.provider.prepare)void this.provider.prepare().catch(()=>{});
+          return;
+        }
         case 'presales/start': {
           if(!this.provider.available) throw new Error('Common stock-account route has not been validated');
           const work=params!.work;
@@ -117,6 +143,7 @@ export class PresalesRuntime {
   }
   close():void{
     this.closed=true;
+    this.transport?.lost();
     for(const pending of this.pending.values()){clearTimeout(pending.timer);pending.reject(new Error('Private host disconnected'));}
     this.pending.clear();
   }
@@ -126,19 +153,19 @@ export async function runPresalesRuntime(provider?:RuntimeProvider):Promise<void
   const runtime=new PresalesRuntime(provider,line=>{
     if(process.stdout.writableLength+Buffer.byteLength(line)>80*1024*1024) throw new Error('Private output backpressure limit exceeded');
     process.stdout.write(`${line}\n`);
-  });
+  },true);
   let pending=Buffer.alloc(0);
   try{
     for await(const chunk of process.stdin){
       pending=Buffer.concat([pending,Buffer.from(chunk as Uint8Array)]);
       let newline:number;
       while((newline=pending.indexOf(10))!==-1){
-        if(newline>9*1024*1024) throw new Error('Private input frame exceeds limit');
+        if(newline>72*1024*1024) throw new Error('Private input frame exceeds limit');
         const line=new TextDecoder('utf-8',{fatal:true}).decode(pending.subarray(0,newline));
         pending=pending.subarray(newline+1);
         await runtime.handle(JSON.parse(line) as JsonRpcMessage);
       }
-      if(pending.length>9*1024*1024) throw new Error('Private input frame exceeds limit');
+      if(pending.length>72*1024*1024) throw new Error('Private input frame exceeds limit');
     }
     if(pending.length) throw new Error('Private input frame is incomplete');
   }finally{runtime.close();}

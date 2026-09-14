@@ -108,7 +108,22 @@ impl V3WorkbenchService {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn claim_queue_work(&self, epoch: i64) -> Result<Option<RuntimeWork>, String> {
+        self.claim_capable_queue_work(
+            epoch,
+            &super::runtime_callbacks::ImageCapabilities {
+                generation: true,
+                reference_editing: true,
+                reason: None,
+            },
+        )
+    }
+    pub(super) fn claim_capable_queue_work(
+        &self,
+        epoch: i64,
+        capabilities: &super::runtime_callbacks::ImageCapabilities,
+    ) -> Result<Option<RuntimeWork>, String> {
         let mut store = self.store.lock().map_err(|_| "v3 store lock poisoned")?;
         write_on(&mut store.connection, |tx| {
             let settings = read_settings(tx)?;
@@ -123,7 +138,7 @@ impl V3WorkbenchService {
                 return Ok(None);
             }
             loop {
-                let next: Option<(String,String)> = tx.query_row("SELECT kind,id FROM (SELECT 'image' AS kind,j.request_id AS id,j.sequence AS sequence FROM queue_jobs j JOIN queue_batches b ON b.batch_id=j.batch_id WHERE j.status='queued' AND b.paused=0 UNION ALL SELECT 'text',operation_id,sequence FROM v3_text_operations WHERE status='queued') ORDER BY sequence LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(message)?;
+                let next: Option<(String,String)> = tx.query_row("SELECT kind,id FROM (SELECT 'image' AS kind,j.request_id AS id,j.sequence AS sequence FROM queue_jobs j JOIN queue_batches b ON b.batch_id=j.batch_id WHERE j.status='queued' AND b.paused=0 AND ?1 AND (?2 OR (json_extract(j.target_json,'$.parentVisual') IS NULL AND json_array_length(json_extract(j.target_json,'$.references'))=0)) UNION ALL SELECT 'text',operation_id,sequence FROM v3_text_operations WHERE status='queued') ORDER BY sequence LIMIT 1", params![capabilities.generation,capabilities.reference_editing], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(message)?;
                 let Some((kind, id)) = next else {
                     return Ok(None);
                 };

@@ -55,6 +55,7 @@ export interface ModelProviderCapabilities {
 type PendingRequest = {
   resolve(value: unknown): void;
   reject(error: Error): void;
+  timer?:ReturnType<typeof setTimeout>;
 };
 
 export class CodexAppServerClient {
@@ -71,7 +72,7 @@ export class CodexAppServerClient {
   private readonly authStateListeners = new Set<(state: AuthState) => void>();
   private authState: AuthState = { status: 'unknown' };
 
-  constructor(private readonly transport: AppServerTransport) {}
+  constructor(private readonly transport: AppServerTransport,private readonly requestTimeoutMs?:number) {}
 
   async connect(): Promise<void> {
     if (this.disposed) throw new Error('Codex App Server client was disposed');
@@ -165,6 +166,12 @@ export class CodexAppServerClient {
     return this.request('modelProvider/capabilities/read', {});
   }
 
+  /** Restricted caller is the native-owned v3 adapter, never a renderer RPC. */
+  async privateV3Request(method: 'account/read'|'config/read'|'configRequirements/read'|'model/list'|'modelProvider/capabilities/read'|'thread/start'|'turn/start'|'turn/interrupt', params: unknown): Promise<unknown> {
+    try { return await this.request(method, params,15_000); }
+    catch { throw new Error('Private Codex request failed; remote outcome may be unknown'); }
+  }
+
   async startImageThread(cwd: string): Promise<string> {
     const response = await this.request<{ thread: { id: string } }>('thread/start', {
       cwd,
@@ -238,18 +245,24 @@ export class CodexAppServerClient {
     this.authStateListeners.clear();
   }
 
-  private async request<T>(method: string, params: unknown): Promise<T> {
+  private async request<T>(method: string, params: unknown, timeoutMs=this.requestTimeoutMs): Promise<T> {
     const id = this.nextRequestId++;
     const response = new Promise<T>((resolve, reject) => {
+      const timer=timeoutMs===undefined?undefined:setTimeout(()=>{this.pending.delete(id);reject(new Error('Private Codex request timed out'));},timeoutMs);
       this.pending.set(id, {
         resolve: (value) => resolve(value as T),
         reject,
+        ...(timer?{timer}:{}),
       });
     });
+    // A private deadline/exit can reject while the proxy is still awaiting its
+    // write acknowledgement. Keep that internal promise observed throughout.
+    void response.catch(()=>{});
 
     try {
       await this.transport.send(JSON.stringify({ id, method, params }));
     } catch (error) {
+      clearTimeout(this.pending.get(id)?.timer);
       this.pending.delete(id);
       throw error;
     }
@@ -274,6 +287,7 @@ export class CodexAppServerClient {
 
     const pending = this.pending.get(message.id);
     if (!pending) return;
+    clearTimeout(pending.timer);
     this.pending.delete(message.id);
 
     if (message.error) {
@@ -291,7 +305,7 @@ export class CodexAppServerClient {
   }
 
   private rejectPending(message: string): void {
-    for (const pending of this.pending.values()) pending.reject(new Error(message));
+    for (const pending of this.pending.values()){clearTimeout(pending.timer);pending.reject(new Error(message));}
     this.pending.clear();
   }
 

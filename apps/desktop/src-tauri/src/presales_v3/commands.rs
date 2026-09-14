@@ -37,6 +37,20 @@ pub(crate) async fn presales_v3_load(
     run(&service, move |s| s.load_v3_project(&project_id)).await
 }
 #[tauri::command]
+pub(crate) async fn presales_v3_read_image(
+    service: State<'_, Arc<V3WorkbenchService>>,
+    project_id: String,
+    slide_id: String,
+    version_id: String,
+    asset_id: String,
+    sha256: String,
+) -> Result<super::provider_assets::ImagePreview, String> {
+    run(&service, move |s| {
+        s.read_verified_image(&project_id, &slide_id, &version_id, &asset_id, &sha256)
+    })
+    .await
+}
+#[tauri::command]
 pub(crate) async fn presales_v3_queue(
     host: State<'_, QueueSupervisor>,
 ) -> Result<super::runtime_callbacks::QueueSnapshot, String> {

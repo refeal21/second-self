@@ -34,6 +34,8 @@ mod service;
 pub(crate) mod supervisor;
 pub(crate) mod runtime_host;
 mod runtime_callbacks;
+mod provider_assets;
+mod provider_process;
 pub(crate) mod commands;
 pub(crate) mod picker;
 mod store;

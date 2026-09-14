@@ -1,5 +1,10 @@
 //! Dedicated child and actor; its handles are absent from legacy WebView state.
-use super::{runtime_callbacks::QueueSnapshot, store::message, supervisor::RuntimeWork, *};
+use super::{
+    runtime_callbacks::{ImageCapabilities, QueueSnapshot},
+    store::message,
+    supervisor::RuntimeWork,
+    *,
+};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -17,6 +22,7 @@ use tauri_plugin_shell::ShellExt;
 pub(crate) struct QueueSupervisor {
     service: Arc<V3WorkbenchService>,
     available: Arc<AtomicBool>,
+    capabilities: Arc<std::sync::Mutex<ImageCapabilities>>,
     stop: Arc<AtomicBool>,
     wake: mpsc::SyncSender<Control>,
     thread: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
@@ -42,13 +48,27 @@ impl QueueSupervisor {
             .arg("--presales-runtime")
             .env_clear();
         let handle = app.clone();
-        Self::start(service, command.into(), move |revision| {
+        let binary = crate::codex_process::resolve_codex_binary(
+            None,
+            &crate::codex_process::SystemCodexBinaryProbe,
+        )
+        .ok();
+        Self::start_with_provider(service, command.into(), binary, move |revision| {
             let _ = handle.emit("presales-queue-changed", json!({"revision":revision}));
         })
     }
+    #[cfg(test)]
     pub(crate) fn start(
         service: Arc<V3WorkbenchService>,
+        command: Command,
+        changed: impl Fn(u64) + Send + 'static,
+    ) -> Result<Self, String> {
+        Self::start_with_provider(service, command, None, changed)
+    }
+    pub(super) fn start_with_provider(
+        service: Arc<V3WorkbenchService>,
         mut command: Command,
+        provider_binary: Option<std::path::PathBuf>,
         changed: impl Fn(u64) + Send + 'static,
     ) -> Result<Self, String> {
         let epoch = service.begin_queue_runtime()?;
@@ -101,6 +121,8 @@ impl QueueSupervisor {
         let stopping = stop.clone();
         let available = Arc::new(AtomicBool::new(false));
         let availability = available.clone();
+        let capabilities = Arc::new(std::sync::Mutex::new(ImageCapabilities::default()));
+        let image_capabilities = capabilities.clone();
         let owned = service.clone();
         let thread = thread::spawn(move || {
             let mut actor = Actor {
@@ -110,6 +132,9 @@ impl QueueSupervisor {
                 active: HashMap::new(),
                 outgoing,
                 available: availability,
+                capabilities: image_capabilities,
+                provider_binary,
+                provider: None,
                 sequence: 0,
                 pending: HashMap::new(),
                 interrupted: HashSet::new(),
@@ -122,7 +147,20 @@ impl QueueSupervisor {
             let _ = actor.service.retry_local_results();
             let mut stop_reason =
                 "private process stopped without remote terminal evidence".to_string();
+            let mut last_refresh = Instant::now();
             while !stopping.load(Ordering::Acquire) {
+                if let Err(error) = actor.flush_provider() {
+                    stop_reason = error;
+                    break;
+                }
+                if actor.provider_binary.is_some()
+                    && !actor.available.load(Ordering::Acquire)
+                    && !actor.pending.contains_key("status")
+                    && last_refresh.elapsed() > Duration::from_secs(5)
+                {
+                    last_refresh = Instant::now();
+                    if let Err(error)=actor.send(json!({"id":"status","method":"presales/status","params":{"generation":epoch}})){stop_reason=error;break;}
+                }
                 while let Ok(control) = controls.try_recv() {
                     match control {
                         Control::Wake => {
@@ -166,7 +204,11 @@ impl QueueSupervisor {
                     && actor.available.load(Ordering::Acquire)
                 {
                     loop {
-                        match actor.service.claim_queue_work(epoch) {
+                        let capabilities = match actor.capabilities.lock() {
+                            Ok(c) => c.clone(),
+                            Err(_) => break,
+                        };
+                        match actor.service.claim_capable_queue_work(epoch, &capabilities) {
                             Ok(Some(work)) => {
                                 actor.sequence += 1;
                                 let request = json!({"id":format!("start:{}",actor.sequence),"method":"presales/start","params":{"generation":epoch,"work":match work.wire(){Ok(w)=>w,Err(_)=>break}}});
@@ -186,12 +228,16 @@ impl QueueSupervisor {
                 let _ = actor.service.unknown_work(epoch, work, &stop_reason);
             }
             actor.available.store(false, Ordering::Release);
+            if let Ok(mut capabilities) = actor.capabilities.lock() {
+                *capabilities = ImageCapabilities::default();
+            }
             actor.notify();
             drop(child);
         });
         Ok(Self {
             service,
             available,
+            capabilities,
             stop,
             wake,
             thread: std::sync::Mutex::new(Some(thread)),
@@ -200,6 +246,11 @@ impl QueueSupervisor {
     pub(crate) fn snapshot(&self) -> Result<QueueSnapshot, String> {
         let mut snapshot = self.service.queue_snapshot()?;
         snapshot.dispatch_available = self.available.load(Ordering::Acquire);
+        snapshot.capabilities = self
+            .capabilities
+            .lock()
+            .map_err(|_| "capabilities lock poisoned")?
+            .clone();
         Ok(snapshot)
     }
     pub(crate) fn wake(&self) {
@@ -233,6 +284,9 @@ struct Actor<F: Fn(u64)> {
     active: HashMap<String, RuntimeWork>,
     outgoing: mpsc::SyncSender<Vec<u8>>,
     available: Arc<AtomicBool>,
+    capabilities: Arc<std::sync::Mutex<ImageCapabilities>>,
+    provider_binary: Option<std::path::PathBuf>,
+    provider: Option<super::provider_process::PrivateProviderProcess>,
     sequence: u64,
     pending: HashMap<String, PendingControl>,
     interrupted: HashSet<String>,
@@ -245,6 +299,23 @@ struct PendingControl {
     work: Option<RuntimeWork>,
 }
 impl<F: Fn(u64)> Actor<F> {
+    fn flush_provider(&mut self) -> Result<(), String> {
+        for _ in 0..8 {
+            let Some(event) = self.provider.as_ref().and_then(|p| p.event()) else {
+                break;
+            };
+            match event {
+                super::provider_process::ProviderEvent::Line(line)=>self.send(json!({"method":"presales/provider/line","params":{"generation":self.generation,"line":line}}))?,
+                super::provider_process::ProviderEvent::Lost=>{
+                    self.available.store(false,Ordering::Release);
+                    *self.capabilities.lock().map_err(|_|"capabilities lock poisoned")?=ImageCapabilities::default();
+                    self.send(json!({"method":"presales/provider/lost","params":{"generation":self.generation}}))?;
+                    self.provider=None;self.notify();break;
+                }
+            }
+        }
+        Ok(())
+    }
     fn notify(&self) {
         (self.changed)(self.revision.fetch_add(1, Ordering::Relaxed) + 1);
     }
@@ -287,7 +358,13 @@ impl<F: Fn(u64)> Actor<F> {
             return Err("private control request capacity exceeded".into());
         }
         let mut bytes = serde_json::to_vec(&message).map_err(message_error)?;
-        if bytes.len() > 9 * 1024 * 1024 {
+        let limit = if message["method"] == "presales/provider/line" {
+            72
+        } else {
+            9
+        } * 1024
+            * 1024;
+        if bytes.len() > limit {
             return Err("private native frame exceeds limit".into());
         }
         bytes.push(b'\n');
@@ -347,6 +424,23 @@ impl<F: Fn(u64)> Actor<F> {
             }
             self.available
                 .store(message["result"]["available"] == true, Ordering::Release);
+            if !message["result"]["capabilities"].is_null() {
+                *self
+                    .capabilities
+                    .lock()
+                    .map_err(|_| "capabilities lock poisoned")? =
+                    serde_json::from_value(message["result"]["capabilities"].clone())
+                        .map_err(message_error)?;
+            } else if self.provider_binary.is_none() {
+                *self
+                    .capabilities
+                    .lock()
+                    .map_err(|_| "capabilities lock poisoned")? = ImageCapabilities {
+                    generation: true,
+                    reference_editing: true,
+                    reason: None,
+                };
+            }
             self.notify();
             return Ok(());
         }
@@ -361,6 +455,52 @@ impl<F: Fn(u64)> Actor<F> {
         let params = &message["params"];
         if params["generation"] != self.generation {
             return Err("old private process generation".into());
+        }
+        if method == "presales/capabilities" {
+            self.available
+                .store(params["available"] == true, Ordering::Release);
+            *self
+                .capabilities
+                .lock()
+                .map_err(|_| "capabilities lock poisoned")? =
+                serde_json::from_value(params["capabilities"].clone()).map_err(message_error)?;
+            self.notify();
+            return Ok(());
+        }
+        if method == "native/provider/start" || method == "native/provider/send" {
+            if !message["id"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("native:"))
+            {
+                return Err("invalid private provider request identity".into());
+            }
+            let result = (|| -> Result<Value, String> {
+                if method == "native/provider/start" {
+                    if self.provider.is_none() {
+                        self.provider =
+                            Some(super::provider_process::PrivateProviderProcess::start(
+                                self.provider_binary
+                                    .as_deref()
+                                    .ok_or("dedicated Codex binary unavailable")?,
+                                &self.service.root,
+                            )?);
+                    }
+                    Ok(json!({"cwd":self.service.root}))
+                } else {
+                    self.provider
+                        .as_ref()
+                        .ok_or("dedicated Codex child unavailable")?
+                        .send(
+                            params["line"]
+                                .as_str()
+                                .ok_or("provider line missing")?
+                                .into(),
+                        )?;
+                    Ok(json!({"sent":true}))
+                }
+            })();
+            self.send(match result{Ok(value)=>json!({"id":message["id"],"result":value}),Err(_)=>json!({"id":message["id"],"error":{"message":"Private Codex transport unavailable"}})})?;
+            return Ok(());
         }
         if method == "presales/progress" {
             self.notify();
@@ -378,6 +518,19 @@ impl<F: Fn(u64)> Actor<F> {
             return Err("private attempt target mismatch".into());
         }
         match method {
+            "native/provider/inputs" => {
+                if !message["id"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("native:"))
+                {
+                    return Err("invalid provider input request identity".into());
+                }
+                let result = self
+                    .service
+                    .resolve_provider_inputs(&work)
+                    .and_then(|v| serde_json::to_value(v).map_err(message_error));
+                self.send(match result{Ok(value)=>json!({"id":message["id"],"result":value}),Err(_)=>json!({"id":message["id"],"error":{"message":"Native input verification failed"}})})?;
+            }
             "presales/terminal" => {
                 let provider =
                     serde_json::from_value(params["provider"].clone()).map_err(message_error)?;

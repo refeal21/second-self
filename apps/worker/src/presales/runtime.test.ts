@@ -9,6 +9,13 @@ import { PresalesRuntime, type RuntimeJob, type RuntimeProvider } from './runtim
 const job = (n:number):RuntimeJob => ({kind:'image',job:{requestId:`request-${n}`,attemptId:`attempt-${n}`,epoch:1,target:{projectId:'synthetic',slideId:`page-${n}`,prompt:`中文 prompt ${n}`,promptVersion:'fixture',feedback:'',spec:{version:'v',sha256:'a'.repeat(64)},design:{version:'v',sha256:'b'.repeat(64)},skill:{version:'v',sha256:'c'.repeat(64)},palette:{version:'v',sha256:'d'.repeat(64)},parentVisual:null,references:[]}}});
 
 describe('private async presales runtime',()=>{
+  it('acknowledges status while actual private provider bootstrap awaits native RPC',async()=>{
+    const lines:Record<string,unknown>[]=[];
+    const runtime=new PresalesRuntime(undefined,line=>lines.push(JSON.parse(line) as Record<string,unknown>),true);
+    await runtime.handle({id:'status',method:'presales/status',params:{generation:1}});
+    expect(lines.find(l=>l.id==='status')?.result).toMatchObject({available:false});
+    runtime.close();
+  });
   it.each([1,2,4])('accepts %i native claims without blocking callbacks or RPC, preserving out-of-order identities',async count=>{
     const lines: Record<string,unknown>[]=[];
     const release: (()=>void)[]=[];

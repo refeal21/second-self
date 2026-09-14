@@ -1,7 +1,7 @@
 use super::*;
 use crate::presales_v3::supervisor::RuntimeWork;
 
-fn enqueue_test_images(s: &V3WorkbenchService, count: usize) {
+pub(super) fn enqueue_test_images(s: &V3WorkbenchService, count: usize) {
     let (checkpoint, palette) = crate::presales_v3::basis::tests::frozen_fixture_pages(count);
     let mut store = s.store.lock().unwrap();
     store
@@ -49,7 +49,7 @@ fn synthetic_child(f: &Fixture, options: Value) -> Command {
     command
 }
 
-fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+pub(super) fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
     while !condition() {
         if std::time::Instant::now() >= deadline {

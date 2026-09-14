@@ -73,6 +73,31 @@ pub fn build_codex_app_server_command(binary_path: &Path) -> Command {
     command
 }
 
+pub(crate) fn build_private_codex_app_server_command(binary_path: &Path, cwd: &Path) -> Command {
+    let mut command = build_codex_app_server_command(binary_path);
+    command
+        .args(["-c", "model_provider=\"openai\""])
+        .current_dir(cwd);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    // Child-only removals: never inspect values, clear proxy/CA, or rewrite login.
+    for name in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "OPENAI_BASE_URL",
+        "OPENAI_FEDERATION_RULE_ID",
+        "OPENAI_IDENTITY_TOKEN_FILE",
+        "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexProcessExit {
     pub code: Option<i32>,
@@ -82,6 +107,7 @@ pub struct CodexProcessExit {
 pub struct CodexAppServerProcess {
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<ChildStdin>>,
+    private_group: bool,
 }
 
 impl CodexAppServerProcess {
@@ -101,7 +127,44 @@ impl CodexAppServerProcess {
         on_stderr_line: impl Fn(String) + Send + 'static,
         on_exit: impl FnOnce(CodexProcessExit) + Send + 'static,
     ) -> Result<Self, String> {
-        let mut command = build_codex_app_server_command(binary_path);
+        Self::spawn_command(
+            build_codex_app_server_command(binary_path),
+            crate::legacy_frames::CODEX_FRAME_LIMIT,
+            false,
+            on_stdout_line,
+            on_stdout_loss,
+            on_stderr_line,
+            on_exit,
+        )
+    }
+
+    pub(crate) fn spawn_private(
+        binary_path: &Path,
+        cwd: &Path,
+        on_stdout_line: impl Fn(String) + Send + 'static,
+        on_stdout_loss: impl Fn() + Send + 'static,
+        on_exit: impl FnOnce(CodexProcessExit) + Send + 'static,
+    ) -> Result<Self, String> {
+        Self::spawn_command(
+            build_private_codex_app_server_command(binary_path, cwd),
+            64 * 1024 * 1024,
+            true,
+            on_stdout_line,
+            on_stdout_loss,
+            |_| {},
+            on_exit,
+        )
+    }
+
+    fn spawn_command(
+        mut command: Command,
+        frame_limit: usize,
+        private_group: bool,
+        on_stdout_line: impl Fn(String) + Send + 'static,
+        on_stdout_loss: impl Fn() + Send + 'static,
+        on_stderr_line: impl Fn(String) + Send + 'static,
+        on_exit: impl FnOnce(CodexProcessExit) + Send + 'static,
+    ) -> Result<Self, String> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -121,14 +184,16 @@ impl CodexAppServerProcess {
             .take()
             .ok_or_else(|| "Codex stderr was unavailable".to_string())?;
         let child = Arc::new(Mutex::new(child));
+        let (stdout_done, stdout_drained) = std::sync::mpsc::channel();
 
         thread::spawn(move || {
             read_bounded_lines(
                 BufReader::new(stdout),
-                crate::legacy_frames::CODEX_FRAME_LIMIT,
+                frame_limit,
                 on_stdout_line,
                 on_stdout_loss,
             );
+            let _ = stdout_done.send(());
         });
         thread::spawn(move || {
             read_bounded_lines(BufReader::new(stderr), 64 * 1024, on_stderr_line, || {});
@@ -142,11 +207,17 @@ impl CodexAppServerProcess {
                 .try_wait();
             match status {
                 Ok(Some(status)) => {
+                    if private_group {
+                        let _ = stdout_drained.recv();
+                    }
                     on_exit(process_exit(status));
                     break;
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(25)),
                 Err(_) => {
+                    if private_group {
+                        let _ = stdout_drained.recv();
+                    }
                     on_exit(CodexProcessExit {
                         code: None,
                         signal: None,
@@ -159,6 +230,7 @@ impl CodexAppServerProcess {
         Ok(Self {
             child,
             stdin: Arc::new(Mutex::new(stdin)),
+            private_group,
         })
     }
 
@@ -181,6 +253,12 @@ impl CodexAppServerProcess {
             .child
             .lock()
             .map_err(|_| "Codex child lock poisoned".to_string())?;
+        #[cfg(unix)]
+        if self.private_group {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+        }
         if child
             .try_wait()
             .map_err(|error| error.to_string())?
@@ -191,6 +269,13 @@ impl CodexAppServerProcess {
                 .map_err(|error| format!("Failed to stop Codex App Server: {error}"))?;
         }
         Ok(())
+    }
+
+    pub(crate) fn stop_and_wait(&self) {
+        let _ = self.stop();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.wait();
+        }
     }
 }
 

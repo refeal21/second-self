@@ -10,17 +10,26 @@ use crate::presales_queue::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rusqlite::params;
-use serde::Serialize;
+use serde::{Deserialize,Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueueSnapshot {
     pub dispatch_available: bool,
+    pub capabilities:ImageCapabilities,
     pub settings: crate::presales_queue::QueueSettings,
     pub remote_active: usize,
     pub succeeded: usize,
     pub jobs: Vec<QueueJobSummary>,
+}
+#[derive(Clone,Debug,Default,Serialize,Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub(crate) struct ImageCapabilities {
+    pub generation:bool,
+    pub reference_editing:bool,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub reason:Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -181,6 +190,7 @@ impl V3WorkbenchService {
         tx.commit().map_err(message)?;
         Ok(QueueSnapshot {
             dispatch_available: false,
+            capabilities:ImageCapabilities::default(),
             settings,
             remote_active,
             succeeded,

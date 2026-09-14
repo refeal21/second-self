@@ -31,9 +31,27 @@ pub(crate) struct QueueJobSummary {
     pub slide_id: Option<String>,
     pub status: String,
     pub sequence: i64,
+    pub error: Option<String>,
 }
 
 impl V3WorkbenchService {
+    pub(super) fn cancellation_pending(
+        &self,
+        epoch: i64,
+        work: &RuntimeWork,
+    ) -> Result<bool, String> {
+        let store = self.store.lock().map_err(|_| "v3 store lock poisoned")?;
+        let query = match work {
+            RuntimeWork::Image(_) => "SELECT EXISTS(SELECT 1 FROM queue_jobs WHERE request_id=?1 AND attempt_id=?2 AND epoch=?3 AND status='cancel_requested')",
+            RuntimeWork::Text(_) => "SELECT EXISTS(SELECT 1 FROM v3_text_operations WHERE operation_id=?1 AND attempt_id=?2 AND epoch=?3 AND status='cancel_requested')",
+        };
+        store
+            .connection
+            .query_row(query, params![work.id(), work.attempt(), epoch], |row| {
+                row.get(0)
+            })
+            .map_err(message)
+    }
     pub(super) fn terminal_work(
         &self,
         epoch: i64,
@@ -120,6 +138,7 @@ impl V3WorkbenchService {
                         .ok_or("invalid status")?
                         .into(),
                     sequence: j.sequence,
+                    error: j.error,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -145,6 +164,7 @@ impl V3WorkbenchService {
                     .ok_or("invalid status")?
                     .into(),
                 sequence: j.sequence,
+                error: j.error,
             });
         }
         jobs.sort_by_key(|j| j.sequence);
@@ -259,7 +279,7 @@ impl V3WorkbenchService {
                     envelope: result["envelope"].clone(),
                 })?;
                 if staged.status == V3TextStatus::ResultReady {
-                    let _ = self.commit_text_result(work.id());
+                    self.publish_local_result(epoch, work)?;
                 }
             }
             RuntimeWork::Image(_) => {
@@ -298,18 +318,7 @@ impl V3WorkbenchService {
                         q.stage_png_result(&vault, epoch, work.id(), work.attempt(), &bytes)?;
                     drop(q);
                     if staged.status == JobStatus::ResultReady {
-                        let _ = self
-                            .store
-                            .lock()
-                            .map_err(|_| "v3 store lock poisoned")?
-                            .commit_result(
-                                CommitResult {
-                                    epoch,
-                                    request_id: work.id().into(),
-                                    attempt_id: work.attempt().into(),
-                                },
-                                &vault,
-                            );
+                        self.publish_local_result(epoch, work)?;
                     }
                 }
             }
@@ -317,26 +326,36 @@ impl V3WorkbenchService {
         Ok(())
     }
     pub(super) fn retry_local_results(&self) -> Result<(), String> {
+        let mut failures = Vec::new();
         let snapshot = self.queue_snapshot()?;
         for job in snapshot.jobs.iter().filter(|j| {
             j.kind == "image" && matches!(j.status.as_str(), "outcome_unknown" | "cancel_requested")
         }) {
-            let vault = ResultVault::open(&self.root)?;
-            let mut q = self
-                .image_lifecycle
-                .lock()
-                .map_err(|_| "image lifecycle lock poisoned")?;
-            let image = q
-                .get_job(&job.request_id)?
-                .ok_or("image recovery attempt missing")?;
-            // A completed native vault manifest is durable result evidence even
-            // if SQLite staging failed. Missing/incomplete files prove nothing.
-            let _ = q.recover_png_result(
-                &vault,
-                snapshot.settings.epoch,
-                &image.request_id,
-                &image.attempt_id,
-            );
+            let work = self.local_work(&job.kind, &job.request_id)?;
+            let outcome = (|| {
+                let vault = ResultVault::open(&self.root)?;
+                let RuntimeWork::Image(image) = &work else {
+                    unreachable!()
+                };
+                let binding = crate::presales_queue::result_staging::result_binding(image)?;
+                // No manifest is expected after an unknown remote outcome.
+                // Present but corrupt/incomplete evidence is an actionable error.
+                if vault.has_manifest(&binding)? {
+                    self.image_lifecycle
+                        .lock()
+                        .map_err(|_| "image lifecycle lock poisoned")?
+                        .recover_png_result(
+                            &vault,
+                            snapshot.settings.epoch,
+                            work.id(),
+                            work.attempt(),
+                        )?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = outcome {
+                failures.push(self.local_result_error(snapshot.settings.epoch, &work, error));
+            }
         }
         let snapshot = self.queue_snapshot()?;
         for job in snapshot
@@ -344,31 +363,99 @@ impl V3WorkbenchService {
             .into_iter()
             .filter(|j| matches!(j.status.as_str(), "result_ready" | "committing"))
         {
-            if job.kind == "text" {
-                let _ = self.commit_text_result(&job.request_id);
-            } else {
-                let vault = ResultVault::open(&self.root)?;
-                let q = self
-                    .image_lifecycle
-                    .lock()
-                    .map_err(|_| "image lifecycle lock poisoned")?;
-                let image = q.get_job(&job.request_id)?.ok_or("local result missing")?;
-                // Files are already verified; publishing never calls a provider.
-                drop(q);
-                let _ = self
-                    .store
-                    .lock()
-                    .map_err(|_| "v3 store lock poisoned")?
-                    .commit_result(
-                        CommitResult {
-                            epoch: snapshot.settings.epoch,
-                            request_id: image.request_id,
-                            attempt_id: image.attempt_id,
-                        },
-                        &vault,
-                    );
+            let work = self.local_work(&job.kind, &job.request_id)?;
+            if let Err(error) = self.publish_local_result(snapshot.settings.epoch, &work) {
+                failures.push(error);
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn local_work(&self, kind: &str, id: &str) -> Result<RuntimeWork, String> {
+        if kind == "text" {
+            Ok(RuntimeWork::Text(self.text_operation(id)?))
+        } else {
+            Ok(RuntimeWork::Image(
+                self.image_lifecycle
+                    .lock()
+                    .map_err(|_| "image lifecycle lock poisoned")?
+                    .get_job(id)?
+                    .ok_or("local image result missing")?,
+            ))
+        }
+    }
+
+    fn publish_local_result(&self, epoch: i64, work: &RuntimeWork) -> Result<(), String> {
+        let outcome = (|| {
+            match work {
+                RuntimeWork::Text(_) => {
+                    self.commit_text_result(work.id())?;
+                }
+                RuntimeWork::Image(_) => {
+                    let vault = ResultVault::open(&self.root)?;
+                    self.store
+                        .lock()
+                        .map_err(|_| "v3 store lock poisoned")?
+                        .commit_result(
+                            CommitResult {
+                                epoch,
+                                request_id: work.id().into(),
+                                attempt_id: work.attempt().into(),
+                            },
+                            &vault,
+                        )?;
+                }
+            }
+            self.record_local_error(epoch, work, None)
+        })();
+        outcome.map_err(|error| self.local_result_error(epoch, work, error))
+    }
+
+    fn local_result_error(&self, epoch: i64, work: &RuntimeWork, error: String) -> String {
+        let mut detail = format!(
+            "Local result save/recovery failed for {}: {error}",
+            work.id()
+        );
+        let mut end = detail.len().min(4096);
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+        match self.record_local_error(epoch, work, Some(&detail)) {
+            Ok(()) => detail,
+            Err(record_error) => format!("{detail}; could not persist error: {record_error}"),
+        }
+    }
+
+    fn record_local_error(
+        &self,
+        epoch: i64,
+        work: &RuntimeWork,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let mut store = self.store.lock().map_err(|_| "v3 store lock poisoned")?;
+        write_on(&mut store.connection, |tx| {
+            if read_settings(tx)?.epoch != epoch {
+                return Err("local save epoch mismatch".into());
+            }
+            let (table, id) = match work {
+                RuntimeWork::Image(_) => ("queue_jobs", "request_id"),
+                RuntimeWork::Text(_) => ("v3_text_operations", "operation_id"),
+            };
+            // Never overwrite terminal conflict/cancellation evidence. Clearing
+            // happens only after a successful publication, not merely a retry.
+            let states = if error.is_some() {
+                "'result_ready','committing','outcome_unknown','cancel_requested'"
+            } else {
+                "'succeeded'"
+            };
+            tx.execute(&format!("UPDATE {table} SET error=?1,updated_at_ms=?2 WHERE {id}=?3 AND attempt_id=?4 AND epoch=?5 AND status IN ({states})"),
+                params![error, epoch_milliseconds()?, work.id(), work.attempt(), epoch]).map_err(message)?;
+            Ok(())
+        })
     }
 }

@@ -1,6 +1,304 @@
 use super::*;
 use crate::presales_v3::supervisor::RuntimeWork;
 
+fn enqueue_test_images(s: &V3WorkbenchService, count: usize) {
+    let (checkpoint, palette) = crate::presales_v3::basis::tests::frozen_fixture_pages(count);
+    let mut store = s.store.lock().unwrap();
+    store
+        .insert_project(ValidatedV3ProjectSeed::from_checkpoint(checkpoint, palette).unwrap())
+        .unwrap();
+    let pages = store.load_project("frozen-project").unwrap().pages;
+    store
+        .enqueue_pages(
+            EnqueuePages {
+                project_id: "frozen-project".into(),
+                batch_id: "review-batch".into(),
+                pages: pages
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, p)| PageRequest {
+                        slide_id: p.slide_id,
+                        expected_revision: p.revision,
+                        request_id: format!("review-image-{i}"),
+                        attempt_id: format!("review-attempt-{i}"),
+                        parent_version_id: None,
+                        feedback: String::new(),
+                    })
+                    .collect(),
+            },
+            None,
+        )
+        .unwrap();
+}
+
+fn synthetic_child(f: &Fixture, options: Value) -> Command {
+    let mut fixture = json!({"png":STANDARD.encode(png(65)),"outline":f.pair["outline"],"details":f.pair["details"]});
+    fixture
+        .as_object_mut()
+        .unwrap()
+        .extend(options.as_object().unwrap().clone());
+    let path = f.root.path().join("review-child.json");
+    std::fs::write(&path, fixture.to_string()).unwrap();
+    let worker = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../worker");
+    let mut command = Command::new("node");
+    command
+        .arg("--import")
+        .arg(worker.join("node_modules/tsx/dist/loader.mjs"))
+        .arg(worker.join("src/presales/runtime-child.test-support.ts"))
+        .arg(path);
+    command
+}
+
+fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while !condition() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+#[test]
+fn completed_interrupt_race_does_not_stop_unrelated_private_child_work() {
+    let f = Fixture::new(5);
+    let s = std::sync::Arc::new(f.service());
+    enqueue_test_images(&s, 2);
+    s.set_queue_settings(2, false).unwrap();
+    let marker = f.root.path().join("emitted");
+    let command = synthetic_child(
+        &f,
+        json!({"resultMarker":marker,"heldRequest":"review-image-1"}),
+    );
+    let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocked = std::sync::atomic::AtomicBool::new(false);
+    let observed = s.clone();
+    let host =
+        crate::presales_v3::runtime_host::QueueSupervisor::start(s.clone(), command, move |_| {
+            let ready = observed
+                .image_lifecycle
+                .lock()
+                .unwrap()
+                .get_job("review-image-0")
+                .unwrap()
+                .unwrap()
+                .provider
+                .is_some_and(|p| p.turn_id.is_some());
+            if ready && !blocked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                blocked_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(6)).unwrap();
+            }
+        })
+        .unwrap();
+    blocked_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+    let emitted = wait_until(|| marker.exists());
+    s.image_lifecycle
+        .lock()
+        .unwrap()
+        .request_cancel("review-image-0")
+        .unwrap();
+    host.interrupt("review-image-0".into());
+    release_tx.send(()).unwrap();
+    assert!(
+        emitted,
+        "completion must already be in child stdout before cancellation delivery"
+    );
+    assert!(wait_until(
+        || s.queue_snapshot().unwrap().jobs[0].status == "cancelled"
+    ));
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        host.snapshot().unwrap().dispatch_available,
+        "negative interrupt reply killed the shared private child"
+    );
+    assert_eq!(s.queue_snapshot().unwrap().jobs[1].status, "running");
+    host.shutdown();
+}
+
+#[test]
+fn saturated_wakes_do_not_drop_durable_cancellation_or_release_its_slot() {
+    let f = Fixture::new(5);
+    let s = std::sync::Arc::new(f.service());
+    enqueue_test_images(&s, 1);
+    let marker = f.root.path().join("interrupted");
+    let command = synthetic_child(&f, json!({"interruptMarker":marker,"delayMs":10000}));
+    let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocked = std::sync::atomic::AtomicBool::new(false);
+    let observed = s.clone();
+    let host =
+        crate::presales_v3::runtime_host::QueueSupervisor::start(s.clone(), command, move |_| {
+            let ready = observed
+                .image_lifecycle
+                .lock()
+                .unwrap()
+                .get_job("review-image-0")
+                .unwrap()
+                .unwrap()
+                .provider
+                .is_some();
+            if ready && !blocked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                blocked_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(6)).unwrap();
+            }
+        })
+        .unwrap();
+    blocked_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+    for _ in 0..32 {
+        host.wake();
+    }
+    s.image_lifecycle
+        .lock()
+        .unwrap()
+        .request_cancel("review-image-0")
+        .unwrap();
+    host.interrupt("review-image-0".into());
+    release_tx.send(()).unwrap();
+    assert!(
+        wait_until(|| marker.exists()),
+        "persisted cancellation was lost behind wake backpressure"
+    );
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "review-image-0");
+    assert_eq!(host.snapshot().unwrap().remote_active, 1);
+    assert_eq!(
+        s.queue_snapshot().unwrap().jobs[0].status,
+        "cancel_requested"
+    );
+    host.shutdown();
+}
+
+#[test]
+fn failed_image_and_text_publication_is_visible_and_retries_only_local_results() {
+    let f = Fixture::new(5);
+    let s = f.service();
+    let d = super::draft_tests::imported(&f, &s);
+    s.request_text_authoring(RequestTextAuthoring {
+        project_id: d.summary.project_id,
+        expected_revision: 1,
+        operation_id: "review-text".into(),
+        attempt_id: "review-text-attempt".into(),
+        stage: V3TextStage::Outline,
+    })
+    .unwrap();
+    enqueue_test_images(&s, 1);
+    s.set_queue_settings(2, false).unwrap();
+    let epoch = s.begin_queue_runtime().unwrap();
+    let works = [
+        s.claim_queue_work(epoch).unwrap().unwrap(),
+        s.claim_queue_work(epoch).unwrap().unwrap(),
+    ];
+    let c = rusqlite::Connection::open(f.root.path().join("presales-v3.sqlite3")).unwrap();
+    c.execute_batch("CREATE TRIGGER fail_text_publish BEFORE UPDATE OF status ON v3_text_operations WHEN NEW.status='succeeded' BEGIN SELECT RAISE(ABORT,'synthetic text disk failure'); END; CREATE TRIGGER fail_image_publish BEFORE UPDATE OF status ON queue_jobs WHEN NEW.status='succeeded' BEGIN SELECT RAISE(ABORT,'synthetic image disk failure'); END;").unwrap();
+    for work in &works {
+        let provider = TextProviderIdentity {
+            thread_id: format!("thread-{}", work.id()),
+            turn_id: Some("turn".into()),
+        };
+        s.provider_identity(epoch, work, provider.clone()).unwrap();
+        let result = match work {
+            RuntimeWork::Text(_) => json!({"kind":"text","envelope":f.pair["outline"]}),
+            RuntimeWork::Image(_) => json!({"kind":"image","pngBase64":STANDARD.encode(png(44))}),
+        };
+        assert!(
+            s.complete_work(epoch, work, provider, &result).is_err(),
+            "publication failure must not report success"
+        );
+    }
+    let snapshot = serde_json::to_value(s.queue_snapshot().unwrap()).unwrap();
+    for job in snapshot["jobs"].as_array().unwrap() {
+        assert_eq!(job["status"], "result_ready");
+        assert!(job["error"].as_str().unwrap().contains("disk failure"));
+    }
+    let text_result = s.text_operation("review-text").unwrap().result.unwrap();
+    let image_result = s
+        .image_lifecycle
+        .lock()
+        .unwrap()
+        .get_job("review-image-0")
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+    let image_bytes = std::fs::read(s.root.join(&image_result.relative_path)).unwrap();
+    let error = s
+        .retry_local_results()
+        .expect_err("retry command must report remaining failures");
+    assert!(
+        error.contains("review-text") && error.contains("review-image-0"),
+        "{error}"
+    );
+    assert_eq!(
+        s.text_operation("review-text").unwrap().result,
+        Some(text_result)
+    );
+    assert_eq!(
+        std::fs::read(s.root.join(image_result.relative_path)).unwrap(),
+        image_bytes
+    );
+    c.execute_batch("DROP TRIGGER fail_text_publish; DROP TRIGGER fail_image_publish;")
+        .unwrap();
+    s.retry_local_results().unwrap();
+    assert_eq!(s.queue_snapshot().unwrap().succeeded, 2);
+    for job in serde_json::to_value(s.queue_snapshot().unwrap()).unwrap()["jobs"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(job["error"].is_null());
+    }
+    assert!(
+        s.claim_queue_work(epoch).unwrap().is_none(),
+        "local recovery must never enqueue or dispatch generation"
+    );
+}
+
+#[test]
+fn absent_manifest_is_expected_but_corrupt_or_unreadable_recovery_is_visible() {
+    let f = Fixture::new(5);
+    let s = f.service();
+    enqueue_test_images(&s, 1);
+    let epoch = s.begin_queue_runtime().unwrap();
+    let work = s.claim_queue_work(epoch).unwrap().unwrap();
+    s.unknown_work(epoch, &work, "child gone").unwrap();
+    s.retry_local_results().unwrap(); // No manifest is expected for unknown remote work.
+    let RuntimeWork::Image(job) = &work else {
+        panic!("expected image")
+    };
+    let vault = crate::presales_queue::ResultVault::open(&s.root).unwrap();
+    let binding = crate::presales_queue::result_staging::result_binding(job).unwrap();
+    vault.stage(&binding, &png(33)).unwrap();
+    let manifest = s
+        .root
+        .join("queue-results/review-image-0/review-attempt-0.json");
+    let bytes = std::fs::read(&manifest).unwrap();
+    std::fs::write(&manifest, b"not JSON").unwrap();
+    let error = s
+        .retry_local_results()
+        .expect_err("corrupt manifest must not be treated as absent");
+    assert!(error.contains("manifest"), "{error}");
+    let snapshot = serde_json::to_value(s.queue_snapshot().unwrap()).unwrap();
+    assert!(snapshot["jobs"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("manifest"));
+    assert_eq!(snapshot["remoteActive"], 1);
+    std::fs::write(&manifest, bytes).unwrap();
+    let png_path = s
+        .root
+        .join("queue-results/review-image-0/review-attempt-0.png");
+    let bytes = std::fs::read(&png_path).unwrap();
+    std::fs::remove_file(&png_path).unwrap();
+    assert!(
+        s.retry_local_results().is_err(),
+        "manifest without its PNG is incomplete evidence, not absence"
+    );
+    std::fs::write(&png_path, bytes).unwrap();
+    s.retry_local_results().unwrap();
+    assert_eq!(s.queue_snapshot().unwrap().succeeded, 1);
+    assert!(s.claim_queue_work(epoch).unwrap().is_none());
+}
+
 #[test]
 fn stalled_private_start_acknowledgement_becomes_named_unknown_without_releasing_slot() {
     let f = Fixture::new(5);

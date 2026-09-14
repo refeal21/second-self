@@ -85,6 +85,47 @@ mod native {
             Ok(bytes)
         }
 
+        /// Only ENOENT means absence. Unsafe paths and other I/O failures must
+        /// remain errors, including a dangling symlink at the final component.
+        pub(crate) fn contains_regular_file(&self, components: &[&str]) -> Result<bool, String> {
+            let (name, parents) = components.split_last().ok_or("Result path is empty")?;
+            let mut directory = self.descriptor.try_clone().map_err(|e| e.to_string())?;
+            for component in parents {
+                directory = match open_directory_at(&directory, &component_name(component)?) {
+                    Ok(next) => next,
+                    Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+                    Err(e) => {
+                        return Err(format!("Result directory cannot be inspected safely: {e}"))
+                    }
+                };
+            }
+            let name = component_name(name)?;
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: parent descriptor is held, name is validated and output
+            // storage is valid. AT_SYMLINK_NOFOLLOW never follows the leaf.
+            if unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                let e = std::io::Error::last_os_error();
+                return if e.kind() == ErrorKind::NotFound {
+                    Ok(false)
+                } else {
+                    Err(format!("Result manifest cannot be inspected: {e}"))
+                };
+            }
+            // SAFETY: successful fstatat initialized metadata.
+            if unsafe { metadata.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return Err("Result manifest is not a regular file".into());
+            }
+            Ok(true)
+        }
+
         pub(crate) fn write_immutable(
             &self,
             components: &[&str],
@@ -334,6 +375,10 @@ impl RootDirectory {
     }
 
     pub(super) fn read(&self, _components: &[&str], _limit: usize) -> Result<Vec<u8>, String> {
+        Err("Result vault requires descriptor-relative filesystem support".into())
+    }
+
+    pub(super) fn contains_regular_file(&self, _components: &[&str]) -> Result<bool, String> {
         Err("Result vault requires descriptor-relative filesystem support".into())
     }
 

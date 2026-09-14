@@ -19,9 +19,9 @@ async fn change<T: Send + 'static>(
     host: &QueueSupervisor,
     operation: impl FnOnce(&V3WorkbenchService) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
-    let result = run(service, operation).await?;
+    let result = run(service, operation).await;
     host.wake();
-    Ok(result)
+    result
 }
 #[tauri::command]
 pub(crate) async fn presales_v3_list(

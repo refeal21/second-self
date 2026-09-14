@@ -144,6 +144,15 @@ impl ResultVault {
             dimensions,
         })
     }
+
+    pub(crate) fn has_manifest(&self, binding: &ResultBinding) -> Result<bool, String> {
+        validate_binding(binding)?;
+        self.root.contains_regular_file(&[
+            "queue-results",
+            &binding.request_id,
+            &manifest_name(binding),
+        ])
+    }
 }
 
 fn validate_binding(binding: &ResultBinding) -> Result<(), String> {

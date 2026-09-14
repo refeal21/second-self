@@ -2,7 +2,7 @@
 use super::{runtime_callbacks::QueueSnapshot, store::message, supervisor::RuntimeWork, *};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufReader, Write},
     process::{Child, Command, Stdio},
     sync::{
@@ -23,7 +23,6 @@ pub(crate) struct QueueSupervisor {
 }
 enum Control {
     Wake,
-    Interrupt(String),
 }
 enum ChildEvent {
     Line(String),
@@ -113,6 +112,7 @@ impl QueueSupervisor {
                 available: availability,
                 sequence: 0,
                 pending: HashMap::new(),
+                interrupted: HashSet::new(),
                 revision: AtomicU64::new(0),
                 changed,
             };
@@ -128,12 +128,11 @@ impl QueueSupervisor {
                         Control::Wake => {
                             actor.notify();
                         }
-                        Control::Interrupt(id) => {
-                            if actor.active.contains_key(&id) {
-                                let _=actor.send(json!({"id":format!("interrupt:{id}"),"method":"presales/interrupt","params":{"generation":epoch,"requestId":id}}));
-                            }
-                        }
                     }
+                }
+                if let Err(error) = actor.flush_cancellations() {
+                    stop_reason = error;
+                    break;
                 }
                 let result = match reader.recv_timeout(Duration::from_millis(25)) {
                     Ok(ChildEvent::Line(line)) => actor.handle(&line),
@@ -155,7 +154,7 @@ impl QueueSupervisor {
                 if actor
                     .pending
                     .values()
-                    .any(|sent| sent.elapsed() > Duration::from_secs(15))
+                    .any(|request| request.sent.elapsed() > Duration::from_secs(15))
                 {
                     stop_reason =
                         "private control acknowledgement timed out; remote outcome unknown".into();
@@ -206,8 +205,10 @@ impl QueueSupervisor {
     pub(crate) fn wake(&self) {
         let _ = self.wake.try_send(Control::Wake);
     }
-    pub(crate) fn interrupt(&self, id: String) {
-        let _ = self.wake.try_send(Control::Interrupt(id));
+    pub(crate) fn interrupt(&self, _id: String) {
+        // Intent is already committed by the command. Wakes may coalesce: the
+        // actor polls durable intent even when this bounded channel is full.
+        self.wake();
     }
     pub(crate) fn shutdown(&self) {
         self.stop.store(true, Ordering::Release);
@@ -233,15 +234,48 @@ struct Actor<F: Fn(u64)> {
     outgoing: mpsc::SyncSender<Vec<u8>>,
     available: Arc<AtomicBool>,
     sequence: u64,
-    pending: HashMap<String, Instant>,
+    pending: HashMap<String, PendingControl>,
+    interrupted: HashSet<String>,
     revision: AtomicU64,
     changed: F,
+}
+struct PendingControl {
+    sent: Instant,
+    method: String,
+    work: Option<RuntimeWork>,
 }
 impl<F: Fn(u64)> Actor<F> {
     fn notify(&self) {
         (self.changed)(self.revision.fetch_add(1, Ordering::Relaxed) + 1);
     }
     fn send(&mut self, message: Value) -> Result<(), String> {
+        if self.try_send(message)? {
+            Ok(())
+        } else {
+            Err("private stdin backpressured".into())
+        }
+    }
+    fn flush_cancellations(&mut self) -> Result<(), String> {
+        self.interrupted.retain(|id| self.active.contains_key(id));
+        let candidates: Vec<_> = self
+            .active
+            .values()
+            .filter(|work| !self.interrupted.contains(work.id()))
+            .cloned()
+            .collect();
+        for work in candidates {
+            if self.service.cancellation_pending(self.epoch, &work)? {
+                let id = work.id();
+                if self.try_send(json!({"id":format!("interrupt:{id}"),"method":"presales/interrupt","params":{"generation":self.generation,"requestId":id}}))? {
+                    self.interrupted.insert(id.into());
+                }
+                // Full stdin is retried from durable intent on the next actor
+                // tick; disconnect is an explicit transport failure, not loss.
+            }
+        }
+        Ok(())
+    }
+    fn try_send(&mut self, message: Value) -> Result<bool, String> {
         let pending_id = message["method"]
             .as_str()
             .and_then(|_| message["id"].as_str())
@@ -257,13 +291,27 @@ impl<F: Fn(u64)> Actor<F> {
             return Err("private native frame exceeds limit".into());
         }
         bytes.push(b'\n');
-        self.outgoing
-            .try_send(bytes)
-            .map_err(|_| "private stdin unavailable or backpressured".to_string())?;
-        if let Some(id) = pending_id {
-            self.pending.insert(id, Instant::now());
+        match self.outgoing.try_send(bytes) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => return Ok(false),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err("private stdin disconnected; cancellation delivery is uncertain".into())
+            }
         }
-        Ok(())
+        if let Some(id) = pending_id {
+            let work_id = message["params"]["requestId"]
+                .as_str()
+                .or_else(|| message["params"]["work"]["job"]["requestId"].as_str());
+            self.pending.insert(
+                id,
+                PendingControl {
+                    sent: Instant::now(),
+                    method: message["method"].as_str().unwrap().into(),
+                    work: work_id.and_then(|id| self.active.get(id).cloned()),
+                },
+            );
+        }
+        Ok(true)
     }
     fn handle(&mut self, line: &str) -> Result<(), String> {
         let message: Value = serde_json::from_str(line).map_err(message_error)?;
@@ -271,8 +319,26 @@ impl<F: Fn(u64)> Actor<F> {
             let id = message["id"]
                 .as_str()
                 .ok_or("private reply identity missing")?;
-            if self.pending.remove(id).is_none() {
-                return Err("unknown private control reply".into());
+            let pending = self
+                .pending
+                .remove(id)
+                .ok_or("unknown private control reply")?;
+            if pending.method == "presales/interrupt" {
+                // Completion may already have been buffered before this control
+                // reached the Worker. A negative ACK is local to this attempt,
+                // never a reason to stop the shared child or release its slot.
+                if message["error"].is_object() || message["result"]["acknowledged"] != true {
+                    if let Some(work) = pending.work {
+                        self.interrupted.remove(work.id());
+                        self.service.unknown_work(
+                            self.epoch,
+                            &work,
+                            "cancellation was not acknowledged; remote outcome remains unknown",
+                        )?;
+                    }
+                    self.notify();
+                }
+                return Ok(());
             }
         }
         if message["id"] == "status" {
@@ -379,6 +445,10 @@ impl Drop for OwnedChild {
         let _ = self.0.wait();
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_control_tests.rs"]
+mod control_tests;
 
 #[cfg(test)]
 mod frame_tests {

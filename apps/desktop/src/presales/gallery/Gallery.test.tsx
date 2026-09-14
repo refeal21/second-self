@@ -7,7 +7,7 @@ import { Gallery } from './Gallery.js';
 import { GalleryImage } from './GalleryImage.js';
 import type { GalleryModel, GalleryProps } from './model.js';
 
-afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 function deferred<T = void>() {
   let resolve!: (value: T) => void;
@@ -36,7 +36,7 @@ const base: GalleryModel = {
 function props(overrides: Partial<GalleryProps> = {}): GalleryProps {
   return { model: base, loadImage: vi.fn(async () => 'data:image/png;base64,aGVsbG8='),
     onGenerate: vi.fn(async () => {}), onEdit: vi.fn(async () => {}), onAdopt: vi.fn(async () => {}),
-    onRestore: vi.fn(async () => {}), onApprove: vi.fn(async () => {}), onSaveFeedback: vi.fn(async () => {}),
+    onRestore: vi.fn(async () => {}), onApprove: vi.fn(async () => {}), onSaveFeedback: vi.fn(async (_ref, text: string) => ({ text, revision: 1 })),
     onQueueChange: vi.fn(async () => {}), onBatchGenerate: vi.fn(async () => {}), onDirtyChange: vi.fn(), ...overrides };
 }
 
@@ -77,7 +77,7 @@ describe('Gallery', () => {
 
   it('retains typed feedback through save conflict and unrelated updates, then restores host-saved feedback after remount', async () => {
     const user = userEvent.setup(); const onDirtyChange = vi.fn();
-    const onSaveFeedback = vi.fn().mockRejectedValueOnce(new Error('版本冲突')).mockResolvedValue(undefined);
+    const onSaveFeedback = vi.fn().mockRejectedValueOnce(new Error('版本冲突')).mockResolvedValue({ text: '请加强对比', revision: 1 });
     const input = props({ onSaveFeedback, onDirtyChange });
     const { rerender, unmount } = render(<Gallery {...input} />);
     await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
@@ -211,5 +211,180 @@ describe('Gallery', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('编辑暂不可用');
     await user.click(screen.getByRole('button', { name: /第 1 页 开场/ }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('blocks overlapping generation paths for B while permitting a different page to generate', async () => {
+    const user = userEvent.setup(); const running = deferred();
+    const onGenerate = vi.fn(() => running.promise); const onBatchGenerate = vi.fn(async () => {});
+    const d = { ...base.pages[1]!, id: 'd', number: 4, title: '成果', candidateVersionId: 'd1',
+      versions: [{ id: 'd1', revision: 1, label: '候选稿', manualRevision: 0, approved: false, image: image('d1') }] };
+    render(<Gallery {...props({ model: { ...base, pages: [...base.pages, d] }, onGenerate, onBatchGenerate })} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.click(screen.getByRole('button', { name: '生成新稿' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(onGenerate).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole('checkbox', { name: '选择第 2 页' }));
+    expect(screen.getByRole('button', { name: '批量生成所选页' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '编辑此版本' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: /第 4 页 成果/ }));
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+    expect(onBatchGenerate).not.toHaveBeenCalled();
+    await act(async () => running.resolve());
+  });
+
+  it('allows a disjoint batch while another batch is awaiting its callback', async () => {
+    const user = userEvent.setup(); const first = deferred();
+    const onBatchGenerate = vi.fn((batch: { pageIds: string[] }) => batch.pageIds[0] === 'b' ? first.promise : Promise.resolve());
+    const d = { ...base.pages[1]!, id: 'd', number: 4, title: '成果', candidateVersionId: 'd1',
+      versions: [{ id: 'd1', revision: 1, label: '候选稿', manualRevision: 0, approved: false, image: image('d1') }] };
+    render(<Gallery {...props({ model: { ...base, pages: [...base.pages, d] }, onBatchGenerate })} />);
+    await user.click(screen.getByRole('checkbox', { name: '选择第 2 页' }));
+    await user.click(screen.getByRole('button', { name: '批量生成所选页' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    await user.click(screen.getByRole('checkbox', { name: '选择第 2 页' }));
+    await user.click(screen.getByRole('checkbox', { name: '选择第 4 页' }));
+    expect(screen.getByRole('button', { name: '批量生成所选页' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: '批量生成所选页' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(onBatchGenerate).toHaveBeenCalledTimes(2);
+    expect(onBatchGenerate).toHaveBeenNthCalledWith(2, { pageIds: ['d'], replaceCandidates: true });
+    await act(async () => first.resolve());
+  });
+
+  it('treats a pending edit as generation work for that page only', async () => {
+    const user = userEvent.setup(); const running = deferred();
+    const onEdit = vi.fn(() => running.promise);
+    render(<Gallery {...props({ onEdit })} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.click(screen.getByRole('button', { name: '编辑此版本' }));
+    expect(onEdit).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    await user.click(screen.getByRole('checkbox', { name: '选择第 2 页' }));
+    expect(screen.getByRole('button', { name: '批量生成所选页' })).toBeDisabled();
+    await act(async () => running.resolve());
+  });
+
+  it('requires fresh replacement confirmation when a candidate appears while the dialog is open', async () => {
+    const user = userEvent.setup(); const onGenerate = vi.fn(async () => {});
+    const d = { ...base.pages[1]!, id: 'd', number: 4, title: '成果', candidateVersionId: null, versions: [] };
+    const first: GalleryModel = { ...base, pages: [...base.pages, d] };
+    const { rerender } = render(<Gallery {...props({ model: first, onGenerate })} />);
+    await user.click(screen.getByRole('button', { name: /第 4 页 成果/ }));
+    await user.click(screen.getByRole('button', { name: '生成新稿' }));
+    expect(screen.getByRole('dialog')).not.toHaveTextContent('替换候选稿');
+    const updated: GalleryModel = { ...first, pages: first.pages.map(p => p.id === 'd' ? {
+      ...p, candidateVersionId: 'd1', versions: [{ id: 'd1', revision: 1, label: '新候选稿', manualRevision: 0, approved: false, image: image('d1') }],
+    } : p) };
+    rerender(<Gallery {...props({ model: updated, onGenerate })} />);
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(onGenerate).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog')).toHaveTextContent('替换候选稿');
+    expect(screen.getByRole('dialog')).toHaveTextContent('页面状态已变化，请再次确认');
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(onGenerate).toHaveBeenCalledWith('d', true);
+  });
+
+  it('rejects a batch confirmation when a selected page becomes queued before dispatch', async () => {
+    const user = userEvent.setup(); const onBatchGenerate = vi.fn(async () => {});
+    const input = props({ onBatchGenerate });
+    const { rerender } = render(<Gallery {...input} />);
+    await user.click(screen.getByRole('checkbox', { name: '选择第 2 页' }));
+    await user.click(screen.getByRole('button', { name: '批量生成所选页' }));
+    const updated: GalleryModel = { ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'queued', label: '排队中' } } : p) };
+    rerender(<Gallery {...input} model={updated} />);
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(onBatchGenerate).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('页面状态已变化，请重新选择');
+  });
+
+  it('requires fresh confirmation when the same candidate identity gets a new revision', async () => {
+    const user = userEvent.setup(); const onGenerate = vi.fn(async () => {});
+    const input = props({ onGenerate }); const { rerender } = render(<Gallery {...input} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.click(screen.getByRole('button', { name: '生成新稿' }));
+    const updated: GalleryModel = { ...base, pages: base.pages.map(p => p.id === 'b' ? {
+      ...p, versions: p.versions.map(v => v.id === 'b2' ? { ...v, revision: 3 } : v),
+    } : p) };
+    rerender(<Gallery {...input} model={updated} />);
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(onGenerate).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog')).toHaveTextContent('页面状态已变化，请再次确认');
+  });
+
+  it('keeps acknowledged feedback through an older host snapshot and accepts a newer one', async () => {
+    const user = userEvent.setup(); const saving = deferred<{ text: string; revision: number }>();
+    const onSaveFeedback = vi.fn(() => saving.promise); const onDirtyChange = vi.fn();
+    const saved = { 'b:b2:2': { text: '旧反馈', revision: 2 } };
+    const input = props({ model: { ...base, savedFeedback: saved }, onSaveFeedback, onDirtyChange });
+    const { rerender } = render(<Gallery {...input} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.clear(screen.getByRole('textbox', { name: '此版本反馈' }));
+    await user.type(screen.getByRole('textbox', { name: '此版本反馈' }), '新反馈');
+    await user.click(screen.getByRole('button', { name: '保存反馈' }));
+    expect(onSaveFeedback).toHaveBeenCalledWith({ pageId: 'b', versionId: 'b2', revision: 2 }, '新反馈');
+    await act(async () => saving.resolve({ text: '新反馈', revision: 3 }));
+    rerender(<Gallery {...input} model={{ ...base, savedFeedback: { 'b:b2:2': { text: '旧反馈', revision: 2 } } }} />);
+    expect(screen.getByRole('textbox', { name: '此版本反馈' })).toHaveValue('新反馈');
+    expect(screen.getByRole('button', { name: '保存反馈' })).toBeDisabled();
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+    rerender(<Gallery {...input} model={{ ...base, savedFeedback: { 'b:b2:2': { text: '新反馈', revision: 3 } } }} />);
+    expect(screen.getByRole('textbox', { name: '此版本反馈' })).toHaveValue('新反馈');
+    rerender(<Gallery {...input} model={{ ...base, savedFeedback: { 'b:b2:2': { text: '远程反馈', revision: 4 } } }} />);
+    expect(screen.getByRole('textbox', { name: '此版本反馈' })).toHaveValue('远程反馈');
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it('keeps a typed draft dirty when a newer host feedback revision precedes save acknowledgment', async () => {
+    const user = userEvent.setup(); const saving = deferred<{ text: string; revision: number }>();
+    const initial: GalleryModel = { ...base, savedFeedback: { 'b:b2:2': { text: '旧反馈', revision: 2 } } };
+    const input = props({ model: initial, onSaveFeedback: vi.fn(() => saving.promise) });
+    const { rerender } = render(<Gallery {...input} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.clear(screen.getByRole('textbox', { name: '此版本反馈' }));
+    await user.type(screen.getByRole('textbox', { name: '此版本反馈' }), '我的更新');
+    await user.click(screen.getByRole('button', { name: '保存反馈' }));
+    rerender(<Gallery {...input} model={{ ...base, savedFeedback: { 'b:b2:2': { text: '远程更新', revision: 4 } } }} />);
+    await act(async () => saving.resolve({ text: '我的更新', revision: 3 }));
+    expect(screen.getByRole('textbox', { name: '此版本反馈' })).toHaveValue('我的更新');
+    expect(screen.getByRole('button', { name: '保存反馈' })).toBeEnabled();
+    expect(screen.getByRole('alert')).toHaveTextContent('反馈已被其他更新覆盖');
+  });
+
+  it('requires saving typed feedback before editing that version and keeps text after a failed save', async () => {
+    const user = userEvent.setup(); const onEdit = vi.fn(async () => {});
+    const onSaveFeedback = vi.fn(async () => { throw new Error('版本冲突'); });
+    render(<Gallery {...props({ onEdit, onSaveFeedback })} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.type(screen.getByRole('textbox', { name: '此版本反馈' }), '先修改重点');
+    expect(screen.getByRole('button', { name: '编辑此版本' })).toBeDisabled();
+    expect(screen.getByText('先保存此版本反馈，再修改')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: '保存反馈' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('版本冲突');
+    expect(screen.getByRole('textbox', { name: '此版本反馈' })).toHaveValue('先修改重点');
+    expect(screen.getByRole('button', { name: '编辑此版本' })).toBeDisabled();
+    expect(onEdit).not.toHaveBeenCalled();
+  });
+
+  it('does not load a changed thumbnail identity until the new image intersects', async () => {
+    const callbacks: IntersectionObserverCallback[] = [];
+    class Observer {
+      constructor(callback: IntersectionObserverCallback) { callbacks.push(callback); }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('IntersectionObserver', Observer);
+    const loadImage = vi.fn(async () => 'data:image/png;base64,aW1hZ2U=');
+    const oldImage = { id: 'visible-old', sha256: 'old' };
+    const newImage = { id: 'offscreen-new', sha256: 'new' };
+    const { rerender } = render(<GalleryImage image={oldImage} loadImage={loadImage} alt="缩略图" />);
+    expect(loadImage).not.toHaveBeenCalled();
+    await act(async () => callbacks[0]!([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver));
+    await waitFor(() => expect(loadImage).toHaveBeenCalledWith(oldImage));
+    rerender(<GalleryImage image={newImage} loadImage={loadImage} alt="缩略图" />);
+    expect(loadImage).not.toHaveBeenCalledWith(newImage);
+    await act(async () => callbacks[1]!([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver));
+    await waitFor(() => expect(loadImage).toHaveBeenCalledWith(newImage));
   });
 });

@@ -55,7 +55,8 @@ export interface GalleryProps {
   /** Restore an eligible previously approved version using the host's history contract. */
   onRestore: (version: GalleryVersionRef) => Promise<void>;
   onApprove: (version: GalleryVersionRef) => Promise<void>;
-  onSaveFeedback: (version: GalleryVersionRef, text: string) => Promise<void>;
+  /** Returns the saved feedback CAS revision, distinct from the visual version revision. */
+  onSaveFeedback: (version: GalleryVersionRef, text: string) => Promise<GalleryFeedback>;
   onQueueChange: (change: { concurrency?: number; paused?: boolean }) => Promise<void>;
   onBatchGenerate: (batch: { pageIds: string[]; replaceCandidates: boolean }) => Promise<void>;
   onCancelJob?: (pageId: string) => Promise<void>;

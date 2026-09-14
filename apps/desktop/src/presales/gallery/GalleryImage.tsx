@@ -12,18 +12,20 @@ export function GalleryImage({ image, loadImage, alt, priority = false }: {
   priority?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const [visible, setVisible] = useState(priority);
+  const [visibleKey, setVisibleKey] = useState<string | null>(null);
   const [result, setResult] = useState<{ key: string; src?: string; error?: string } | null>(null);
   const key = keyOf(image);
+  const visible = priority || visibleKey === key;
   useEffect(() => {
-    if (priority) { setVisible(true); return; }
-    setVisible(false);
+    if (priority) return;
+    setVisibleKey(null);
     if (!ref.current || typeof IntersectionObserver === 'undefined') return;
+    let active = true;
     const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) { setVisible(true); observer.disconnect(); }
+      if (active && entries.some((entry) => entry.isIntersecting)) { setVisibleKey(key); observer.disconnect(); }
     });
     observer.observe(ref.current);
-    return () => observer.disconnect();
+    return () => { active = false; observer.disconnect(); };
   }, [key, priority]);
   useEffect(() => {
     if (!visible) return;

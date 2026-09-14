@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { GalleryImage } from './GalleryImage.js';
-import type { GalleryAction, GalleryPage, GalleryProps, GalleryVersion, GalleryVersionRef } from './model.js';
+import type { GalleryAction, GalleryFeedback, GalleryPage, GalleryProps, GalleryVersion, GalleryVersionRef } from './model.js';
 import './gallery.css';
 
 const feedbackKey = (pageId: string, versionId: string, revision: number) => `${pageId}:${versionId}:${revision}`;
@@ -21,6 +21,11 @@ function generateReason(page: GalleryPage): string | null {
   if (page.job.state === 'failed') return '请先核对失败任务';
   return null;
 }
+function versionSnapshot(page: GalleryPage, id: string | null): string | null {
+  if (!id) return null;
+  const version = page.versions.find(item => item.id === id);
+  return JSON.stringify([id, version?.revision ?? null, version?.image?.id ?? null, version?.image?.sha256 ?? null]);
+}
 
 export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onRestore, onApprove, onSaveFeedback,
   onQueueChange, onBatchGenerate, onCancelJob, onRetryJob, onDirtyChange }: GalleryProps) {
@@ -29,21 +34,41 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
   const [selected, setSelected] = useState<string[]>([]);
   const [feedback, setFeedback] = useState<Record<string, string>>({});
   const [baseline, setBaseline] = useState<Record<string, string>>({});
+  const acknowledgedFeedbackRef = useRef<Record<string, GalleryFeedback>>({});
+  const feedbackRevisionFloorRef = useRef<Record<string, number>>({});
   const [pending, setPending] = useState<Record<string, boolean>>({});
+  const generationPendingRef = useRef(new Set<string>());
+  const [generationPending, setGenerationPending] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [checked, setChecked] = useState<Record<string, boolean>>({});
-  const [confirmation, setConfirmation] = useState<{ pageIds: string[]; replaceCandidates: boolean; single: boolean } | null>(null);
+  const [confirmation, setConfirmation] = useState<{
+    pageIds: string[];
+    candidateKeys: Record<string, string | null>;
+    deliveryKeys: Record<string, string | null>;
+    replaceCandidates: boolean;
+    source: 'single' | 'selected' | 'missing';
+    notice?: string;
+  } | null>(null);
 
   useEffect(() => {
+    const updates = Object.entries(model.savedFeedback).flatMap(([key, saved]) => {
+      const floor = feedbackRevisionFloorRef.current[key] ?? -1;
+      if (saved.revision < floor) return [];
+      const acknowledgement = acknowledgedFeedbackRef.current[key];
+      if (acknowledgement && saved.revision === acknowledgement.revision && saved.text !== acknowledgement.text) return [];
+      feedbackRevisionFloorRef.current[key] = saved.revision;
+      if (acknowledgement && saved.revision >= acknowledgement.revision) delete acknowledgedFeedbackRef.current[key];
+      return [{ key, saved, acknowledgement }];
+    });
     setBaseline(previous => {
       const next = { ...previous };
-      for (const [key, saved] of Object.entries(model.savedFeedback)) next[key] = saved.text;
+      for (const { key, saved } of updates) next[key] = saved.text;
       return next;
     });
     setFeedback(previous => {
       const next = { ...previous };
-      for (const [key, saved] of Object.entries(model.savedFeedback)) {
-        if (!(key in previous) || previous[key] === (baseline[key] ?? '')) next[key] = saved.text;
+      for (const { key, saved, acknowledgement } of updates) {
+        if (!(key in previous) || previous[key] === (baseline[key] ?? '') || previous[key] === acknowledgement?.text) next[key] = saved.text;
       }
       return next;
     });
@@ -65,21 +90,65 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
     catch (error) { setErrors(previous => ({ ...previous, [key]: explain(error) })); }
     finally { setPending(previous => ({ ...previous, [key]: false })); }
   }
+  function runGeneration(ids: string[], key: string, work: () => Promise<void>) {
+    if (ids.some(id => generationPendingRef.current.has(id))) return;
+    for (const id of ids) generationPendingRef.current.add(id);
+    setGenerationPending([...generationPendingRef.current]);
+    void perform(key, work).finally(() => {
+      for (const id of ids) generationPendingRef.current.delete(id);
+      setGenerationPending([...generationPendingRef.current]);
+    });
+  }
+  const isGenerating = (id: string) => generationPending.includes(id);
   function doVersionAction(action: GalleryAction, work: (ref: GalleryVersionRef) => Promise<void>) {
-    if (!page || !ref || page.eligibility[action] || (action === 'restore' && !version?.approved) || pending[actionKey(page.id, action)]) return;
-    void perform(actionKey(page.id, action), () => work(ref));
+    if (!page || !ref || page.eligibility[action] || (action === 'restore' && !version?.approved) || pending[actionKey(page.id, action)] ||
+      (action === 'edit' && (feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`]))) return;
+    if (action === 'edit') runGeneration([page.id], actionKey(page.id, action), () => work(ref));
+    else void perform(actionKey(page.id, action), () => work(ref));
   }
   const feedbackId = ref ? feedbackKey(ref.pageId, ref.versionId, ref.revision) : '';
   const feedbackText = feedback[feedbackId] ?? model.savedFeedback[feedbackId]?.text ?? '';
   const feedbackBase = baseline[feedbackId] ?? model.savedFeedback[feedbackId]?.text ?? '';
   const currentCheckKey = ref ? `${ref.pageId}:${ref.versionId}:${ref.revision}` : '';
   const canApprove = Boolean(page && version && page.candidateVersionId === version.id && checked[currentCheckKey] && !page.eligibility.approve);
-  const generateMissingIds = model.pages.filter(p => !p.candidateVersionId && !p.currentDeliveryVersionId && !generateReason(p)).map(p => p.id);
-  function openBatch(ids: string[], single = false) {
+  const generateMissingIds = model.pages.filter(p => !p.candidateVersionId && !p.currentDeliveryVersionId && !generateReason(p) && !isGenerating(p.id)).map(p => p.id);
+  function openBatch(ids: string[], source: 'single' | 'selected' | 'missing' = 'selected') {
     if (!ids.length) return;
-    setConfirmation({ pageIds: ids, replaceCandidates: ids.some(id => Boolean(model.pages.find(p => p.id === id)?.candidateVersionId)), single });
+    const targets = ids.map(id => model.pages.find(p => p.id === id));
+    setConfirmation({ pageIds: ids, source,
+      candidateKeys: Object.fromEntries(ids.map((id, index) => [id, targets[index] ? versionSnapshot(targets[index]!, targets[index]!.candidateVersionId) : null])),
+      deliveryKeys: Object.fromEntries(ids.map((id, index) => [id, targets[index] ? versionSnapshot(targets[index]!, targets[index]!.currentDeliveryVersionId) : null])),
+      replaceCandidates: targets.some(target => Boolean(target?.candidateVersionId)),
+    });
   }
-  const selectedBlocker = selected.map(id => { const item = model.pages.find(p => p.id === id); return item ? generateReason(item) : '页面已移除'; }).find(Boolean);
+  function confirmGeneration() {
+    if (!confirmation) return;
+    const batch = confirmation;
+    const currentIds = batch.source === 'selected' ? selected : batch.source === 'missing' ? generateMissingIds : batch.pageIds;
+    const targets = batch.pageIds.map(id => model.pages.find(p => p.id === id));
+    if (currentIds.length !== batch.pageIds.length || currentIds.some((id, index) => id !== batch.pageIds[index]) ||
+      targets.some(target => !target || generateReason(target) || generationPendingRef.current.has(target.id))) {
+      setConfirmation(null);
+      setErrors(previous => ({ ...previous, batch: '页面状态已变化，请重新选择。' }));
+      return;
+    }
+    const changed = targets.some((target, index) => versionSnapshot(target!, target!.candidateVersionId) !== batch.candidateKeys[batch.pageIds[index]!] ||
+      versionSnapshot(target!, target!.currentDeliveryVersionId) !== batch.deliveryKeys[batch.pageIds[index]!]);
+    if (changed) {
+      setConfirmation({ ...batch,
+        candidateKeys: Object.fromEntries(batch.pageIds.map((id, index) => [id, versionSnapshot(targets[index]!, targets[index]!.candidateVersionId)])),
+        deliveryKeys: Object.fromEntries(batch.pageIds.map((id, index) => [id, versionSnapshot(targets[index]!, targets[index]!.currentDeliveryVersionId)])),
+        replaceCandidates: targets.some(target => Boolean(target?.candidateVersionId)),
+        notice: '页面状态已变化，请再次确认。',
+      });
+      return;
+    }
+    setConfirmation(null);
+    runGeneration(batch.pageIds, batch.source === 'single' ? actionKey(batch.pageIds[0]!, 'generate') : `batch:${batch.pageIds.join('|')}`, () => batch.source === 'single'
+      ? onGenerate(batch.pageIds[0]!, batch.replaceCandidates)
+      : onBatchGenerate({ pageIds: batch.pageIds, replaceCandidates: batch.replaceCandidates }));
+  }
+  const selectedBlocker = selected.map(id => { const item = model.pages.find(p => p.id === id); return item ? isGenerating(id) ? '该页操作进行中' : generateReason(item) : '页面已移除'; }).find(Boolean);
   return <section className="presales-gallery" aria-label="多页视觉图库">
     <header className="presales-gallery__header"><div><p className="presales-gallery__eyebrow">视觉工作台 / 逐页审核</p><h1>多页图库</h1><p>逐页检查、修订和确认。新生成稿不会自动提交或成为交付版本。</p></div>
       <div className="presales-gallery__queue" aria-label="队列设置">
@@ -90,9 +159,9 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         {(model.queue.paused ? model.queue.resumeReason : model.queue.pauseReason) && <small>{model.queue.paused ? model.queue.resumeReason : model.queue.pauseReason}</small>}
       </div></header>
     <div className="presales-gallery__toolbar"><span>{model.pages.length} 页 · 已选 {selected.length} 页</span>
-      <button type="button" disabled={!selected.length || Boolean(selectedBlocker) || Boolean(pending['batch'])} title={selectedBlocker || undefined} onClick={() => openBatch(selected)}>批量生成所选页</button>
+      <button type="button" disabled={!selected.length || Boolean(selectedBlocker)} title={selectedBlocker || undefined} onClick={() => openBatch(selected)}>批量生成所选页</button>
       {selectedBlocker && <small>所选页无法生成：{selectedBlocker}</small>}
-      <button type="button" disabled={!generateMissingIds.length || Boolean(model.queue.generateAllMissingReason) || Boolean(pending['batch'])} onClick={() => openBatch(generateMissingIds)}>生成全部缺失页</button>
+      <button type="button" disabled={!generateMissingIds.length || Boolean(model.queue.generateAllMissingReason)} onClick={() => openBatch(generateMissingIds, 'missing')}>生成全部缺失页</button>
       {model.queue.generateAllMissingReason && <small>{model.queue.generateAllMissingReason}</small>}</div>
     <div className="presales-gallery__layout"><aside className="presales-gallery__pages" aria-label="页面列表">
       {model.pages.map(item => {
@@ -116,9 +185,9 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         <div className="presales-gallery__history"><h3>版本历史</h3><div>{page.versions.map(item => <button key={item.id} type="button" className={item.id === version?.id ? 'is-active' : ''}
           onClick={() => setVersionIds(previous => ({ ...previous, [page.id]: item.id }))}>查看{item.label} 修订 {item.revision}{item.id === page.currentDeliveryVersionId ? ' · 当前交付' : ''}</button>)}</div></div>
         <div className="presales-gallery__actions" aria-label="页面操作">
-          <button type="button" disabled={Boolean(generateReason(page) || pending[actionKey(page.id, 'generate')])} title={generateReason(page) ?? undefined}
-            onClick={() => openBatch([page.id], true)}>生成新稿</button>
-          <button type="button" disabled={!ref || Boolean(page.eligibility.edit || model.capabilityReasons.edit || pending[actionKey(page.id, 'edit')])} title={page.eligibility.edit ?? model.capabilityReasons.edit ?? undefined}
+          <button type="button" disabled={Boolean(generateReason(page) || isGenerating(page.id))} title={generateReason(page) ?? (isGenerating(page.id) ? '该页操作进行中' : undefined)}
+            onClick={() => openBatch([page.id], 'single')}>生成新稿</button>
+          <button type="button" disabled={!ref || Boolean(page.eligibility.edit || model.capabilityReasons.edit || isGenerating(page.id) || feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`])} title={page.eligibility.edit ?? model.capabilityReasons.edit ?? (feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`] ? '先保存此版本反馈，再修改' : isGenerating(page.id) ? '该页操作进行中' : undefined)}
             onClick={() => doVersionAction('edit', onEdit)}>编辑此版本</button>
           <button type="button" disabled={!ref || Boolean(page.eligibility.adopt || pending[actionKey(page.id, 'adopt')])} title={page.eligibility.adopt ?? undefined}
             onClick={() => doVersionAction('adopt', onAdopt)}>选择用于交付</button>
@@ -128,6 +197,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         <div className="presales-gallery__reasons">{model.capabilityReasons.reference && <p>参考图：{model.capabilityReasons.reference}</p>}{model.capabilityReasons.edit && <p>编辑：{model.capabilityReasons.edit}</p>}
           {Object.entries({ ...page.eligibility, generate: generateReason(page) }).map(([action, reason]) => reason && <p key={action}>{({ generate: '生成', edit: '编辑', adopt: '采用', restore: '恢复', approve: '批准' } as Record<string,string>)[action]}：{reason}</p>)}
           {!version?.approved && version && <p>恢复：仅已批准版本可恢复</p>}
+          {ref && (feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`]) && <p>先保存此版本反馈，再修改</p>}
           {page.job.state === 'unknown' && <p>任务结果待确认，暂不自动重试。</p>}</div>
         {(onCancelJob || onRetryJob) && <div className="presales-gallery__actions">
           {onCancelJob && <button type="button" disabled={Boolean(!['queued', 'running'].includes(page.job.state) || page.job.cancelReason || pending[actionKey(page.id, 'cancel')])} onClick={() => void perform(actionKey(page.id, 'cancel'), () => onCancelJob(page.id))}>取消任务</button>}
@@ -138,24 +208,28 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
           <label className="presales-gallery__feedback">反馈（可选）<textarea aria-label="此版本反馈" value={feedbackText} onChange={event => setFeedback(previous => ({ ...previous, [feedbackId]: event.target.value }))} /></label>
           <div className="presales-gallery__actions"><button type="button" disabled={feedbackText === feedbackBase || Boolean(pending[`feedback:${feedbackId}`])} onClick={() => {
             const text = feedbackText;
-            void perform(`feedback:${feedbackId}`, async () => { await onSaveFeedback(ref, text); setBaseline(previous => ({ ...previous, [feedbackId]: text })); });
+            void perform(`feedback:${feedbackId}`, async () => {
+              const saved = await onSaveFeedback(ref, text);
+              if (saved.revision < (feedbackRevisionFloorRef.current[feedbackId] ?? -1)) {
+                throw new Error('反馈已被其他更新覆盖，请核对后重新保存。');
+              }
+              acknowledgedFeedbackRef.current[feedbackId] = saved;
+              feedbackRevisionFloorRef.current[feedbackId] = Math.max(feedbackRevisionFloorRef.current[feedbackId] ?? -1, saved.revision);
+              setBaseline(previous => ({ ...previous, [feedbackId]: saved.text }));
+            });
           }}>保存反馈</button>
           <label className="presales-gallery__check"><input type="checkbox" checked={Boolean(checked[currentCheckKey])} onChange={event => setChecked(previous => ({ ...previous, [currentCheckKey]: event.target.checked }))} />已人工核对第 {page.number} 页{versionRole(page, version!)}修订 {version!.revision}（仅此版本）</label>
           <button type="button" className="presales-gallery__primary" disabled={!canApprove || Boolean(pending[actionKey(page.id, 'approve')])} onClick={() => doVersionAction('approve', onApprove)}>批准此版本</button></div>
           {errors[`feedback:${feedbackId}`] && <p role="alert">{errors[`feedback:${feedbackId}`]}。输入已保留。</p>}
         </section>}
         {Object.entries(errors).filter(([key, value]) => value && !key.startsWith('feedback:') &&
-          (key.startsWith(`${page.id}:`) || key === 'batch' || key.startsWith('queue:'))).map(([key, value]) => <p role="alert" key={key}>{value}</p>)}
+          (key.startsWith(`${page.id}:`) || key === 'batch' || key.startsWith('batch:') || key.startsWith('queue:'))).map(([key, value]) => <p role="alert" key={key}>{value}</p>)}
       </>}</main></div>
     {confirmation && <div className="presales-gallery__modal-backdrop"><div role="dialog" aria-modal="true" aria-label="确认批量生成" className="presales-gallery__modal">
       <h2>确认批量生成</h2><p>将为 {confirmation.pageIds.length} 页创建新候选稿；不会自动提交或批准。</p>
       {confirmation.replaceCandidates && <p>所选页面已有候选稿。确认后将替换候选稿；历史版本仍可查看。</p>}
-      <div className="presales-gallery__actions"><button type="button" onClick={() => setConfirmation(null)}>返回</button><button type="button" className="presales-gallery__primary" onClick={() => {
-        const batch = confirmation; setConfirmation(null);
-        void perform(batch.single ? actionKey(batch.pageIds[0]!, 'generate') : 'batch', () => batch.single
-          ? onGenerate(batch.pageIds[0]!, batch.replaceCandidates)
-          : onBatchGenerate({ pageIds: batch.pageIds, replaceCandidates: batch.replaceCandidates }));
-      }}>确认批量生成</button></div></div></div>}
+      {confirmation.notice && <p role="status">{confirmation.notice}</p>}
+      <div className="presales-gallery__actions"><button type="button" onClick={() => setConfirmation(null)}>返回</button><button type="button" className="presales-gallery__primary" onClick={confirmGeneration}>确认批量生成</button></div></div></div>}
   </section>;
 }
 

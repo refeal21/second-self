@@ -1136,6 +1136,38 @@ impl WorkbenchService {
         ))
     }
 
+    /// Copy intake must not query the live SQLite connection: even a read may
+    /// update WAL shared-memory read marks. The captured read-only image checks
+    /// project existence and exact identity after this filesystem-only lookup.
+    pub(crate) fn native_copy_source(
+        &self,
+        project_id: &str,
+    ) -> Result<crate::presales_v3::activity::NativeSource, String> {
+        if project_id.is_empty()
+            || project_id.len() > 160
+            || !project_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err("Invalid source project identity".into());
+        }
+        let workspace = self.workspace()?;
+        let path = workspace.join(project_id);
+        let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err("Source project must be a native directory".into());
+        }
+        let root = fs::canonicalize(path).map_err(|e| e.to_string())?;
+        if !root.starts_with(&workspace) {
+            return Err("Source project is outside workspace".into());
+        }
+        Ok(crate::presales_v3::activity::NativeSource::new(
+            self.database_path.clone(),
+            project_id.into(),
+            root,
+        ))
+    }
+
     /// Used only while the caller already holds admission and has loaded and
     /// validated this native project inside the legacy transaction. Avoids
     /// re-entering the legacy DB mutex during visual-request begin.

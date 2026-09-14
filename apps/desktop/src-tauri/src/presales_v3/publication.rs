@@ -77,6 +77,7 @@ impl V3Store {
                     references: current.target.references.clone(),
                 }),
                 created_at: created_at.clone(),
+                missing_image: None,
             };
             let revision = revision.checked_add(1).ok_or("page revision exhausted")?;
             let receipt = V3PublicationReceipt {
@@ -138,6 +139,23 @@ pub(super) fn verify_version(
     vault: &ResultVault,
 ) -> Result<ImageReference, String> {
     let version = version_on(page, version_id)?;
+    if matches!(
+        version.provenance,
+        Some(V3VisualProvenance::LegacyImported { .. })
+    ) {
+        let project: String = connection
+            .query_row(
+                "SELECT project_id FROM v3_versions WHERE version_id=?1",
+                [version_id],
+                |r| r.get(0),
+            )
+            .map_err(message)?;
+        super::import_read::verify_version(connection, &project, page, version)?;
+        return version
+            .image
+            .clone()
+            .ok_or_else(|| "imported image is unavailable".into());
+    }
     if version.basis.is_none() || version.basis != page.visual_basis {
         return Err("version visual basis is not current".into());
     }

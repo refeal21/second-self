@@ -171,7 +171,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn validate_png(bytes: &[u8]) -> Result<(u32, u32), String> {
+pub(crate) fn validate_png(bytes: &[u8]) -> Result<(u32, u32), String> {
     if bytes.is_empty() || bytes.len() > MAX_PNG_BYTES {
         return Err(format!("PNG must contain 1..={MAX_PNG_BYTES} bytes"));
     }

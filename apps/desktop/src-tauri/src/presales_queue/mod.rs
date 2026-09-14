@@ -8,6 +8,7 @@ pub(crate) mod schema;
 pub(crate) mod store;
 
 pub use contracts::*;
+pub(crate) use result_vault::validate_png;
 pub use result_vault::{ResultBinding, ResultVault, VerifiedPngResult};
 pub use rpc::handle_queue_rpc_line;
 pub use store::QueueStore;

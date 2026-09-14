@@ -1,4 +1,7 @@
-use super::store::{bump_project, encode, load_on, message, now, page_on, write_on};
+use super::store::{
+    bump_project, encode, load_review_on as load_on, message, now, review_page_on as page_on,
+    write_on,
+};
 use super::*;
 use crate::presales_queue::ResultVault;
 use rusqlite::{params, Connection};
@@ -12,8 +15,14 @@ impl V3Store {
         if !input.content_checked || !input.visual_checked {
             return Err("both manual content and visual checks are required".into());
         }
-        let before = self.load_project(&input.project_id)?;
+        let before = load_on(&self.connection, &input.project_id)?;
         let page = page_on(&before, &input.slide_id)?;
+        if !matches!(
+            super::publication::version_on(page, &input.version_id)?.provenance,
+            Some(V3VisualProvenance::Presales { .. })
+        ) {
+            return Err("legacy images retain original references and cannot receive fabricated presales approvals".into());
+        }
         let image =
             super::publication::verify_version(&self.connection, page, &input.version_id, vault)?;
         if input.basis != *page.visual_basis.as_ref().ok_or("missing basis")?
@@ -82,7 +91,7 @@ impl V3Store {
         vault: &ResultVault,
         restore: bool,
     ) -> Result<V3PageState, String> {
-        let before = self.load_project(&input.project_id)?;
+        let before = load_on(&self.connection, &input.project_id)?;
         let image = super::publication::verify_version(
             &self.connection,
             page_on(&before, &input.slide_id)?,
@@ -105,6 +114,10 @@ impl V3Store {
                     .approvals
                     .iter()
                     .any(|a| a.version_id == input.version_id)
+                    && !page
+                        .origin_approvals
+                        .iter()
+                        .any(|a| a.version_id == input.version_id)
                     || page.current_version_id.as_deref() != Some(&input.version_id))
             {
                 return Err(

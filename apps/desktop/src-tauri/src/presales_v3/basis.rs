@@ -143,6 +143,8 @@ pub(super) fn frozen_snapshot(
                 intent_request_id: None,
                 approvals: vec![],
                 feedback_drafts: vec![],
+                origin_approvals: vec![],
+                origin_approval: None,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

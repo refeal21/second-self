@@ -35,6 +35,12 @@ pub fn run() {
             let workspace = paths::default_workspace(&home);
             let service =
                 workbench::WorkbenchService::open(app_data.join("workbench.sqlite3"), workspace)?;
+            let v3 = presales_v3::V3WorkbenchService::bundled(
+                app.handle(),
+                &service,
+                &app_data.join("presales-v3.sqlite3"),
+            )?;
+            app.manage(v3);
             app.manage(service);
             Ok(())
         })

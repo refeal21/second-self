@@ -11,6 +11,7 @@ pub(super) fn load_page_history(
     project_id: &str,
     page: &mut V3PageState,
     approved_version: Option<&str>,
+    imported: Option<&super::import_evidence::ImportReceipt>,
 ) -> Result<(), String> {
     if page.revision < 1 {
         return Err("invalid page revision".into());
@@ -26,9 +27,26 @@ pub(super) fn load_page_history(
             || row.2 != version.sequence
             || row.3 != version.request_id
             || row.4 != version.attempt_id
-            || row.5 != "candidate"
         {
             return Err("version row identity mismatch".into());
+        }
+        if matches!(
+            version.provenance,
+            Some(V3VisualProvenance::LegacyImported { .. })
+        ) {
+            if row.5 != "legacy_imported" {
+                return Err("import version row kind mismatch".into());
+            }
+            super::import_read::verify_version_against(
+                connection,
+                imported.ok_or("native project cannot contain imported versions")?,
+                page,
+                version,
+            )?;
+            continue;
+        }
+        if row.5 != "candidate" || version.missing_image.is_some() {
+            return Err("native version row kind/availability mismatch".into());
         }
         let (
             Some(request),
@@ -154,19 +172,22 @@ pub(super) fn load_page_history(
         }
         page.approvals.push(approval);
     }
+    super::import_read::load_origins(connection, project_id, page, imported)?;
     if let Some(id) = approved_version {
         if page.current_version_id.as_deref() != Some(id)
             || super::events::active_job(connection, project_id, &page.slide_id)?.is_some()
         {
             return Err("effective approval does not name an idle active version".into());
         }
-        page.approval = Some(
-            page.approvals
-                .iter()
-                .find(|a| a.version_id == id)
-                .cloned()
-                .ok_or("effective approval missing")?,
-        );
+        page.approval = page.approvals.iter().find(|a| a.version_id == id).cloned();
+        page.origin_approval = page
+            .origin_approvals
+            .iter()
+            .find(|a| a.version_id == id)
+            .cloned();
+        if page.approval.is_some() == page.origin_approval.is_some() {
+            return Err("effective approval must have exactly one authority".into());
+        }
     }
     let mut drafts = connection.prepare("SELECT base_version_id,revision,draft_json FROM v3_feedback WHERE project_id=?1 AND slide_id=?2 ORDER BY base_version_id").map_err(message)?;
     let rows = drafts
@@ -220,9 +241,20 @@ pub(super) fn load_delivery(
     connection: &Connection,
     snapshot: &mut V3ProjectSnapshot,
 ) -> Result<(), String> {
+    snapshot.delivery_snapshot =
+        load_delivery_pages(connection, &snapshot.summary, &snapshot.pages)?;
+    Ok(())
+}
+
+pub(super) fn load_delivery_pages(
+    connection: &Connection,
+    summary: &V3ProjectSummary,
+    pages: &[V3PageState],
+) -> Result<Option<V3DeliverySnapshot>, String> {
+    let mut current_delivery = None;
     let mut statement = connection.prepare("SELECT snapshot_id,revision,snapshot_json FROM v3_delivery_snapshots WHERE project_id=?1 ORDER BY revision").map_err(message)?;
     let rows = statement
-        .query_map([&snapshot.summary.project_id], |r| {
+        .query_map([&summary.project_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
@@ -236,33 +268,45 @@ pub(super) fn load_delivery(
         let delivery: V3DeliverySnapshot = decode(&encoded)?;
         if delivery.snapshot_id != id
             || delivery.revision != revision
-            || delivery.project_id != snapshot.summary.project_id
-            || delivery.pages.len() != snapshot.pages.len()
-            || revision > snapshot.summary.revision
+            || delivery.project_id != summary.project_id
+            || delivery.pages.len() != pages.len()
+            || revision > summary.revision
         {
             return Err("delivery snapshot identity mismatch".into());
         }
-        for (entry, page) in delivery.pages.iter().zip(&snapshot.pages) {
+        for (entry, page) in delivery.pages.iter().zip(pages) {
             let version = super::publication::version_on(page, &entry.version_id)?;
             if entry.slide_id != page.slide_id
                 || version.image.as_ref() != Some(&entry.image)
-                || !page
-                    .approvals
-                    .iter()
-                    .any(|a| a.approval_id == entry.approval_id && a.version_id == entry.version_id)
+                || !match &entry.origin_approval_ref {
+                    Some(a) => {
+                        a.reference_id == entry.approval_id
+                            && a.version_id == entry.version_id
+                            && page.origin_approvals.contains(a)
+                    }
+                    None => page.approvals.iter().any(|a| {
+                        a.approval_id == entry.approval_id && a.version_id == entry.version_id
+                    }),
+                }
             {
                 return Err("delivery map evidence mismatch".into());
             }
-            if revision == snapshot.summary.revision
+            if revision == summary.revision
                 && (page.current_version_id.as_ref() != Some(&entry.version_id)
-                    || page.approval.as_ref().map(|a| &a.approval_id) != Some(&entry.approval_id))
+                    || page
+                        .approval
+                        .as_ref()
+                        .map(|a| &a.approval_id)
+                        .or_else(|| page.origin_approval.as_ref().map(|a| &a.reference_id))
+                        != Some(&entry.approval_id)
+                    || page.origin_approval != entry.origin_approval_ref)
             {
                 return Err("current delivery selection mismatch".into());
             }
         }
-        if revision == snapshot.summary.revision {
-            snapshot.delivery_snapshot = Some(delivery);
+        if revision == summary.revision {
+            current_delivery = Some(delivery);
         }
     }
-    Ok(())
+    Ok(current_delivery)
 }

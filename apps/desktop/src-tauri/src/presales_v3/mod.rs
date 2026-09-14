@@ -7,17 +7,25 @@ mod delivery;
 mod events;
 mod feedback;
 mod history;
+mod import;
+mod import_assets;
+mod import_contracts;
+mod import_evidence;
+mod import_read;
 mod legacy_envelope;
 mod legacy_snapshot;
 mod prompt;
 mod publication;
 mod review;
+mod service;
 mod store;
 mod validator_process;
 mod wal_snapshot;
 
 pub(crate) use basis::ValidatedV3ProjectSeed;
 pub use contracts::*;
+pub use import_contracts::*;
+pub use service::V3WorkbenchService;
 pub use store::V3Store;
 
 pub(crate) fn validate_native_upgrade(
@@ -43,3 +51,5 @@ pub(crate) fn validate_native_upgrade(
 mod activity_tests;
 #[cfg(test)]
 mod events_tests;
+#[cfg(test)]
+mod import_tests;

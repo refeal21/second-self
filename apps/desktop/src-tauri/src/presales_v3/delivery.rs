@@ -1,4 +1,4 @@
-use super::store::{encode, load_on, message, now, write_on};
+use super::store::{encode, load_review_on as load_on, message, now, write_on};
 use super::*;
 use crate::presales_queue::ResultVault;
 use rusqlite::params;
@@ -9,27 +9,25 @@ impl V3Store {
         project_id: &str,
         vault: &ResultVault,
     ) -> Result<V3DeliverySnapshot, String> {
-        let before = self.load_project(project_id)?;
+        let before = load_on(&self.connection, project_id)?;
         let mut pages = Vec::new();
         for page in &before.pages {
-            let approval = page
-                .approval
-                .as_ref()
-                .ok_or("every page needs an exact effective approval")?;
-            if page.current_version_id.as_ref() != Some(&approval.version_id) {
+            let (approval_id, version_id) = match (&page.approval, &page.origin_approval) {
+                (Some(a), None) => (&a.approval_id, &a.version_id),
+                (None, Some(a)) => (&a.reference_id, &a.version_id),
+                _ => return Err("every page needs exactly one effective approval authority".into()),
+            };
+            if page.current_version_id.as_ref() != Some(version_id) {
                 return Err("delivery approval is not active".into());
             }
-            let image = super::publication::verify_version(
-                &self.connection,
-                page,
-                &approval.version_id,
-                vault,
-            )?;
+            let image =
+                super::publication::verify_version(&self.connection, page, version_id, vault)?;
             pages.push(V3DeliveryPage {
                 slide_id: page.slide_id.clone(),
-                version_id: approval.version_id.clone(),
+                version_id: version_id.clone(),
                 image,
-                approval_id: approval.approval_id.clone(),
+                approval_id: approval_id.clone(),
+                origin_approval_ref: page.origin_approval.clone(),
             });
         }
         if pages.is_empty() {

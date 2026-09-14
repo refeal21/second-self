@@ -75,9 +75,9 @@ impl V3Store {
         let projects = ids
             .iter()
             .map(|id| {
-                load_on(&tx, id).map(|snapshot| V3CatalogEntry {
-                    kind: V3CatalogKind::Frozen,
-                    summary: snapshot.summary,
+                super::import_read::load_on(&tx, id).map(|snapshot| V3CatalogEntry {
+                    kind: snapshot.kind(),
+                    summary: snapshot.summary().clone(),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -97,6 +97,12 @@ pub(super) fn load_on(
     connection: &Connection,
     project_id: &str,
 ) -> Result<V3ProjectSnapshot, String> {
+    if super::import_read::has_receipt(connection, project_id)? {
+        return match super::import_read::load_on(connection, project_id)? {
+            V3WorkbenchProject::Frozen(p) => Ok(p),
+            _ => Err("project is not frozen for presales generation".into()),
+        };
+    }
     let (kind, revision): (String, i64) = connection
         .query_row(
             "SELECT kind,revision FROM v3_catalog WHERE project_id=?1",
@@ -151,6 +157,17 @@ pub(super) fn load_native_on(
         return Err("v3 project metadata does not match frozen evidence".into());
     }
     snapshot.summary.revision = stored.5;
+    load_pages_on(connection, project_id, &mut snapshot.pages, None)?;
+    super::history::load_delivery(connection, &mut snapshot)?;
+    Ok(snapshot)
+}
+
+pub(super) fn load_pages_on(
+    connection: &Connection,
+    project_id: &str,
+    pages: &mut [V3PageState],
+    imported: Option<&super::import_evidence::ImportReceipt>,
+) -> Result<(), String> {
     let mut stmt = connection.prepare(
         "SELECT slide_id, ordinal, spec_json, design_json, basis_json, current_version_id, approved_version_id, revision, intent_request_id
          FROM v3_pages WHERE project_id = ?1 ORDER BY ordinal").map_err(message)?;
@@ -171,10 +188,10 @@ pub(super) fn load_native_on(
         .map_err(message)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(message)?;
-    if rows.len() != snapshot.pages.len() {
+    if rows.len() != pages.len() {
         return Err("v3 frozen page set is incomplete".into());
     }
-    for (page, row) in snapshot.pages.iter_mut().zip(rows) {
+    for (page, row) in pages.iter_mut().zip(rows) {
         if page.slide_id != row.0
             || page.ordinal as i64 != row.1
             || page.spec != decode::<serde_json::Value>(&row.2)?
@@ -186,6 +203,12 @@ pub(super) fn load_native_on(
         page.current_version_id = row.5;
         page.revision = row.7;
         page.intent_request_id = row.8;
+        page.approval = None;
+        page.approvals.clear();
+        page.origin_approval = None;
+        page.origin_approvals.clear();
+        page.feedback = None;
+        page.feedback_drafts.clear();
         let mut versions = connection.prepare(
             "SELECT version_json FROM v3_versions WHERE project_id = ?1 AND slide_id = ?2 ORDER BY sequence").map_err(message)?;
         let encoded = versions
@@ -199,10 +222,25 @@ pub(super) fn load_native_on(
             .iter()
             .map(|v| decode(v))
             .collect::<Result<_, _>>()?;
-        super::history::load_page_history(connection, project_id, page, row.6.as_deref())?;
+        if let Some(receipt) = imported {
+            let original = receipt
+                .pages
+                .iter()
+                .find(|p| p.slide_id == page.slide_id)
+                .ok_or("original page mapping missing")?;
+            if !page.versions.starts_with(&original.versions) {
+                return Err("imported history was deleted or rewritten".into());
+            }
+        }
+        super::history::load_page_history(
+            connection,
+            project_id,
+            page,
+            row.6.as_deref(),
+            imported,
+        )?;
     }
-    super::history::load_delivery(connection, &mut snapshot)?;
-    Ok(snapshot)
+    Ok(())
 }
 
 pub(super) fn encode(value: &impl serde::Serialize) -> Result<String, String> {
@@ -254,13 +292,57 @@ pub(super) fn page_on<'a>(
 }
 
 pub(super) fn bump_project(tx: &Connection, project_id: &str) -> Result<(), String> {
-    if tx.execute("UPDATE v3_projects SET revision = revision + 1 WHERE project_id = ?1 AND revision < 9223372036854775807", [project_id]).map_err(message)? != 1 {
+    let kind: String = tx
+        .query_row(
+            "SELECT kind FROM v3_catalog WHERE project_id=?1",
+            [project_id],
+            |r| r.get(0),
+        )
+        .map_err(message)?;
+    if kind == "draft" {
+        return Err("draft has no live visual revision".into());
+    }
+    if kind == "frozen" && tx.execute("UPDATE v3_projects SET revision = revision + 1 WHERE project_id = ?1 AND revision < 9223372036854775807", [project_id]).map_err(message)? != 1 {
         return Err("project revision exhausted or project missing".into());
     }
     if tx.execute("UPDATE v3_catalog SET revision = revision + 1 WHERE project_id = ?1 AND revision < 9223372036854775807", [project_id]).map_err(message)? != 1 {
         return Err("catalog revision exhausted or project missing".into());
     }
     Ok(())
+}
+
+pub(super) struct ReviewProject {
+    pub summary: V3ProjectSummary,
+    pub pages: Vec<V3PageState>,
+    pub delivery_snapshot: Option<V3DeliverySnapshot>,
+}
+pub(super) fn load_review_on(
+    connection: &Connection,
+    project: &str,
+) -> Result<ReviewProject, String> {
+    match super::import_read::load_on(connection, project)? {
+        V3WorkbenchProject::Frozen(p) => Ok(ReviewProject {
+            summary: p.summary,
+            pages: p.pages,
+            delivery_snapshot: p.delivery_snapshot,
+        }),
+        V3WorkbenchProject::HistoryOnly(p) => Ok(ReviewProject {
+            summary: p.summary,
+            pages: p.pages,
+            delivery_snapshot: p.delivery_snapshot,
+        }),
+        V3WorkbenchProject::Draft(_) => Err("draft has no reviewable visual page set".into()),
+    }
+}
+pub(super) fn review_page_on<'a>(
+    snapshot: &'a ReviewProject,
+    slide: &str,
+) -> Result<&'a V3PageState, String> {
+    snapshot
+        .pages
+        .iter()
+        .find(|p| p.slide_id == slide)
+        .ok_or_else(|| "unknown v3 page".into())
 }
 
 pub(super) fn now() -> Result<String, String> {

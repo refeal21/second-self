@@ -82,6 +82,10 @@ pub struct V3PageState {
     pub intent_request_id: Option<String>,
     pub approvals: Vec<V3Approval>,
     pub feedback_drafts: Vec<V3FeedbackDraft>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin_approvals: Vec<super::V3OriginApprovalRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_approval: Option<super::V3OriginApprovalRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +168,8 @@ pub struct V3DeliveryPage {
     pub version_id: String,
     pub image: ImageReference,
     pub approval_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_approval_ref: Option<super::V3OriginApprovalRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +193,8 @@ pub struct V3VisualVersion {
     pub image: Option<ImageReference>,
     pub provenance: Option<V3VisualProvenance>,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_image: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +216,8 @@ pub enum V3VisualProvenance {
     LegacyImported {
         origin_digest: String,
         source_version_id: String,
+        original_visual: Value,
+        original_approval: Option<Value>,
     },
 }
 

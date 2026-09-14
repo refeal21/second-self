@@ -1,4 +1,6 @@
-use super::store::{decode, encode, load_on, message, now, page_on, write_on};
+use super::store::{
+    decode, encode, load_review_on as load_on, message, now, review_page_on as page_on, write_on,
+};
 use super::*;
 use rusqlite::{params, OptionalExtension};
 

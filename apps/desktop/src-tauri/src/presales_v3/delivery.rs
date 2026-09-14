@@ -28,6 +28,12 @@ impl V3Store {
                 image,
                 approval_id: approval_id.clone(),
                 origin_approval_ref: page.origin_approval.clone(),
+                content: Some(V3DeliveryContent {
+                    spec: page.spec.clone(),
+                    design: page.design.clone(),
+                    basis: super::publication::version_on(page, version_id)?.basis.clone(),
+                    approval: page.approval.clone(),
+                }),
             });
         }
         if pages.is_empty() {

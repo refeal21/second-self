@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { VisualStyleProfile, VisualStyleState } from '../../../worker/src/visual-style.js';
 import type { OutlineEnvelope, DetailsEnvelope } from '../../../worker/src/presales/contracts.js';
+import { prepareV3Delivery, type V3DeliveryPreparation, type V3DeliverySnapshot } from '../../../worker/src/presales/delivery.js';
 
 export type V3Stage = 'outline' | 'details';
 export type V3Kind = 'frozen' | 'history_only' | 'draft';
@@ -31,6 +32,7 @@ export interface V3PreparedCopy { preparationId: string; sourceProjectId: string
 export interface V3PageRequest { slideId: string; requestId: string; attemptId: string; expectedRevision: number; parentVersionId: string | null; feedback: string }
 export interface V3EnqueueOutcome { jobs: Array<{ requestId: string; target: { projectId: string; slideId: string } }>; reusedRequestIds: string[] }
 export interface PresalesAdapter {
+  delivery(projectId: string): Promise<V3DeliveryPreparation>;
   list(): Promise<V3CatalogEntry[]>; load(projectId: string): Promise<V3Project>; queue(): Promise<V3QueueSnapshot>;
   subscribe(listener: (revision: number) => void): () => void;
   prepareCopy(sourceProjectId: string, mode: 'format_copy' | 'presales_content_revision'): Promise<V3PreparedCopy>;
@@ -57,6 +59,7 @@ export interface PresalesAdapter {
 export function createPresalesAdapter(): PresalesAdapter {
   const call = <T>(name: string, args?: Record<string, unknown>) => invoke<T>(`presales_v3_${name}`, args);
   return {
+    delivery: async projectId => prepareV3Delivery(await call<V3DeliverySnapshot>('delivery', { projectId })),
     list: () => call('list'), load: projectId => call('load', { projectId }), queue: () => call('queue'),
     subscribe(listener) { let active = true; let unlisten: (() => void) | undefined; void listen<{ revision: number }>('presales-queue-changed', event => { if (active) listener(event.payload.revision); }).then(stop => { if (active) unlisten = stop; else stop(); }).catch(() => { /* Manual refresh remains available if event registration fails. */ }); return () => { active = false; unlisten?.(); }; },
     prepareCopy: (sourceProjectId, mode) => call('prepare_copy', { input: { sourceProjectId, mode } }),

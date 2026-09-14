@@ -284,6 +284,18 @@ pub(super) fn load_delivery_pages(
         }
         for (entry, page) in delivery.pages.iter().zip(pages) {
             let version = super::publication::version_on(page, &entry.version_id)?;
+            if let Some(content) = &entry.content {
+                // Frozen project content cannot be rewritten by a delivery row. Old
+                // snapshots without these fields stay readable, without backfill.
+                let approval = page.approvals.iter().find(|a| a.approval_id == entry.approval_id);
+                if content.spec != page.spec
+                    || content.design != page.design
+                    || content.basis != version.basis
+                    || content.approval.as_ref() != approval
+                {
+                    return Err("delivery frozen content evidence mismatch".into());
+                }
+            }
             if entry.slide_id != page.slide_id
                 || version.image.as_ref() != Some(&entry.image)
                 || !match &entry.origin_approval_ref {

@@ -5,6 +5,11 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PresalesWorkspacePage } from './workspace.js';
 import type { PresalesAdapter, V3PageRequest, V3Project, V3QueueSnapshot } from './adapter.js';
+import { createPresalesAdapter } from './adapter.js';
+import { invoke } from '@tauri-apps/api/core';
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 const basis = { hashAlgorithm: 'sha', spec: { version: 's', sha256: 's' }, design: { version: 'd', sha256: 'd' }, skill: { version: 'k', sha256: 'k' }, palette: { version: 'p', sha256: 'p' } };
@@ -14,6 +19,34 @@ const queue = { dispatchAvailable: true, settings: { concurrency: 4, paused: fal
 function adapter() { return { load: vi.fn(async () => project), queue: vi.fn(async () => queue), subscribe: vi.fn(() => () => {}), readImage: vi.fn(async () => ({ mimeType: 'image/png', base64: 'aGVsbG8=' })), approveVersion: vi.fn(async () => ({ approvalId: 'approved', versionId: 'b-v1', imageSha256: 'hash-b', basis, decidedAt: 'today' })), saveFeedback: vi.fn(async input => ({ baseVersionId: input.baseVersionId, text: input.text, revision: 1, updatedAt: 'today' })) } as unknown as PresalesAdapter; }
 
 describe('native presales workspace', () => {
+  it('renders the exact native snapshot unsupported outcome through the real adapter and keeps PNG/history available', async () => {
+    const user = userEvent.setup(); const api = adapter();
+    const native = { snapshotId: 'delivery-v3-18', projectId: 'v3', revision: 18, createdAt: 'today', pages: [{ slideId: 'b', versionId: 'b-v2', image: { assetId: 'asset-b-v2', sha256: 'hash-b-v2' }, approvalId: 'approval-v2' }] };
+    vi.mocked(invoke).mockResolvedValueOnce(native);
+    api.delivery = createPresalesAdapter().delivery;
+    render(<PresalesWorkspacePage adapter={api} projectId="v3" initialPageId="b" onDirtyChange={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: '导出可编辑 PPTX' }));
+    const panel = screen.getByRole('region', { name: '版本交付' });
+    await waitFor(() => expect(panel).toHaveTextContent('delivery-v3-18'));
+    expect(panel).toHaveTextContent('b：b-v2');
+    expect(panel).toHaveTextContent('暂不支持可编辑转换');
+    expect(panel).toHaveTextContent('未生成 PPTX，未运行 QA');
+    expect(panel).toHaveTextContent('历史快照未保存冻结内容证据');
+    expect(invoke).toHaveBeenCalledWith('presales_v3_delivery', { projectId: 'v3' });
+    expect(screen.getByRole('textbox', { name: '此版本反馈' })).toBeEnabled();
+    await waitFor(() => expect(api.readImage).toHaveBeenCalledWith({ projectId: 'v3', slideId: 'b', versionId: 'b-v1', assetId: 'asset-b', sha256: 'hash-b' }));
+  });
+  it('evaluates delivery through native selection and keeps history usable when approval is invalidated', async () => {
+    const user = userEvent.setup(); const api = adapter();
+    const delivery = vi.fn(async () => { throw new Error('every page needs exactly one effective approval authority'); });
+    Object.assign(api, { delivery });
+    render(<PresalesWorkspacePage adapter={api} projectId="v3" initialPageId="b" onDirtyChange={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: '导出可编辑 PPTX' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('every page needs exactly one effective approval authority');
+    expect(delivery).toHaveBeenCalledWith('v3');
+    expect(screen.getByRole('checkbox', { name: /内容与页面规格一致/ })).toBeEnabled();
+    expect(screen.getByRole('textbox', { name: '此版本反馈' })).toBeEnabled();
+  });
   it('keeps B review usable while A runs and C queues; approval carries exact CAS and two checks', async () => {
     const user = userEvent.setup(); const api = adapter();
     render(<PresalesWorkspacePage adapter={api} projectId="v3" onDirtyChange={() => {}} />);

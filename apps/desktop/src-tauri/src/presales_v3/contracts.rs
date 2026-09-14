@@ -172,6 +172,18 @@ pub struct V3DeliveryPage {
     pub approval_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_approval_ref: Option<super::V3OriginApprovalRef>,
+    /// Absent only in older persisted snapshots; never reconstructed on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<V3DeliveryContent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct V3DeliveryContent {
+    pub spec: Value,
+    pub design: Option<Value>,
+    pub basis: Option<V3VisualBasis>,
+    pub approval: Option<V3Approval>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

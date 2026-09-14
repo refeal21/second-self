@@ -6,6 +6,7 @@ import { DraftWorkspace } from './draft-workspace.js';
 import { PreVersionFeedbackEditor } from './feedback-editor.js';
 import type { GalleryGenerationReceipt, GalleryVersionRef } from './gallery/model.js';
 import type { PresalesAdapter, V3Page, V3PageRequest, V3Project, V3ProjectSnapshot, V3QueueSnapshot } from './adapter.js';
+import type { V3DeliveryPreparation } from '../../../worker/src/presales/delivery.js';
 import './workspace.css';
 
 type PendingIntent = { requestId: string; attemptId: string };
@@ -26,6 +27,7 @@ export function PresalesWorkspacePage({ adapter, projectId, initialPageId, initi
   const [preFeedbackError, setPreFeedbackError] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [delivery, setDelivery] = useState<V3DeliveryPreparation | null>(null);
   const [pending, setPending] = useState<Record<string, boolean>>({});
   const projectRef = useRef(loaded); projectRef.current = loaded;
   const queueRef = useRef(queue); queueRef.current = queue;
@@ -53,6 +55,7 @@ export function PresalesWorkspacePage({ adapter, projectId, initialPageId, initi
   }, [adapter, projectId]);
   useEffect(() => {
     setLoaded(null); setQueue(null); setSelectedPageId(initialPageId ?? null); setError(null); setNotice(null);
+    setDelivery(null);
     void refresh().catch(error => setError(errorText(error)));
     const unsubscribe = adapter.subscribe(() => { void refresh().catch(error => setError(errorText(error))); });
     return () => { refreshToken.current++; unsubscribe(); clearGalleryImageCache(); onDirtyChange(false); };
@@ -143,6 +146,16 @@ export function PresalesWorkspacePage({ adapter, projectId, initialPageId, initi
   return <main className="presales-workspace" id="main-content">
     <header className="presales-workspace__intro"><div><p>售前 v3 · {readOnly ? '历史只读' : '冻结页面'}</p><h1>{snapshot.summary.name}</h1><small>源项目 {snapshot.origin.sourceProjectId} · 源修订 {snapshot.origin.sourceRevision} · 副本独立保存，原项目保持不变</small></div><button onClick={() => fire(refresh().catch(caught => { setError(errorText(caught)); }))}>重新核对状态</button></header>
     {error && <p role="alert">{error}</p>}{notice && <p role="status">{notice}</p>}
+    <section className="presales-workspace__panel" aria-label="版本交付">
+      <button disabled={Boolean(pending.delivery)} onClick={() => fire(action('delivery', async () => { setDelivery(null); const result = await adapter.delivery(projectId); setDelivery(result); }))}>导出可编辑 PPTX</button>
+      <p>导出前由本机核对每页当前采用版本、批准依据和图片文件。</p>
+      {delivery && <div role="status">
+        <p>暂不支持可编辑转换：缺少经验证的去字背景和可编辑对象几何。未生成 PPTX，未运行 QA；批准的 PNG 与版本历史仍可查看。</p>
+        {delivery.reasons.includes('missing_frozen_content') && <p>此历史快照未保存冻结内容证据，不能补填为新的批准。</p>}
+        <p>交付快照 {delivery.snapshotId} · 修订 {delivery.revision}{delivery.revision !== snapshot.summary.revision ? ' · 当前页面已变化，请重新核对交付资格' : ''}</p>
+        <ul>{delivery.pages.map(item => <li key={item.slideId}>{item.slideId}：{item.versionId}</li>)}</ul>
+      </div>}
+    </section>
     <Gallery key={projectId} model={model} readOnly={readOnly} initialPageId={initialPageId} initialVersionId={initialVersionId} onDirtyChange={setGalleryDirty} onPageChange={setSelectedPageId}
       loadImage={async identity => {
         const match = snapshot.pages.flatMap(p => p.versions.map(v => ({ p, v }))).find(({ v }) => v.image?.assetId === identity.id && v.image.sha256 === identity.sha256);

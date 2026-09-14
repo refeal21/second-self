@@ -293,6 +293,20 @@ pub(super) mod tests {
     }
 
     pub(crate) fn frozen_fixture_pages(count: usize) -> (ProjectCheckpoint, VisualStyleState) {
+        frozen_vector(
+            include_str!("../../../../../fixtures/presales/native-contract.json"),
+            count,
+        )
+    }
+
+    pub(crate) fn frozen_presales_acceptance() -> (ProjectCheckpoint, VisualStyleState) {
+        frozen_vector(
+            include_str!("../../../../../fixtures/presales/five-page-acceptance.json"),
+            1,
+        )
+    }
+
+    fn frozen_vector(source: &str, count: usize) -> (ProjectCheckpoint, VisualStyleState) {
         let db = Database::open_in_memory().unwrap();
         let id = "frozen-project";
         let at = "2026-09-10T00:00:00Z";
@@ -303,10 +317,7 @@ pub(super) mod tests {
             created_at: at.into(),
         })
         .unwrap();
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../../../../../fixtures/presales/native-contract.json"
-        ))
-        .unwrap();
+        let fixture: Value = serde_json::from_str(source).unwrap();
         let mut full: PresalesDraftPair = serde_json::from_value(fixture["pair"].clone()).unwrap();
         for index in 1..count {
             let id = format!("scenario-{}", index + 1);
@@ -390,7 +401,7 @@ pub(super) mod tests {
         p["project"]["workflowStatus"] = json!("visual_review");
         p["slideSpecs"]["version"]["status"] = json!("frozen");
         p["slideSpecs"]["version"]["frozenAt"] = json!(at);
-        p["currentSlideId"] = json!("scenario-1");
+        p["currentSlideId"] = full.outline["outline"]["slides"][0]["id"].clone();
         p["approvals"]
             .as_array_mut()
             .unwrap()
@@ -421,6 +432,28 @@ pub(super) mod tests {
             }),
         };
         (checkpoint, palette)
+    }
+
+    #[test]
+    fn serialized_native_pages_include_empty_reference_arrays_for_the_frontend() {
+        let (checkpoint, palette) = frozen_fixture();
+        let mut store = V3Store::open_in_memory().unwrap();
+        store
+            .insert_project(ValidatedV3ProjectSeed::from_checkpoint(checkpoint, palette).unwrap())
+            .unwrap();
+        let value = serde_json::to_value(store.load_project("frozen-project").unwrap()).unwrap();
+        assert_eq!(
+            value["pages"][0]["references"],
+            json!([]),
+            "native DTO must satisfy the frontend collection contract"
+        );
+        let mut historical = value["pages"][0].clone();
+        historical.as_object_mut().unwrap().remove("references");
+        let decoded: V3PageState = serde_json::from_value(historical).unwrap();
+        assert!(
+            decoded.references.is_empty(),
+            "older serialized pages remain readable"
+        );
     }
 
     #[test]

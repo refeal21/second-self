@@ -2,25 +2,53 @@ use super::*;
 
 #[test]
 fn rejected_thread_route_revokes_the_native_claim_lease() {
-    let f=Fixture::new(5);
-    let s=std::sync::Arc::new(f.service());
-    super::supervisor_tests::enqueue_test_images(&s,2);
-    s.set_queue_settings(1,false).unwrap();
-    let (command,script)=production_commands(&f,json!({"threadProvider":"custom"}));
-    let host=super::super::runtime_host::QueueSupervisor::start_with_provider(s.clone(),command,Some(script),|_|{}).unwrap();
-    assert!(super::supervisor_tests::wait_until(||s.queue_snapshot().unwrap().jobs[0].status=="outcome_unknown"));
+    let f = Fixture::new(5);
+    let s = std::sync::Arc::new(f.service());
+    super::supervisor_tests::enqueue_test_images(&s, 2);
+    s.set_queue_settings(1, false).unwrap();
+    let (command, script) = production_commands(&f, json!({"threadProvider":"custom"}));
+    let host = super::super::runtime_host::QueueSupervisor::start_with_provider(
+        s.clone(),
+        command,
+        Some(script),
+        |_| {},
+    )
+    .unwrap();
+    assert!(super::supervisor_tests::wait_until(|| s
+        .queue_snapshot()
+        .unwrap()
+        .jobs[0]
+        .status
+        == "outcome_unknown"));
     // Free the uncertainty slot explicitly: a queued second job must still be
     // blocked by revoked readiness, not merely by first-job occupancy.
-    s.image_lifecycle.lock().unwrap().abandon_unresolved("review-image-0",true).unwrap();
+    s.image_lifecycle
+        .lock()
+        .unwrap()
+        .abandon_unresolved("review-image-0", true)
+        .unwrap();
     host.wake();
     std::thread::sleep(Duration::from_millis(250));
-    let snapshot=host.snapshot().unwrap();
-    assert_eq!(snapshot.jobs[1].status,"queued","stale capability admitted another native claim");
+    let snapshot = host.snapshot().unwrap();
+    assert_eq!(
+        snapshot.jobs[1].status, "queued",
+        "stale capability admitted another native claim"
+    );
     assert!(!snapshot.dispatch_available);
     assert!(!snapshot.capabilities.generation);
-    let calls=std::fs::read_to_string(f.root.path().join("provider-log")).unwrap().lines().map(|line|serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>();
-    assert_eq!(calls.iter().filter(|m|m["method"]=="thread/start").count(),1);
-    assert!(!calls.iter().any(|m|m["method"]=="turn/start"));
+    let calls = std::fs::read_to_string(f.root.path().join("provider-log"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|m| m["method"] == "thread/start")
+            .count(),
+        1
+    );
+    assert!(!calls.iter().any(|m| m["method"] == "turn/start"));
     host.shutdown();
 }
 

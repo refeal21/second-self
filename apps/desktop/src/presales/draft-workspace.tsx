@@ -162,6 +162,6 @@ export function DraftWorkspace({ adapter, project, queue, refresh, onDirtyChange
       <div className="presales-workspace__actions"><button disabled={approvedDetails || Boolean(pending)} onClick={() => { const validation = detailDocumentError({ outline: saved!.draft.outline.outline, specs: details.specs }); if (validation) setError(validation); else void savePair('details'); }}>保存细化与设计</button><button disabled={approvedDetails || !saved?.draft.details || Boolean(pending || dirtySections.details)} onClick={() => void perform('细化与设计联合批准', () => adapter.approvePair(project.summary.projectId, project.summary.revision, 'details'))}>联合批准细化与设计</button></div>
     </section>}
     {approvedDetails && <section className="presales-workspace__panel"><h2>发布为独立冻结项目</h2><p>仅新配对页面进入生成流程；原图仍是只读对照证据。</p><button disabled={Boolean(pending || dirty)} onClick={() => { if (window.confirm('确认将已联合批准的配对内容发布为新的冻结页面？原项目保持不变。')) void perform('发布售前副本', () => adapter.promote(project.summary.projectId, project.summary.revision)); }}>发布新页面</button></section>}
-    {project.comparisonPages.length > 0 && <section className="presales-workspace__panel"><h2>原项目视觉对照（只读）</h2>{project.comparisonPages.map(page => <p key={page.slideId}>第 {page.ordinal} 页 {page.slideId} · {page.versions.length} 个历史版本</p>)}</section>}
+    {project.comparisonPages.length > 0 && <section className="presales-workspace__panel"><h2>原项目视觉对照（只读）</h2>{project.comparisonPages.map(page => <p key={page.slideId}>第 {page.ordinal + 1} 页 {page.slideId} · {page.versions.length} 个历史版本</p>)}</section>}
   </main>;
 }

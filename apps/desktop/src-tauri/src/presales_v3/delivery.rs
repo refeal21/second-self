@@ -31,7 +31,9 @@ impl V3Store {
                 content: Some(V3DeliveryContent {
                     spec: page.spec.clone(),
                     design: page.design.clone(),
-                    basis: super::publication::version_on(page, version_id)?.basis.clone(),
+                    basis: super::publication::version_on(page, version_id)?
+                        .basis
+                        .clone(),
                     approval: page.approval.clone(),
                 }),
             });

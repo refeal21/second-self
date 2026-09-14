@@ -26,7 +26,7 @@ export function toGalleryModel(snapshot: Pick<V3ProjectSnapshot, 'summary' | 'pa
     const historyReason = historyOnly ? '此副本仅供历史查看' : null;
     const imageReason = !current?.image ? '当前版本图片不可用' : null;
     return {
-      id: page.slideId, number: page.ordinal, title: text(page.spec, 'title') || page.slideId,
+      id: page.slideId, number: page.ordinal + 1, title: text(page.spec, 'title') || page.slideId,
       summary: text(page.spec, 'purpose') || text(page.spec, 'summary'),
       reviewKey: `${page.revision}:${page.currentVersionId ?? ''}:${page.visualBasis?.spec.sha256 ?? ''}:${page.visualBasis?.design.sha256 ?? ''}:${page.visualBasis?.palette.sha256 ?? ''}`,
       currentDeliveryVersionId: effective ? page.currentVersionId : null,

@@ -287,7 +287,10 @@ pub(super) fn load_delivery_pages(
             if let Some(content) = &entry.content {
                 // Frozen project content cannot be rewritten by a delivery row. Old
                 // snapshots without these fields stay readable, without backfill.
-                let approval = page.approvals.iter().find(|a| a.approval_id == entry.approval_id);
+                let approval = page
+                    .approvals
+                    .iter()
+                    .find(|a| a.approval_id == entry.approval_id);
                 if content.spec != page.spec
                     || content.design != page.design
                     || content.basis != version.basis

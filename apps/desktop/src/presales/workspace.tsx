@@ -88,7 +88,7 @@ export function PresalesWorkspacePage({ adapter, projectId, initialPageId, initi
       const targets = ids.map(id => {
         const native = nativePage(current, id);
         if (native.references.length && !currentQueue.capabilities?.referenceEditing) throw new Error(currentQueue.capabilities?.reason ?? '当前模型未确认图片参考输入能力');
-        if (!native.visualBasis || currentQueue.jobs.some(job => job.kind === 'image' && job.projectId === projectId && job.slideId === id && ['queued', 'dispatching', 'running', 'result_ready', 'committing', 'cancel_requested', 'outcome_unknown'].includes(job.status))) throw new Error(`第 ${native.ordinal} 页当前不符合生成条件`);
+        if (!native.visualBasis || currentQueue.jobs.some(job => job.kind === 'image' && job.projectId === projectId && job.slideId === id && ['queued', 'dispatching', 'running', 'result_ready', 'committing', 'cancel_requested', 'outcome_unknown'].includes(job.status))) throw new Error(`第 ${native.ordinal + 1} 页当前不符合生成条件`);
         if (pendingIntents.has(pendingKey(projectId, id))) throw new Error('该页前次提交结果待核对，请勿重复提交');
         const parentVersion = parent?.pageId === id ? exact(parent).version : null;
         if (parent && (!parentVersion?.image || !parentVersion.basis)) throw new Error('父版本图片或依据缺失，不能作为图片编辑输入');
@@ -180,12 +180,12 @@ export function PresalesWorkspacePage({ adapter, projectId, initialPageId, initi
       const acknowledged = preFeedbackAcknowledged[selectedPage.slideId];
       const baseline = acknowledged && acknowledged.revision >= (stored?.revision ?? 0) ? acknowledged.text : stored?.text ?? '';
       const value = preFeedbackText[selectedPage.slideId] ?? baseline;
-      return <PreVersionFeedbackEditor pageNumber={selectedPage.ordinal} text={value} baseline={baseline} busy={Boolean(pending[`pre-feedback:${selectedPage.slideId}`])} error={preFeedbackError[selectedPage.slideId] ?? null}
+      return <PreVersionFeedbackEditor pageNumber={selectedPage.ordinal + 1} text={value} baseline={baseline} busy={Boolean(pending[`pre-feedback:${selectedPage.slideId}`])} error={preFeedbackError[selectedPage.slideId] ?? null}
         onChange={text => setPreFeedbackText(previous => ({ ...previous, [selectedPage.slideId]: text }))}
         onSave={() => void (async () => { const id = selectedPage.slideId; setPreFeedbackError(previous => ({ ...previous, [id]: '' })); try { const result = await action(`pre-feedback:${id}`, () => adapter.saveFeedback({ projectId, slideId: id, baseVersionId: null, expectedRevision: stored?.revision ?? 0, text: value })); setPreFeedbackAcknowledged(previous => ({ ...previous, [id]: { revision: result.revision, text: result.text } })); } catch (caught) { setPreFeedbackError(previous => ({ ...previous, [id]: errorText(caught) })); } })()}
       />;
     })()}
-    {!readOnly && selectedPage && <section className="presales-workspace__panel" aria-label="页面参考图"><h2>第 {selectedPage.ordinal} 页参考图</h2><p>选择系统文件后由本机验证并复制；仅作为风格、布局或构图参考，不替换文字内容。</p>
+    {!readOnly && selectedPage && <section className="presales-workspace__panel" aria-label="页面参考图"><h2>第 {selectedPage.ordinal + 1} 页参考图</h2><p>选择系统文件后由本机验证并复制；仅作为风格、布局或构图参考，不替换文字内容。</p>
       <div className="presales-workspace__actions">{(['style', 'layout', 'composition'] as const).map(purpose => <button key={purpose} disabled={Boolean(pending[`reference:${selectedPage.slideId}`])} onClick={() => fire(action(`reference:${selectedPage.slideId}`, async () => { const next = await adapter.pickReference({ projectId, slideId: selectedPage.slideId, expectedRevision: selectedPage.revision, purpose }); if (next === null) setNotice('已取消选择，页面未修改。'); }))}>{({ style: '选择风格参考', layout: '选择布局参考', composition: '选择构图参考' })[purpose]}</button>)}</div>
       {selectedPage.references.map(reference => <div key={`${reference.image.assetId}:${reference.purpose}`}><span>{reference.purpose} · {reference.image.assetId}</span> <button onClick={() => fire(action(`reference:${selectedPage.slideId}`, () => adapter.setReferences(projectId, selectedPage.slideId, selectedPage.revision, selectedPage.references.filter(item => item !== reference))))}>移除此参考</button></div>)}
       {!queue.capabilities?.referenceEditing && <p>参考图可附加，但当前模型编辑能力未确认：{queue.capabilities?.reason ?? '等待能力确认'}</p>}</section>}

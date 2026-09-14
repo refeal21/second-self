@@ -9,16 +9,18 @@ use std::{
     time::Duration,
 };
 
+#[path = "acceptance_tests.rs"]
+mod acceptance_tests;
 #[path = "draft_tests.rs"]
 mod draft_tests;
-#[path = "reference_tests.rs"]
-mod reference_tests;
-#[path = "text_tests.rs"]
-mod text_tests;
-#[path = "supervisor_tests.rs"]
-mod supervisor_tests;
 #[path = "provider_tests.rs"]
 mod provider_tests;
+#[path = "reference_tests.rs"]
+mod reference_tests;
+#[path = "supervisor_tests.rs"]
+mod supervisor_tests;
+#[path = "text_tests.rs"]
+mod text_tests;
 
 #[path = "../../tests/support/v3_temp.rs"]
 mod temp;

@@ -271,7 +271,7 @@ export function App({
         if (active) setPresalesApprovals(loaded.flatMap(item => item?.kind === 'frozen' ? item.project.pages.flatMap(page => {
           const current = page.versions.find(version => version.versionId === page.currentVersionId);
           const original = current?.provenance && typeof current.provenance === 'object' && (current.provenance as { kind?: string }).kind === 'legacyImported';
-          return current?.image && !original && (!page.approval || page.approval.versionId !== current.versionId) ? [{ id: `presales-v3:${item.project.summary.projectId}:${page.slideId}:${current.versionId}`, projectId: item.project.summary.projectId, pageId: page.slideId, versionId: current.versionId, title: item.project.summary.name, detail: `第 ${page.ordinal} 页视觉版本待审核`, author: '售前 v3', time: current.createdAt, workspaceKind: 'presalesV3' as const }] : [];
+          return current?.image && !original && (!page.approval || page.approval.versionId !== current.versionId) ? [{ id: `presales-v3:${item.project.summary.projectId}:${page.slideId}:${current.versionId}`, projectId: item.project.summary.projectId, pageId: page.slideId, versionId: current.versionId, title: item.project.summary.name, detail: `第 ${page.ordinal + 1} 页视觉版本待审核`, author: '售前 v3', time: current.createdAt, workspaceKind: 'presalesV3' as const }] : [];
         }) : []));
       }
     }).catch(error => { if (active) setNotice({ kind: 'error', text: `售前 v3 目录未载入：${toMessage(error)}` }); });

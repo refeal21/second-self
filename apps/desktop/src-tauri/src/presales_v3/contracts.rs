@@ -86,7 +86,7 @@ pub struct V3PageState {
     pub origin_approvals: Vec<super::V3OriginApprovalRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_approval: Option<super::V3OriginApprovalRef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub references: Vec<crate::presales_queue::ImageReferenceContext>,
 }
 

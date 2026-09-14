@@ -578,21 +578,49 @@ fn delivery_rechecks_frozen_content_but_never_backfills_historical_snapshots() {
         store.commit_result(c, &vault).unwrap();
         approve(&mut store, &vault, n);
     }
-    let frozen = store.create_delivery_snapshot("frozen-project", &vault).unwrap();
+    let frozen = store
+        .create_delivery_snapshot("frozen-project", &vault)
+        .unwrap();
     let original = serde_json::to_value(frozen).unwrap();
     for field in ["spec", "design", "basis", "approval"] {
         let mut bad = original.clone();
         bad["pages"][0]["content"][field] = serde_json::Value::Null;
-        store.connection.execute("UPDATE v3_delivery_snapshots SET snapshot_json=?1", [bad.to_string()]).unwrap();
-        assert!(store.create_delivery_snapshot("frozen-project", &vault).is_err(), "{field}");
+        store
+            .connection
+            .execute(
+                "UPDATE v3_delivery_snapshots SET snapshot_json=?1",
+                [bad.to_string()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .create_delivery_snapshot("frozen-project", &vault)
+                .is_err(),
+            "{field}"
+        );
     }
     let mut old = original;
-    for item in old["pages"].as_array_mut().unwrap() { item.as_object_mut().unwrap().remove("content"); }
+    for item in old["pages"].as_array_mut().unwrap() {
+        item.as_object_mut().unwrap().remove("content");
+    }
     let old_bytes = old.to_string();
-    store.connection.execute("UPDATE v3_delivery_snapshots SET snapshot_json=?1", [&old_bytes]).unwrap();
-    let returned = store.create_delivery_snapshot("frozen-project", &vault).unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE v3_delivery_snapshots SET snapshot_json=?1",
+            [&old_bytes],
+        )
+        .unwrap();
+    let returned = store
+        .create_delivery_snapshot("frozen-project", &vault)
+        .unwrap();
     assert_eq!(serde_json::to_value(returned).unwrap(), old);
-    let after: String = store.connection.query_row("SELECT snapshot_json FROM v3_delivery_snapshots", [], |r| r.get(0)).unwrap();
+    let after: String = store
+        .connection
+        .query_row("SELECT snapshot_json FROM v3_delivery_snapshots", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
     assert_eq!(after, old_bytes);
 }
 
@@ -608,26 +636,72 @@ fn delivery_freezes_approved_v2_content_and_preserves_snapshot_after_revision() 
             approve(&mut store, &vault, n);
         }
         let p = page(&store, n);
-        store.adopt_version(AdoptVersion {
-            project_id: "frozen-project".into(), slide_id: p.slide_id.clone(),
-            version_id: p.versions[1].version_id.clone(), expected_revision: p.revision,
-        }, &vault).unwrap();
-        store.restore_approval(AdoptVersion {
-            project_id: "frozen-project".into(), slide_id: p.slide_id,
-            version_id: p.versions[1].version_id.clone(), expected_revision: page(&store, n).revision,
-        }, &vault).unwrap();
+        store
+            .adopt_version(
+                AdoptVersion {
+                    project_id: "frozen-project".into(),
+                    slide_id: p.slide_id.clone(),
+                    version_id: p.versions[1].version_id.clone(),
+                    expected_revision: p.revision,
+                },
+                &vault,
+            )
+            .unwrap();
+        store
+            .restore_approval(
+                AdoptVersion {
+                    project_id: "frozen-project".into(),
+                    slide_id: p.slide_id,
+                    version_id: p.versions[1].version_id.clone(),
+                    expected_revision: page(&store, n).revision,
+                },
+                &vault,
+            )
+            .unwrap();
     }
-    let frozen = store.create_delivery_snapshot("frozen-project", &vault).unwrap();
+    let frozen = store
+        .create_delivery_snapshot("frozen-project", &vault)
+        .unwrap();
     let encoded = serde_json::to_value(&frozen).unwrap();
-    assert_eq!(encoded["pages"][0]["versionId"], "visual-attempt-delivery-1-v2");
+    assert_eq!(
+        encoded["pages"][0]["versionId"],
+        "visual-attempt-delivery-1-v2"
+    );
     assert_eq!(encoded["pages"][0]["content"]["spec"], page(&store, 1).spec);
-    assert_eq!(encoded["pages"][0]["content"]["design"], serde_json::to_value(page(&store, 1).design).unwrap());
-    assert_eq!(encoded["pages"][0]["content"]["basis"], serde_json::to_value(page(&store, 1).visual_basis).unwrap());
-    assert_eq!(encoded["pages"][0]["content"]["approval"], serde_json::to_value(page(&store, 1).approval).unwrap());
-    let stored: String = store.connection.query_row("SELECT snapshot_json FROM v3_delivery_snapshots WHERE snapshot_id=?1", [&frozen.snapshot_id], |r| r.get(0)).unwrap();
-    store.enqueue_pages(input(&store, 1, "delivery-revision"), None).unwrap();
-    assert!(store.create_delivery_snapshot("frozen-project", &vault).is_err());
-    let after: String = store.connection.query_row("SELECT snapshot_json FROM v3_delivery_snapshots WHERE snapshot_id=?1", [&frozen.snapshot_id], |r| r.get(0)).unwrap();
+    assert_eq!(
+        encoded["pages"][0]["content"]["design"],
+        serde_json::to_value(page(&store, 1).design).unwrap()
+    );
+    assert_eq!(
+        encoded["pages"][0]["content"]["basis"],
+        serde_json::to_value(page(&store, 1).visual_basis).unwrap()
+    );
+    assert_eq!(
+        encoded["pages"][0]["content"]["approval"],
+        serde_json::to_value(page(&store, 1).approval).unwrap()
+    );
+    let stored: String = store
+        .connection
+        .query_row(
+            "SELECT snapshot_json FROM v3_delivery_snapshots WHERE snapshot_id=?1",
+            [&frozen.snapshot_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    store
+        .enqueue_pages(input(&store, 1, "delivery-revision"), None)
+        .unwrap();
+    assert!(store
+        .create_delivery_snapshot("frozen-project", &vault)
+        .is_err());
+    let after: String = store
+        .connection
+        .query_row(
+            "SELECT snapshot_json FROM v3_delivery_snapshots WHERE snapshot_id=?1",
+            [&frozen.snapshot_id],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(after, stored);
     assert_eq!(serde_json::to_value(frozen).unwrap(), encoded);
 }

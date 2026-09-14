@@ -11,6 +11,32 @@ fn fixture() -> Value {
     .expect("synthetic fixture is valid JSON")
 }
 
+#[test]
+fn accepts_genuine_five_page_chinese_narrative_and_rejects_incomplete_binding() {
+    let source: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/presales/five-page-acceptance.json"
+    ))
+    .unwrap();
+    let mut pair: PresalesDraftPair = serde_json::from_value(source["pair"].clone()).unwrap();
+    validate_pair(&pair, &source["analysis"]).unwrap();
+    assert_eq!(
+        pair.outline["plan"]["pages"][1]["moduleIds"],
+        json!(["sensing", "response"])
+    );
+    assert_eq!(
+        pair.details.as_ref().unwrap()["specs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    pair.details.as_mut().unwrap()["designs"][1]["textBindings"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    assert!(validate_pair(&pair, &source["analysis"]).is_err());
+}
+
 fn pair() -> PresalesDraftPair {
     serde_json::from_value(fixture()["pair"].clone()).expect("fixture pair matches request")
 }

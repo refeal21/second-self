@@ -92,6 +92,20 @@ codesign -dv --verbose=4 'apps/desktop/src-tauri/target/release/bundle/macos/Dig
 
 Worker SEA 使用当前 Node 22 可执行文件构建，同时把该 Node 发行版的完整 `LICENSE`（其中包含依赖许可证和第三方声明）以及精确版本复制到 `.app/Contents/Resources/licenses/node-runtime/`。若构建机器上的匹配 LICENSE 缺失，构建会直接失败。
 
+## 售前 v3 本轮独立开发产物
+
+最终分支审查修复完成后，在 `.worktrees/presales-batch` 构建（此命令当前尚未执行）：
+
+```bash
+pnpm --dir apps/desktop exec tauri build --bundles app --config '{"productName":"Digital Twin Workbench V3 Dev"}'
+```
+
+此命令会重新构建前端和自包含 Worker SEA。预期原始输出是 `apps/desktop/src-tauri/target/release/bundle/macos/Digital Twin Workbench V3 Dev.app`；计划将交付副本保留在 `artifacts/build/presales-v3-dev/Digital Twin Workbench V3 Dev.app`。当前路径为计划交付位置，不能当作已经生成的产物。不安装到 `/Applications`，也不替换运行中的旧包。
+
+该包仍使用 `com.digitaltwin.workbench`，并非合成 GUI 沙箱。手动启动时，原生 setup 会打开标准应用数据目录下的 `workbench.sqlite3` 和 `presales-v3.sqlite3`，初始化 `~/Documents/DigitalTwinWorkspace`，前端会自动连接常规 Codex 账户路径。不同包名称不隔离数据库、工作区或账户，本轮未执行该启动操作。原生窗口视觉与 app-tree RSS、真实 ImageGen、Keynote 编辑和真实峰值内存均需另行观察。
+
+无需启动应用的合成验收命令、浏览器截图和 RSS 测量边界在 [v3 验证记录](verification-2026-09-11-presales-v3-workbench.md)。不要用此开发包的旧 Golden Project 成绩替代 v3 可编辑转换验收。
+
 ## 只读账号冒烟测试
 
 打开 `.app` 后会自动执行一次只读连接检查，也可以进入“通用任务”点击“检查连接”重试。该操作只启动 `codex app-server --listen stdio://`，发送 `initialize` / `initialized` / `account/read`，不会创建 thread/turn，也不会为了测试消耗一个模型回合。首页、通用任务和设置同步显示连接结果；服务已连接但 ChatGPT 未登录时会提示等待登录，任务保持禁用。浏览器登录完成后自动重新读取账号；进程退出时清除旧状态，点击“检查连接”可重连。未测量的模型、运行时间和队列数据继续显示“未提供”。

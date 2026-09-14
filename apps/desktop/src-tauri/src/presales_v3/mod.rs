@@ -18,8 +18,8 @@ mod import_evidence;
 mod import_read;
 mod legacy_envelope;
 mod legacy_snapshot;
-mod prompt;
 mod preparation;
+mod prompt;
 mod publication;
 pub(crate) mod reference_assets;
 mod references;
@@ -30,15 +30,15 @@ mod text_operations;
 mod text_prompt;
 mod text_result;
 pub use reference_assets::NativeSelectedReference;
-mod service;
-pub(crate) mod supervisor;
-pub(crate) mod runtime_host;
-mod runtime_callbacks;
-mod provider_assets;
-mod provider_process;
 pub(crate) mod commands;
 pub(crate) mod picker;
+mod provider_assets;
+mod provider_process;
+mod runtime_callbacks;
+pub(crate) mod runtime_host;
+mod service;
 mod store;
+pub(crate) mod supervisor;
 mod validator_process;
 mod wal_snapshot;
 
@@ -74,6 +74,6 @@ mod activity_tests;
 #[cfg(test)]
 mod events_tests;
 #[cfg(test)]
-mod preparation_tests;
-#[cfg(test)]
 mod import_tests;
+#[cfg(test)]
+mod preparation_tests;

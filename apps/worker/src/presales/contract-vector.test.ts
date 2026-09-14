@@ -13,6 +13,24 @@ const vector = JSON.parse(
 ) as { analysis: unknown; pair: { schemaVersion: unknown; outline: unknown; details: unknown } };
 
 describe('shared presales native contract vector', () => {
+  it('validates the genuine five-page Chinese narrative, complete bindings and linked modules', () => {
+    const five = JSON.parse(readFileSync(resolve(REPO_ROOT, 'fixtures/presales/five-page-acceptance.json'), 'utf8')) as typeof vector;
+    const outline = parseOutlineEnvelope(five.pair.outline, five.analysis as never);
+    const details = parseDetailsEnvelope(five.pair.details, outline, five.analysis as never);
+    expect(outline.plan.pages.map(page => page.pageType)).toEqual(['goals', 'architecture', 'module', 'module', 'scenario']);
+    expect(outline.plan.pages[1]?.moduleIds).toEqual(['sensing', 'response']);
+    expect(details.designs[4]?.scene?.steps.map(step => step.moduleId)).toEqual(['sensing', 'response']);
+    expect(new Set(details.specs.map(spec => spec.imageGenerationBrief)).size).toBe(5);
+    details.specs.forEach((spec, index) => {
+      const design = details.designs[index]!;
+      expect(resolveVisibleBindings(spec, design)).toHaveLength(index === 4 ? 7 : 4);
+      expect(JSON.stringify(spec)).not.toContain(design.speakerNotes);
+    });
+    const broken = structuredClone(five.pair.details) as { designs: { textBindings: unknown[] }[] };
+    broken.designs[1]!.textBindings.pop();
+    expect(() => parseDetailsEnvelope(broken, outline, five.analysis as never)).toThrow();
+  });
+
   it('passes the TypeScript outline and rich-details validators', () => {
     expect(vector.pair.schemaVersion).toBe(1);
     const outline = parseOutlineEnvelope(vector.pair.outline, vector.analysis as never);

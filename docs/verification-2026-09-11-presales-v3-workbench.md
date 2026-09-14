@@ -4,9 +4,9 @@
 
 ## 当前交付状态
 
-五页原生集成、真实 App 的合成 DTO 浏览器检查、源码检查与前端构建已执行。最终 Worker SEA 与独立 `.app` 按总控要求等待全分支审查和修复波次完成后再构建，避免交付过时二进制；Task 8 尚未完成最终包交付。
+五页原生集成、真实 App 的合成 DTO 浏览器检查、全分支审查及 F1–F6 修复复审已完成。最终生产源码为 `d5bcdd55f0f04b42410f71515849c8f1af86758f`；2026-09-14 已从该提交重新构建 Worker SEA、前端、原生 release 与独立开发包，并执行包内 v3 离线协议冒烟。后续交付提交只增加打包检查脚本和文档，不改变包内生产源码。
 
-计划构建名称是 `Digital Twin Workbench V3 Dev.app`，保留 `com.digitaltwin.workbench`。计划交付目录：`artifacts/build/presales-v3-dev/`，当前不是已生成产物。具体命令见 [开发与打包](run-build.md#售前-v3-本轮独立开发产物)。
+实际构建名称是 `Digital Twin Workbench V3 Dev.app`，保留 `com.digitaltwin.workbench`，版本 0.1.0，最低 macOS 13.0。已保留在 `artifacts/build/presales-v3-dev/`，本地 ad-hoc 封装后整包严格签名验证通过，但没有 Developer ID 签名或公证；具体命令及手动使用条件见 [开发与打包](run-build.md#售前-v3-本轮独立开发产物)。
 
 该应用即使名称、文件位置不同，启动仍会打开标准应用数据目录下两个 SQLite 数据库，初始化 `~/Documents/DigitalTwinWorkspace`，并由 App 自动连接常规账户路径。没有添加测试专用生产启动模式，本轮没有启动原生 GUI，也没有替换 `/Applications` 或运行中的应用。
 
@@ -44,6 +44,10 @@
 
 1. 原生 `V3PageState.references` 对空数组使用 skip_serializing_if；前端要求数组并读取 length。实际原生 DTO 令 App 白屏，控制台为 `Cannot read properties of undefined (reading 'length')`。先运行回归，得到 `Null != Array []`；然后让原生始终输出数组，保留 serde default 以读取旧数据。原生回归、旧值读取和实际 App 重跑通过，未在夹具中补假字段。
 2. 原生 ordinal 为 0..4；前端误直接显示 0..4。先运行读取模型回归，得到 `first:0/fifth:4` 而非 `1/5`；再只调整用户可见页码加 1。Gallery 的 display-number 约定、数据库顺序和页面 ID 未改，关联参考图、反馈、对照与审批标签一致。
+
+最终复审另修复了第 1 项对旧不可变副本凭据的兼容影响（F6）：读取仍要求数据库原始字符串与磁盘字节完全相等，仅允许当前 canonical 编码或精确旧编码（每个 receipt page 最末的空 references 字段被省略）；不做全局 JSON 归一化、不重写存储。原生历史、省略字段的格式副本、内容修订副本均实际重启读回，DTO 仍输出 `references: []`；修改身份、未知字段、空白重排和 null 仍被拒绝。
+
+其他最终修复：完整场景/绑定编辑与缺失绑定修复、已完成但非法的文本回合终结为 failed、导入版本的 null-basis 采用/恢复/父图编辑、完整原输入重试与 native 持久撤回、离屏原图释放及 24 项缓存。V3 schema 3→4 为精确原子升级，V3 1/2 收敛到 4，QueueOnly schema 2 不变。
 
 ## 浏览器视觉与交互
 
@@ -93,23 +97,45 @@ PRESALES_TEST_BINARY=/absolute/path/to/target/debug/deps/digital_twin_desktop_li
 
 测试 wrapper 只启动指定测试可执行文件；原生 helper 必須先由 acceptance-harness feature 编译。本次控制器只读音量检查返回 output volume 0、alert volume 0、output muted true；未播放声音。
 
-## 检查证据与最终待办
+## 最终检查证据与外部待验收
+
+以下全套源码结果来自最终修复实施记录 `final-fix-report.md`，总控已复审通过；本打包阶段未重复运行未改变的重型套件。早期 Task 8 的 413/401/355 是历史执行边界，不是最终源码计数。总控额外新跑了历史凭据 1/1、withdrawal 3/3、workspace/draft/GalleryImage 24/24。
 
 | 命令 | 结果与时间边界 |
 | --- | --- |
 | `pnpm run test:core` | 8/8 |
-| `pnpm run test:worker` | 413/413，包括共用五页 vector 与旧 Golden Project QA 回归 |
-| `pnpm --dir apps/desktop test` | 修复后全套 401/401，36 个文件（15:04:51 开始） |
-| `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features acceptance-harness -- --test-threads=1` | 355/355；为两项边界修复之前的完整执行，日志 rust-full.log |
-| 修复后 native basis tests | 7/7，含新 serialization regression 与旧省略字段读取 |
-| 修复后 native integrated test | 1/1，内部依次覆盖 1/2/4；RSS 运行同样通过 |
-| 修复后 frontend targeted | 23/23：read-model、workspace、draft-workspace、App routing |
-| `pnpm typecheck`、`pnpm lint`、`pnpm check:presales-skill` | 修复后全部再次执行通过 |
-| `pnpm --dir apps/desktop build` | 通过；79 modules，CSS 62.42 kB / JS 497.13 kB；仅前端 dist，不是 SEA 或原生包 |
+| `pnpm run test:worker` | 416/416，34 个文件；含共用五页 vector 与旧 Golden Project QA 回归 |
+| `pnpm --dir apps/desktop test` | 410/410，37 个文件（最终 15:54:38） |
+| `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features acceptance-harness -- --test-threads=1` | 361/361，169 lib + 192 bin/integration；含私有合成子进程 1/2/4 五页验收 |
+| `pnpm typecheck`、`pnpm lint`、`pnpm check:presales-skill` | 最终修复后全部通过 |
+| `pnpm --dir apps/desktop build` | 最终修复及本次打包均通过；80 modules，CSS 63.01 kB / JS 504.37 kB；Vite >500 kB advisory 非阻断 |
 | `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check`、`git diff --check` | 通过；包含此前 Task 5/7 遗留的纯格式整理 |
 
 本轮未复现已知并行重负载下 sidecar timeout 或旧 native-generation-review feedback race；不把没有复现等同于已解决这些历史噪声。
 
-全分支基线 `5f0d06c5826fb63cdfd0156e6a4354125da0aba5` 的独立审查、发现修复与窄范围复审由总控执行。本次没有自行再派一个重复 reviewer。审查波次完成后需要刷新最终检查、重新构建真实自包含 SEA 和独立 `.app`，记录实际路径、二进制身份、包内文件与签名检查，再完成开发包交付。
+全分支基线 `5f0d06c5826fb63cdfd0156e6a4354125da0aba5` 的独立审查、修复和窄范围复审由总控完成：F1–F6 全部 addressed，未发现新增 Critical/Important。没有重复派发 reviewer。最终浏览器证据在 `artifacts/qa/presales-v3/final-fixes/browser-report.json`（完整场景编辑、40 图滚动，最高 6 个 DOM 原图、errors []、3 个内存资源）与 `final-fixes/native-app/browser-report.json`（更新的真实原生五页 DTO→实际 App，errors []、手机宽度 390）。DOM 原图数量不是内存测量；上文 225.1 MiB 是原始合成树观测，没有因新包构建而重测。
+
+## 最终开发包与离线冒烟
+
+构建命令见 run-build；实际日志 `artifacts/qa/presales-v3/final-package-build.log`。Tauri beforeBuildCommand 重新执行 `build:worker-sidecar`（Node v22.21.1 SEA blob/postject/ad-hoc）和前端构建，再完成原生 release（1m14s），退出 0。未安装依赖。`ditto` 保留副本，未覆盖现存目标。主程序与 Worker 均为 arm64 Mach-O；最终封装包内 8 个文件总计 133,615,912 字节，`du -sk` 为 130500 KiB。
+
+| 包内文件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `Contents/MacOS/digital-twin-desktop` | 20,097,520 | `85cf24fd6cf4d95034ac328fdd928b9a2f9517d5880225d00a9d284ca66cbc13` |
+| `Contents/MacOS/digital-twin-worker` | 111,460,144 | `c617333882ffe5b6af2d59878750581f6cf3f78da8f534e395f32972e5dfccaf` |
+| `Contents/Resources/licenses/node-runtime/LICENSE-and-third-party-notices.txt` | 143,299 | `e991d81497a85bb24fc6bffae0a3637a6accd6c6bc5ce1f2c5698bd555cf9d49` |
+
+许可逐字节匹配本机 Node v22.21.1 发行版 LICENSE，VERSION.txt 同为 v22.21.1，包内另有 THIRD_PARTY_NOTICES.md。Worker 逐字节匹配本次新构建 SEA，外层封装未改变 Worker。完整文件清单、哈希、Info.plist、签名命令/退出码保存在 `final-package-inspection.json`（08:24:06 UTC）。清单 JSON 的 SHA-256 为 `74957727ca203499eb5d0477992e9ffd43eba43396549710b00312e4db083451`；这是该记录定义的有序文件清单摘要，不是 `.app` 目录或 zip 的字节哈希。
+
+原始 Tauri 包实测 Worker 严格验证退出 0、整包严格验证退出 1（`code has no resources but signature indicates they must be present`），证据保留在 `final-package-inspection-preseal.json`。总控批准仅对精确保留副本做本地资源封装：先读取主程序/Worker entitlements，均为空；执行 `codesign --force --sign - <保留包>`，未新增能力或使用证书/钥匙串。最终整包 `codesign --verify --deep --strict` 与 Worker `--verify --strict` 均退出 0；Info.plist 14 项已绑定、Sealed Resources version 2/files 5，签名为 ad-hoc，无 TeamIdentifier。主程序哈希因重新封装而变化，原始构建输出未变。未做 Developer ID 签名、公证或 Gatekeeper/GUI 启动验收。
+
+封装后重新执行 `node scripts/smoke-packaged-presales-worker.mjs <包内 Worker 绝对路径>` 退出 0，证据 `final-packaged-worker-smoke.json`（08:24:06 UTC；封装前记录另存 `final-packaged-worker-smoke-preseal.json`）：
+
+- 默认模式仅创建一个真实内存 intake checkpoint 作为校验输入，不执行 Golden deck。
+- `--presales-validate` 接受紧凑与缩进两个准确 UTF-8 快照，分别验证 450/550 字节和不同 SHA；伪造 completed/revision99 被 -32602 拒绝，运行时方法被 -32601 拒绝。
+- `--presales-runtime` 实际生产私有代理启动，但所有 native start/send 回复由脚本伪造。初始 unavailable→合成能力 generation/referenceEditing true→连接丢失后均 false；旧 generation 与 legacy 方法被拒绝。
+- 三个包内 Worker 进程均正常退出 0、stderr 空；仅继承 `/usr/bin:/bin` PATH，无 Node/Codex 查找或账户环境。合成 provider 方法严格限定为 initialize/initialized/account/config/requirements/model/capabilities，thread/turn 调用 0；scratch 仍为空，无 HTTP listener 或 GUI。
+
+打包阶段未运行旧 packaged Golden 全链路：所需已生成 outline 输入不存在，没有为此额外生成数据。源码套件中的旧 Golden QA 仍仅是回归证据。冒烟不证明真实能力、图片设计质量、实际 native provider 启动或 v3 可编辑转换。
 
 仍需单独实测：安全隔离的原生 GUI 初始化与视觉检查、原生 app-tree RSS、真实账户 ImageGen 的五页效果与父图编辑、Keynote 打开/编辑、真实峰值内存。任意 v3 整页 PNG 的可编辑重建仍未实现，不能从本次合成验收或旧 Golden QA 推导为完成。

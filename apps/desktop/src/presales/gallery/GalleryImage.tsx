@@ -3,6 +3,7 @@ import type { GalleryImageIdentity } from './model.js';
 
 const LIMIT = 24;
 const cache = new Map<string, string>();
+export function clearGalleryImageCache() { cache.clear(); }
 const keyOf = (image: GalleryImageIdentity) => `${image.id}:${image.sha256}`;
 
 export function GalleryImage({ image, loadImage, alt, priority = false }: {

@@ -42,6 +42,18 @@ function props(overrides: Partial<GalleryProps> = {}): GalleryProps {
 }
 
 describe('Gallery', () => {
+  it('requires separate content and visual checks for the exact candidate', async () => {
+    const user = userEvent.setup(); const onApprove = vi.fn(async () => {});
+    render(<Gallery {...props({ onApprove })} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    const approve = screen.getByRole('button', { name: '批准此版本' });
+    await user.click(screen.getByRole('checkbox', { name: /内容与页面规格一致/ }));
+    expect(approve).toBeDisabled();
+    await user.click(screen.getByRole('checkbox', { name: /视觉与设计方案一致/ }));
+    expect(approve).toBeEnabled();
+    await user.click(approve);
+    expect(onApprove).toHaveBeenCalledWith({ pageId: 'b', versionId: 'b2', revision: 2 }, { contentChecked: true, visualChecked: true });
+  });
   it('keeps B selected while A runs and allows B edit and exact-version approval without submitting a new draft', async () => {
     const user = userEvent.setup(); const pending = deferred<{ requestIds: Record<string, string> }>();
     const onEdit = vi.fn(() => pending.promise); const onApprove = vi.fn(async () => {});
@@ -53,10 +65,11 @@ describe('Gallery', () => {
     expect(onEdit).toHaveBeenCalledWith({ pageId: 'b', versionId: 'b2', revision: 2 });
     expect(screen.getByRole('button', { name: /第 1 页 开场/ })).toBeEnabled();
     expect(screen.getByRole('button', { name: '批准此版本' })).toBeDisabled();
-    await user.click(screen.getByRole('checkbox', { name: /已人工核对第 2 页候选稿修订 2/ }));
+    await user.click(screen.getByRole('checkbox', { name: /内容与页面规格一致/ }));
+    await user.click(screen.getByRole('checkbox', { name: /视觉与设计方案一致/ }));
     expect(screen.getByRole('button', { name: '批准此版本' })).toBeEnabled();
     await user.click(screen.getByRole('button', { name: '批准此版本' }));
-    expect(onApprove).toHaveBeenCalledWith({ pageId: 'b', versionId: 'b2', revision: 2 });
+    expect(onApprove).toHaveBeenCalledWith({ pageId: 'b', versionId: 'b2', revision: 2 }, { contentChecked: true, visualChecked: true });
     rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'a' ? { ...p, job: { state: 'idle', requestId: null } } : p) }} />);
     expect(screen.getByRole('heading', { name: /第 2 页 · 机会/ })).toBeVisible();
     pending.resolve({ requestIds: { b: 'b-edit-request' } });
@@ -64,7 +77,8 @@ describe('Gallery', () => {
 
   it('inspects history without adoption, then requires explicit adoption or restoration', async () => {
     const user = userEvent.setup(); const onAdopt = vi.fn(async () => {}); const onRestore = vi.fn(async () => {});
-    render(<Gallery {...props({ onAdopt, onRestore })} />);
+    const input = props({ onAdopt, onRestore });
+    const { rerender } = render(<Gallery {...input} />);
     await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
     expect(screen.getByRole('button', { name: '恢复此前批准' })).toBeDisabled();
     await user.click(screen.getByRole('button', { name: /查看初稿 修订 1/ }));
@@ -72,6 +86,8 @@ describe('Gallery', () => {
     expect(onAdopt).not.toHaveBeenCalled(); expect(onRestore).not.toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: '选择用于交付' }));
     expect(onAdopt).toHaveBeenCalledWith({ pageId: 'b', versionId: 'b1', revision: 1 });
+    expect(screen.getByRole('button', { name: '恢复此前批准' })).toBeDisabled();
+    rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, candidateVersionId: 'b1' } : p) }} />);
     await user.click(screen.getByRole('button', { name: '恢复此前批准' }));
     expect(onRestore).toHaveBeenCalledWith({ pageId: 'b', versionId: 'b1', revision: 1 });
   });
@@ -308,14 +324,15 @@ describe('Gallery', () => {
     expect(onGenerate).toHaveBeenCalledTimes(1);
   });
 
-  it('unfences rejected generation with a visible error so the page can be retried explicitly', async () => {
+  it('keeps a generic rejected generation fenced as outcome-unknown until authoritative reconciliation', async () => {
     const user = userEvent.setup(); const onGenerate = vi.fn(async () => { throw new Error('入队失败'); });
     render(<Gallery {...props({ onGenerate })} />);
     await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
     await user.click(screen.getByRole('button', { name: '生成新稿' }));
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('入队失败');
-    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    expect(screen.getByText('提交结果待确认，请核对任务列表；暂不重复提交。')).toBeVisible();
     expect(onGenerate).toHaveBeenCalledTimes(1);
   });
 

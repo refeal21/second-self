@@ -53,6 +53,9 @@ export interface ProjectSummary {
 export interface ApprovalSummary {
   id: string;
   projectId?: string;
+  workspaceKind?: 'legacy' | 'presalesV3';
+  pageId?: string;
+  versionId?: string;
   title: string;
   detail: string;
   author: string;

@@ -32,6 +32,8 @@ export interface GalleryPage {
   job: GalleryJob;
   /** null permits an action; a string explains why the host forbids it. */
   eligibility: Record<GalleryAction, string | null>;
+  /** Native page-scoped review fence, separate from immutable version sequence. */
+  reviewKey?: string;
 }
 export interface GalleryFeedback { text: string; revision: number }
 export interface GalleryModel {
@@ -53,6 +55,9 @@ export interface GalleryVersionRef { pageId: string; versionId: string; revision
 export interface GalleryGenerationReceipt { requestIds: Record<string, string> }
 export interface GalleryProps {
   model: GalleryModel;
+  readOnly?: boolean;
+  initialPageId?: string;
+  initialVersionId?: string;
   /** The host resolves immutable identity; the UI never treats a path or token as authority. */
   loadImage: (identity: GalleryImageIdentity) => Promise<string>;
   onGenerate: (pageId: string, replaceCandidate: boolean) => Promise<GalleryGenerationReceipt>;
@@ -61,7 +66,7 @@ export interface GalleryProps {
   onAdopt: (version: GalleryVersionRef) => Promise<void>;
   /** Restore an eligible previously approved version using the host's history contract. */
   onRestore: (version: GalleryVersionRef) => Promise<void>;
-  onApprove: (version: GalleryVersionRef) => Promise<void>;
+  onApprove: (version: GalleryVersionRef, checks: { contentChecked: true; visualChecked: true }) => Promise<void>;
   /** Returns the saved feedback CAS revision, distinct from the visual version revision. */
   onSaveFeedback: (version: GalleryVersionRef, text: string) => Promise<GalleryFeedback>;
   onQueueChange: (change: { concurrency?: number; paused?: boolean }) => Promise<void>;
@@ -69,4 +74,5 @@ export interface GalleryProps {
   onCancelJob?: (pageId: string) => Promise<void>;
   onRetryJob?: (pageId: string) => Promise<void>;
   onDirtyChange?: (dirty: boolean) => void;
+  onPageChange?: (pageId: string) => void;
 }

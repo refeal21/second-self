@@ -29,9 +29,9 @@ function versionSnapshot(page: GalleryPage, id: string | null): string | null {
 type GenerationFence = { phase: 'submitting' | 'awaiting-sync' | 'outcome-unknown'; requestId: string | null };
 
 export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onRestore, onApprove, onSaveFeedback,
-  onQueueChange, onBatchGenerate, onCancelJob, onRetryJob, onDirtyChange }: GalleryProps) {
-  const [pageId, setPageId] = useState<string | null>(null);
-  const [versionIds, setVersionIds] = useState<Record<string, string>>({});
+  onQueueChange, onBatchGenerate, onCancelJob, onRetryJob, onDirtyChange, onPageChange, initialPageId, initialVersionId, readOnly = false }: GalleryProps) {
+  const [pageId, setPageId] = useState<string | null>(initialPageId ?? null);
+  const [versionIds, setVersionIds] = useState<Record<string, string>>(initialPageId && initialVersionId ? { [initialPageId]: initialVersionId } : {});
   const [selected, setSelected] = useState<string[]>([]);
   const [feedback, setFeedback] = useState<Record<string, string>>({});
   const [baseline, setBaseline] = useState<Record<string, string>>({});
@@ -43,7 +43,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
   const modelRef = useRef(model);
   modelRef.current = model;
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [checked, setChecked] = useState<Record<string, boolean>>({});
+  const [checked, setChecked] = useState<Record<string, { content?: boolean; visual?: boolean }>>({});
   const [confirmation, setConfirmation] = useState<{
     pageIds: string[];
     candidateKeys: Record<string, string | null>;
@@ -127,9 +127,9 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         if (missing.length) setErrors(previous => ({ ...previous, [key]: `任务回执不完整（${missing.length} 页），提交结果待确认；请核对任务列表，暂不重复提交` }));
         reconcileGenerationFences(modelRef.current);
       } catch (error) {
-        for (const id of ids) generationPendingRef.current.delete(id);
+        for (const id of ids) generationPendingRef.current.set(id, { phase: 'outcome-unknown', requestId: null });
         syncGenerationFences();
-        setErrors(previous => ({ ...previous, [key]: explain(error) }));
+        setErrors(previous => ({ ...previous, [key]: `${explain(error)}；提交结果待确认，请核对任务列表，暂不重复提交。` }));
       }
     })();
   }
@@ -139,7 +139,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
     return phase === 'outcome-unknown' ? '提交结果待确认，请核对任务列表' : phase === 'awaiting-sync' ? '等待任务状态同步' : phase ? '该页操作进行中' : null;
   }
   function doVersionAction(action: Exclude<GalleryAction, 'edit' | 'generate'>, work: (ref: GalleryVersionRef) => Promise<void>) {
-    if (!page || !ref || page.eligibility[action] || (action === 'restore' && !version?.approved) || pending[actionKey(page.id, action)]) return;
+    if (!page || !ref || !version?.image || page.eligibility[action] || (action === 'restore' && (!version?.approved || (page.candidateVersionId !== version.id && page.currentDeliveryVersionId !== version.id))) || pending[actionKey(page.id, action)]) return;
     void perform(actionKey(page.id, action), () => work(ref));
   }
   function doEdit() {
@@ -149,8 +149,9 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
   const feedbackId = ref ? feedbackKey(ref.pageId, ref.versionId, ref.revision) : '';
   const feedbackText = feedback[feedbackId] ?? model.savedFeedback[feedbackId]?.text ?? '';
   const feedbackBase = baseline[feedbackId] ?? model.savedFeedback[feedbackId]?.text ?? '';
-  const currentCheckKey = ref ? `${ref.pageId}:${ref.versionId}:${ref.revision}` : '';
-  const canApprove = Boolean(page && version && page.candidateVersionId === version.id && checked[currentCheckKey] && !page.eligibility.approve);
+  const currentCheckKey = ref ? `${ref.pageId}:${ref.versionId}:${ref.revision}:${version?.image?.id ?? ''}:${version?.image?.sha256 ?? ''}:${page?.reviewKey ?? ''}` : '';
+  const checks = checked[currentCheckKey];
+  const canApprove = Boolean(page && version?.image && page.candidateVersionId === version.id && checks?.content && checks?.visual && !page.eligibility.approve);
   const generateMissingIds = model.pages.filter(p => !p.candidateVersionId && !p.currentDeliveryVersionId && !generateReason(p) && !isGenerating(p.id)).map(p => p.id);
   function openBatch(ids: string[], source: 'single' | 'selected' | 'missing' = 'selected') {
     if (!ids.length) return;
@@ -197,9 +198,9 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
   return <section className="presales-gallery" aria-label="多页视觉图库">
     <header className="presales-gallery__header"><div><p className="presales-gallery__eyebrow">视觉工作台 / 逐页审核</p><h1>多页图库</h1><p>逐页检查、修订和确认。新生成稿不会自动提交或成为交付版本。</p></div>
       <div className="presales-gallery__queue" aria-label="队列设置">
-        <label>并发数 <input type="number" aria-label="并发数" min={1} max={4} value={model.queue.concurrency}
+        <label>并发数 <input type="number" aria-label="并发数" min={1} max={4} value={model.queue.concurrency} disabled={readOnly}
           onChange={event => { const value = Number(event.target.value); if (Number.isInteger(value) && value >= 1 && value <= 4) void perform('queue:concurrency', () => onQueueChange({ concurrency: value })); }} /></label>
-        <button type="button" disabled={Boolean(pending['queue:pause'] || (model.queue.paused ? model.queue.resumeReason : model.queue.pauseReason))}
+        <button type="button" disabled={Boolean(readOnly || pending['queue:pause'] || (model.queue.paused ? model.queue.resumeReason : model.queue.pauseReason))}
           onClick={() => void perform('queue:pause', () => onQueueChange({ paused: !model.queue.paused }))}>{model.queue.paused ? '继续队列' : '暂停队列'}</button>
         {(model.queue.paused ? model.queue.resumeReason : model.queue.pauseReason) && <small>{model.queue.paused ? model.queue.resumeReason : model.queue.pauseReason}</small>}
       </div></header>
@@ -213,7 +214,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         const thumbnail = item.versions.find(v => v.id === item.candidateVersionId) ?? item.versions.find(v => v.id === item.currentDeliveryVersionId);
         return <div className={`presales-gallery__page ${item.id === page?.id ? 'is-active' : ''}`} key={item.id}>
           <input type="checkbox" aria-label={`选择第 ${item.number} 页`} checked={selected.includes(item.id)} onChange={event => setSelected(previous => event.target.checked ? [...previous, item.id] : previous.filter(id => id !== item.id))} />
-          <button type="button" aria-current={item.id === page?.id ? 'page' : undefined} onClick={() => setPageId(item.id)}>
+          <button type="button" aria-current={item.id === page?.id ? 'page' : undefined} onClick={() => { setPageId(item.id); onPageChange?.(item.id); }}>
             {thumbnail?.image && <GalleryImage image={thumbnail.image} loadImage={loadImage} alt="" />}
             <span><strong>第 {item.number} 页 {item.title}</strong><small>{item.summary}</small><em>{item.job.label ?? (item.currentDeliveryVersionId ? '有交付稿' : item.candidateVersionId ? '待审核' : '未生成')}</em></span>
           </button>
@@ -234,9 +235,9 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
             onClick={() => openBatch([page.id], 'single')}>生成新稿</button>
           <button type="button" disabled={!ref || Boolean(page.eligibility.edit || model.capabilityReasons.edit || isGenerating(page.id) || feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`])} title={page.eligibility.edit ?? model.capabilityReasons.edit ?? (feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`] ? '先保存此版本反馈，再修改' : isGenerating(page.id) ? '该页操作进行中' : undefined)}
             onClick={doEdit}>编辑此版本</button>
-          <button type="button" disabled={!ref || Boolean(page.eligibility.adopt || pending[actionKey(page.id, 'adopt')])} title={page.eligibility.adopt ?? undefined}
+          <button type="button" disabled={!ref || !version?.image || Boolean(page.eligibility.adopt || pending[actionKey(page.id, 'adopt')])} title={!version?.image ? '此历史版本图片不可用' : page.eligibility.adopt ?? undefined}
             onClick={() => doVersionAction('adopt', onAdopt)}>选择用于交付</button>
-          <button type="button" disabled={!ref || Boolean(!version?.approved || page.eligibility.restore || pending[actionKey(page.id, 'restore')])} title={!version?.approved ? '仅已批准版本可恢复' : page.eligibility.restore ?? undefined}
+          <button type="button" disabled={!ref || !version?.image || Boolean(!version?.approved || (page.candidateVersionId !== version.id && page.currentDeliveryVersionId !== version.id) || page.eligibility.restore || pending[actionKey(page.id, 'restore')])} title={!version?.image ? '此历史版本图片不可用' : !version?.approved ? '仅已批准版本可恢复' : page.candidateVersionId !== version.id && page.currentDeliveryVersionId !== version.id ? '请先明确采用此历史版本，再恢复其批准' : page.eligibility.restore ?? undefined}
             onClick={() => doVersionAction('restore', onRestore)}>恢复此前批准</button>
         </div>
         <div className="presales-gallery__reasons">{model.capabilityReasons.reference && <p>参考图：{model.capabilityReasons.reference}</p>}{model.capabilityReasons.edit && <p>编辑：{model.capabilityReasons.edit}</p>}
@@ -252,8 +253,8 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
           {page.job.retryReason && <small>{page.job.retryReason}</small>}
         </div>}
         {ref && <section className="presales-gallery__review" aria-label="版本审核"><h3>审核此版本</h3>
-          <label className="presales-gallery__feedback">反馈（可选）<textarea aria-label="此版本反馈" value={feedbackText} onChange={event => setFeedback(previous => ({ ...previous, [feedbackId]: event.target.value }))} /></label>
-          <div className="presales-gallery__actions"><button type="button" disabled={feedbackText === feedbackBase || Boolean(pending[`feedback:${feedbackId}`])} onClick={() => {
+          <label className="presales-gallery__feedback">反馈（可选）<textarea aria-label="此版本反馈" value={feedbackText} disabled={readOnly} onChange={event => setFeedback(previous => ({ ...previous, [feedbackId]: event.target.value }))} /></label>
+          <div className="presales-gallery__actions"><button type="button" disabled={readOnly || feedbackText === feedbackBase || Boolean(pending[`feedback:${feedbackId}`])} onClick={() => {
             const text = feedbackText;
             void perform(`feedback:${feedbackId}`, async () => {
               const saved = await onSaveFeedback(ref, text);
@@ -265,8 +266,13 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
               setBaseline(previous => ({ ...previous, [feedbackId]: saved.text }));
             });
           }}>保存反馈</button>
-          <label className="presales-gallery__check"><input type="checkbox" checked={Boolean(checked[currentCheckKey])} onChange={event => setChecked(previous => ({ ...previous, [currentCheckKey]: event.target.checked }))} />已人工核对第 {page.number} 页{versionRole(page, version!)}修订 {version!.revision}（仅此版本）</label>
-          <button type="button" className="presales-gallery__primary" disabled={!canApprove || Boolean(pending[actionKey(page.id, 'approve')])} onClick={() => doVersionAction('approve', onApprove)}>批准此版本</button></div>
+          <label className="presales-gallery__check"><input type="checkbox" disabled={readOnly} checked={Boolean(checks?.content)} onChange={event => setChecked(previous => ({ ...previous, [currentCheckKey]: { ...previous[currentCheckKey], content: event.target.checked } }))} />已核对第 {page.number} 页修订 {version!.revision}：内容与页面规格一致</label>
+          <label className="presales-gallery__check"><input type="checkbox" disabled={readOnly} checked={Boolean(checks?.visual)} onChange={event => setChecked(previous => ({ ...previous, [currentCheckKey]: { ...previous[currentCheckKey], visual: event.target.checked } }))} />已核对第 {page.number} 页修订 {version!.revision}：视觉与设计方案一致</label>
+          <button type="button" className="presales-gallery__primary" disabled={readOnly || !canApprove || Boolean(pending[actionKey(page.id, 'approve')])} onClick={() => doVersionAction('approve', checkedRef => {
+            const confirmed = checked[currentCheckKey];
+            if (!confirmed?.content || !confirmed.visual) throw new Error('请分别确认内容与视觉');
+            return onApprove(checkedRef, { contentChecked: confirmed.content, visualChecked: confirmed.visual });
+          })}>批准此版本</button></div>
           {errors[`feedback:${feedbackId}`] && <p role="alert">{errors[`feedback:${feedbackId}`]}。输入已保留。</p>}
         </section>}
         {Object.entries(errors).filter(([key, value]) => value && !key.startsWith('feedback:') &&

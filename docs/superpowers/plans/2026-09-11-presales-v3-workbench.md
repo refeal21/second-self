@@ -297,7 +297,22 @@ The following shared contract is implemented by sequential reviewed Tasks 3c1 an
 - [ ] **Step 3: Implement protocol-backed image provider and immutable result resolution.** Each job has separate thread/turn identity. Use only verified input and completion formats. Distinguish completed-without-image, image failure, usage limit and unknown outcome. Persist identity before observing completion, never retry uncertain provider calls as new generations.
 - [ ] **Step 4: Run captured-protocol/fake-provider tests and record any unverified live capability; commit `feat: connect queue jobs to capability-checked Codex images`.**
 
-### Task 6: Multi-page gallery, history, feedback and paired presales editing
+### Task 6a: Independent multi-page gallery presentation
+
+**Files/ownership:** New files only under `apps/desktop/src/presales/gallery/`. Do not edit App routing, shared DTOs/adapters, prompt builders, Rust, Worker, package configuration or other tasks' files. Reuse existing React/components/styles by read-only imports where appropriate.
+
+**Interfaces:** A small explicit presentation model and callback interface supplied by a host, not a second workflow authority or invented native command. Inputs contain ordered pages, exact page/version/image identity and revisions, active delivery selection, historical versions/missing-resource reasons, saved keyed feedback, page-specific job/action eligibility, shared queue settings and capability reasons. The host owns authoritative reconciliation and persistence; Task 6b maps real native DTOs/commands into it.
+
+- Implement a Chinese gallery/review surface with independently selected page/history, current-delivery badge, optional feedback, separate generate/edit/adopt/restore/approve actions, exact-version manual checks, per-page/action pending state and persistent-feedback callbacks. Other pages remain operable while one page generates or awaits a command. Manual revisions have no UI count ceiling; new drafts are never auto-submitted.
+- Gallery input updates must not jump selection, clear unrelated feedback, auto-adopt history or auto-check approval. Save/conflict errors retain typed text; expose dirty-state callback for Task 6b's existing navigation guard. Support saved feedback restored after unmount/remount by the supplied host data; do not claim native persistence until integration.
+- Add multi-selection, generate-all-missing, explicit batch/replacement confirmation, concurrency 1–4, pause and narrowly gated job actions. Unknown/cancel-unconfirmed work has a reason, never an automatic retry. Historical missing images remain inspectable as metadata; unsupported reference/edit actions explain their capability limit. File paths/tokens are never accepted as native selection authority by the component.
+- Load selected preview/visible thumbnails through an injected image loader, with immutable identity/SHA cache keys, bounded caching, stale-promise rejection and IntersectionObserver/lazy behavior. Never eagerly decode all historical images. Keep technical JSON/hashes secondary, not the review surface.
+- **TDD/QA:** Inject deferred callbacks and authoritative synthetic updates. Cover A running/B candidate/C queued; approve/edit B while A runs; history inspection versus explicit adoption/restoration; feedback save/error/conflict and reload; five manual revisions without a ceiling; missing images; no offscreen image load; batch confirmation and disabled reasons. Run focused component tests, typecheck and rendered browser QA at desktop and a narrow desktop viewport. Browser plugin absent: use the established muted Playwright, memory-fulfilled artificial origin with all other requests aborted, no local HTTP server or native/provider calls. Keep screenshots/temporary browser script outside source as prescribed by the frontend testing skill.
+- Commit only owned gallery files after the controller's commit gate. Report component/presentation evidence, not native/runtime/whole-product completion. This task can run independently alongside later backend work because it neither reads nor writes their mutable implementation contracts. Task 6b consumes this gallery rather than rebuilding it.
+
+### Task 6b: Multi-page integration, native history/feedback and paired presales editing
+
+Task 6b retains the full Task 6 user-facing contract below. Reuse the reviewed Task 6a presentation and tests, then implement actual native adapter/read-model, tagged routes, persistence, event reconciliation, copy UI and paired authoring. Synthetic gallery callbacks do not count as these integrations.
 
 **Files:**
 - Create `apps/desktop/src/presales/{adapter,read-model,workspace,feedback-editor}.ts[x]` with focused tests/styles.

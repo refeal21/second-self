@@ -245,7 +245,7 @@ The following shared contract is implemented by sequential reviewed Tasks 3c1 an
 
 **Files:**
 - Create `apps/desktop/src-tauri/src/presales_v3/{commands,supervisor}.rs`, `apps/worker/src/presales/runtime.ts`.
-- Extend Task 3's dedicated native-owned Worker host and reuse `CodexAppServerProcess` in a separate supervisor-owned instance; no v3 authority or image bytes go through legacy WebView raw stdout/send/restart commands. Add a Worker AppServerTransport proxy over private correlated messages as needed.
+- Implement the dedicated native-owned Worker host and its private correlated provider boundary; no v3 authority or image bytes go through legacy WebView raw stdout/send/restart commands. Task 5 owns the actual separate supervisor-owned `CodexAppServerProcess` consumer and Worker AppServerTransport proxy together with the common validated provider adapter; do not add a dormant unused Codex owner here merely to satisfy a future seam.
 - Modify `lib.rs`, `tauri_worker.rs`, Worker `sidecar-cli.ts`, `sidecar-rpc.ts`, protocol contracts and tests.
 - Test `apps/worker/src/presales/runtime.test.ts`, native `tests/presales_v3_supervisor.rs` and actual process harness.
 
@@ -276,11 +276,13 @@ The following shared contract is implemented by sequential reviewed Tasks 3c1 an
 
 **Files:**
 - Modify `apps/worker/src/{app-server,codex-image-turn}.ts` and `apps/worker/src/presales/runtime.ts`.
+- Extend Task 4's private native supervisor/Worker protocol and `codex_process.rs` with the genuine dedicated v3 Codex process owner and correlated AppServerTransport proxy. Legacy start/send/stop/reconnect must not address it; share the existing account, never its frontend-owned process lifetime. No Codex spawn is needed before this task's actual adapter exists. Verify isolation, bounded UTF-8 frames, identity-before-completion and owned-process shutdown with synthetic child processes, not a dormant or fake production caller.
 - Create `apps/worker/src/presales/image-provider.ts` and focused tests.
 - Document actual supported protocol in `docs/presales-image-provider.md`.
 
 **Interfaces:**
 - Consume persisted QueueTarget and resolved immutable parent/reference paths from native artifact authority; provide runtime image runner with start identity, progress, cancellation evidence and PNG bytes.
+- Supply the actual outline/details text runner to the same Task 4 provider boundary using Task 3d's captured whole-pair prompt, bounded complete-envelope output and identity/progress/cancel/result callbacks. It uses the same account-route guard, native FIFO/slots/epoch and dedicated provider owner as images, not a second scheduler or the legacy bare-output writer.
 - Produce capability `{ generation: boolean, referenceEditing: boolean, reason?: string }`. Capability is not inferred merely from a Pro account.
 - V3 uses a documented stock ChatGPT-account route policy, not merely a provider-ID check. Validate account/auth requirement, pin the dedicated child and thread to the built-in provider/model, reject known custom/ambiguous route configuration privately, and invalidate capability leases on account updates/restarts before further dispatch. Per-child removal of credential override variables must not read/log their values or remove normal proxy/CA configuration. Do not change shared login, forced-login settings, credential storage or CODEX_HOME. `allowProviderModelFallback:false` controls model choice, not billing; never invent endpoint-attestation fields or claim live route verification from fake tests. See task-5-route-map.md for installed-schema limits and guard options.
 - Actual parent/reference localImage inputs and selected-model image modality are necessary for reference actions; no hashes-only substitute or silent text-only fallback. Keep protocol-contract support distinct from live-unverified reference influence, and keep unsupported actions explicitly gated.

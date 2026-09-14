@@ -848,6 +848,55 @@ fn verified_png_survives_staging_database_failure_and_saves_without_a_new_claim(
 }
 
 #[test]
+fn completed_invalid_text_failure_releases_capacity_and_preserves_cancel_abandon_precedence() {
+    let f = Fixture::new(5);
+    let s = f.service();
+    s.set_queue_settings(1, false).unwrap();
+    let epoch = s.begin_queue_runtime().unwrap();
+    for (index, state) in ["running", "cancel", "abandon"].iter().enumerate() {
+        let d = super::draft_tests::imported(&f, &s);
+        let id = format!("invalid-text-{index}");
+        s.request_text_authoring(RequestTextAuthoring {
+            project_id: d.summary.project_id,
+            expected_revision: 1,
+            operation_id: id.clone(),
+            attempt_id: format!("invalid-attempt-{index}"),
+            stage: V3TextStage::Outline,
+        })
+        .unwrap();
+        let work = s.claim_queue_work(epoch).unwrap().unwrap();
+        let provider = TextProviderIdentity {
+            thread_id: format!("t-{index}"),
+            turn_id: Some(format!("completed-{index}")),
+        };
+        s.provider_identity(epoch, &work, provider.clone()).unwrap();
+        assert_eq!(s.queue_snapshot().unwrap().remote_active, 1);
+        if *state != "running" {
+            s.cancel_text_authoring(&id, false).unwrap();
+        }
+        if *state == "abandon" {
+            s.cancel_text_authoring(&id, true).unwrap();
+        }
+        s.terminal_work(
+            epoch,
+            &work,
+            provider,
+            &json!({"kind":"failed","error":"Completed text failed validation: invalid JSON"}),
+        )
+        .unwrap();
+        assert_eq!(s.queue_snapshot().unwrap().remote_active, 0);
+        assert_eq!(
+            s.text_operation(&id).unwrap().status,
+            match *state {
+                "cancel" => V3TextStatus::Cancelled,
+                "abandon" => V3TextStatus::Abandoned,
+                _ => V3TextStatus::Failed,
+            }
+        );
+    }
+}
+
+#[test]
 fn only_correlated_terminal_provider_evidence_releases_uncertain_text_slot() {
     let f = Fixture::new(5);
     let s = f.service();

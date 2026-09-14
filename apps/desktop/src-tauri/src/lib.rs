@@ -53,6 +53,7 @@ pub fn run() {
             presales_v3::commands::presales_v3_queue,
             presales_v3::commands::presales_v3_read_image,
             presales_v3::commands::presales_v3_enqueue,
+            presales_v3::commands::presales_v3_reconcile_image_admission,
             presales_v3::commands::presales_v3_settings,
             presales_v3::commands::presales_v3_save_pair,
             presales_v3::commands::presales_v3_approve_pair,

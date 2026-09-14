@@ -31,6 +31,8 @@ export interface V3TextOperation { sequence: number; operationId: string; attemp
 export interface V3PreparedCopy { preparationId: string; sourceProjectId: string; sourceRevision: number; kind: V3Kind; destination: V3Summary; reasons: string[] }
 export interface V3PageRequest { slideId: string; requestId: string; attemptId: string; expectedRevision: number; parentVersionId: string | null; feedback: string }
 export interface V3EnqueueOutcome { jobs: Array<{ requestId: string; target: { projectId: string; slideId: string } }>; reusedRequestIds: string[] }
+export interface V3EnqueueInput { projectId: string; batchId: string; pages: V3PageRequest[] }
+export type V3ImageAdmissionResolution = { kind: 'admitted'; input: V3EnqueueInput; outcome: V3EnqueueOutcome } | { kind: 'withdrawn'; input: V3EnqueueInput };
 export interface PresalesAdapter {
   delivery(projectId: string): Promise<V3DeliveryPreparation>;
   list(): Promise<V3CatalogEntry[]>; load(projectId: string): Promise<V3Project>; queue(): Promise<V3QueueSnapshot>;
@@ -38,6 +40,7 @@ export interface PresalesAdapter {
   prepareCopy(sourceProjectId: string, mode: 'format_copy' | 'presales_content_revision'): Promise<V3PreparedCopy>;
   publishCopy(preparationId: string): Promise<V3Project>; discardCopy(preparationId: string): Promise<void>;
   enqueue(projectId: string, batchId: string, pages: V3PageRequest[]): Promise<V3EnqueueOutcome>;
+  reconcileImageAdmission(input: V3EnqueueInput): Promise<V3ImageAdmissionResolution>;
   settings(concurrency: number, paused: boolean): Promise<V3QueueSnapshot['settings']>;
   saveFeedback(input: { projectId: string; slideId: string; baseVersionId: string | null; expectedRevision: number; text: string }): Promise<V3Feedback>;
   approveVersion(input: { projectId: string; slideId: string; versionId: string; imageSha256: string; basis: V3Basis; expectedRevision: number; contentChecked: true; visualChecked: true }): Promise<V3Approval>;
@@ -65,6 +68,7 @@ export function createPresalesAdapter(): PresalesAdapter {
     prepareCopy: (sourceProjectId, mode) => call('prepare_copy', { input: { sourceProjectId, mode } }),
     publishCopy: preparationId => call('publish_copy', { preparationId }), discardCopy: preparationId => call('discard_copy', { preparationId }),
     enqueue: (projectId, batchId, pages) => call('enqueue', { input: { projectId, batchId, pages } }),
+    reconcileImageAdmission: input => call('reconcile_image_admission', { input }),
     settings: (concurrency, paused) => call('settings', { concurrency, paused }),
     saveFeedback: input => call('save_feedback', { input }), approveVersion: input => call('approve_version', { input }),
     adoptVersion: input => call('adopt_version', { input }), restoreApproval: input => call('restore_approval', { input }),

@@ -4,7 +4,7 @@ import { act, cleanup, render, screen, waitFor, within } from '@testing-library/
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PresalesWorkspacePage } from './workspace.js';
-import type { PresalesAdapter, V3PageRequest, V3Project, V3QueueSnapshot } from './adapter.js';
+import type { PresalesAdapter, V3EnqueueInput, V3PageRequest, V3Project, V3QueueSnapshot } from './adapter.js';
 import { createPresalesAdapter } from './adapter.js';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -19,6 +19,113 @@ const queue = { dispatchAvailable: true, settings: { concurrency: 4, paused: fal
 function adapter() { return { load: vi.fn(async () => project), queue: vi.fn(async () => queue), subscribe: vi.fn(() => () => {}), readImage: vi.fn(async () => ({ mimeType: 'image/png', base64: 'aGVsbG8=' })), approveVersion: vi.fn(async () => ({ approvalId: 'approved', versionId: 'b-v1', imageSha256: 'hash-b', basis, decidedAt: 'today' })), saveFeedback: vi.fn(async input => ({ baseVersionId: input.baseVersionId, text: input.text, revision: 1, updatedAt: 'today' })) } as unknown as PresalesAdapter; }
 
 describe('native presales workspace', () => {
+  it('releases a native-withdrawn in-flight admission and ignores its late reply after a newer submission', async () => {
+    const user = userEvent.setup(); const api = adapter();
+    const state = structuredClone(project);
+    if (state.kind !== 'frozen') throw new Error('wrong kind');
+    state.project.summary.projectId = 'late-withdrawn';
+    vi.mocked(api.load).mockImplementation(async () => structuredClone(state));
+    vi.mocked(api.queue).mockResolvedValue({ ...queue, jobs: [] });
+    const releases: (() => void)[] = [];
+    api.enqueue = vi.fn(async () => { await new Promise<void>(resolve => releases.push(resolve)); throw new Error('late withdrawn reply'); });
+    api.reconcileImageAdmission = vi.fn(async (input: V3EnqueueInput) => ({ kind: 'withdrawn' as const, input }));
+    render(<PresalesWorkspacePage adapter={api} projectId="late-withdrawn" initialPageId="b" onDirtyChange={vi.fn()} />);
+    const submit = async () => {
+      await user.click(await screen.findByRole('button', { name: '生成新稿' }));
+      await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    };
+    await submit();
+    await user.click(screen.getByRole('button', { name: '重新核对状态' }));
+    await user.click(await screen.findByRole('button', { name: '核对并撤回未入队请求' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled());
+    await submit();
+    expect(api.enqueue).toHaveBeenCalledTimes(2);
+    await act(async () => releases[0]!());
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: '核对并撤回未入队请求' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled());
+    await act(async () => releases[1]!());
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+    expect(screen.queryByText(/late withdrawn reply/)).not.toBeInTheDocument();
+    expect(api.enqueue).toHaveBeenCalledTimes(2);
+  });
+  it.each(['retry', 'withdraw', 'reuse', 'reconcile-reuse'])('recovers image admission with exact stable batch input and native proof: %s', async mode => {
+    const user = userEvent.setup(); const api = adapter();
+    const state = structuredClone(project);
+    if (state.kind !== 'frozen') throw new Error('wrong kind');
+    const id = `admission-${mode}`;
+    state.project.summary.projectId = id;
+    let jobs: V3QueueSnapshot['jobs'] = [];
+    vi.mocked(api.load).mockImplementation(async () => structuredClone(state));
+    vi.mocked(api.queue).mockImplementation(async () => ({ ...queue, jobs }));
+    let original: { projectId: string; batchId: string; pages: V3PageRequest[] };
+    api.enqueue = vi.fn(async (projectId, batchId, pages) => {
+      if (!original) original = structuredClone({ projectId, batchId, pages });
+      if (mode !== 'reuse' && vi.mocked(api.enqueue).mock.calls.length === 1) {
+        state.project.pages[1]!.revision = 9;
+        state.project.pages[1]!.feedbackDrafts = [{ baseVersionId: null, text: 'Changed after original submit', revision: 1, updatedAt: 'today' }];
+        throw new Error('native rejected or reply lost');
+      }
+      const requestId = mode === 'reuse' ? 'native-existing-job' : pages[0]!.requestId;
+      jobs = [{ kind: 'image', requestId, projectId, slideId: 'b', status: 'succeeded', sequence: 1, error: null }];
+      return { jobs: [{ requestId, target: { projectId, slideId: 'b' } }], reusedRequestIds: mode === 'reuse' ? [requestId] : [] };
+    });
+    api.reconcileImageAdmission = vi.fn(async (input: V3EnqueueInput) => {
+      if (mode === 'reconcile-reuse') {
+        jobs = [{ kind: 'image', requestId: 'resolved-native-job', projectId: id, slideId: 'b', status: 'succeeded', sequence: 1, error: null }];
+        return { kind: 'admitted' as const, input, outcome: { jobs: [{ requestId: 'resolved-native-job', target: { projectId: id, slideId: 'b' } }], reusedRequestIds: ['resolved-native-job'] } };
+      }
+      return { kind: 'withdrawn' as const, input };
+    });
+    render(<PresalesWorkspacePage adapter={api} projectId={id} initialPageId="b" onDirtyChange={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: '生成新稿' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    await waitFor(() => expect(api.enqueue).toHaveBeenCalledTimes(1));
+    if (mode === 'retry') {
+      await user.click(await screen.findByRole('button', { name: '用原图片请求重试确认' }));
+      await waitFor(() => expect(api.enqueue).toHaveBeenCalledTimes(2));
+      expect(vi.mocked(api.enqueue).mock.calls[1]).toEqual(vi.mocked(api.enqueue).mock.calls[0]);
+    } else if (mode === 'withdraw' || mode === 'reconcile-reuse') {
+      await user.click(await screen.findByRole('button', { name: '核对并撤回未入队请求' }));
+      await waitFor(() => expect(api.reconcileImageAdmission).toHaveBeenCalledWith(original));
+      expect(api.enqueue).toHaveBeenCalledTimes(1);
+    }
+    await waitFor(() => expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled());
+    expect(screen.queryByRole('button', { name: '用原图片请求重试确认' })).not.toBeInTheDocument();
+  });
+  it('adopts and restores an imported null-basis original after a newer candidate, then requests its actual parent image', async () => {
+    const user = userEvent.setup(); const api = adapter();
+    const state = structuredClone(project);
+    if (state.kind !== 'frozen') throw new Error('wrong kind');
+    state.project.summary.projectId = 'imported-actions';
+    const imported = state.project.pages[1]!;
+    const original = imported.versions[0]!;
+    original.basis = null;
+    original.requestId = null;
+    original.attemptId = null;
+    original.provenance = { kind: 'legacyImported', originDigest: 'digest', sourceVersionId: 'legacy-original', originalVisual: {}, originalApproval: {} };
+    const origin = { referenceId: 'origin-approval', versionId: original.versionId, image: original.image! } as NonNullable<typeof imported.originApproval>;
+    imported.originApprovals = [origin];
+    imported.versions.push({ ...original, versionId: 'new-candidate', sequence: 2, requestId: 'new-request', attemptId: 'new-attempt', basis, provenance: { kind: 'presales' }, image: { assetId: 'new-image', sha256: 'new-hash' } });
+    imported.currentVersionId = 'new-candidate';
+    vi.mocked(api.load).mockImplementation(async () => structuredClone(state));
+    vi.mocked(api.queue).mockResolvedValue({ ...queue, jobs: [] });
+    api.adoptVersion = vi.fn(async () => { imported.currentVersionId = original.versionId; imported.revision++; return imported; });
+    api.restoreApproval = vi.fn(async () => { imported.originApproval = origin; imported.revision++; return imported; });
+    api.enqueue = vi.fn(async (_id: string, _batch: string, pages: V3PageRequest[]) => ({ jobs: pages.map(page => ({ requestId: page.requestId, target: { projectId: 'imported-actions', slideId: page.slideId } })), reusedRequestIds: [] }));
+    render(<PresalesWorkspacePage adapter={api} projectId="imported-actions" initialPageId="b" onDirtyChange={vi.fn()} />);
+    await user.click(await screen.findByRole('button', { name: /查看原项目对照 修订 1/ }));
+    await user.click(screen.getByRole('button', { name: '选择用于交付' }));
+    await waitFor(() => expect(api.adoptVersion).toHaveBeenCalledWith({ projectId: 'imported-actions', slideId: 'b', versionId: 'b-v1', expectedRevision: 8 }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '恢复此前批准' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '恢复此前批准' }));
+    await waitFor(() => expect(api.restoreApproval).toHaveBeenCalledWith({ projectId: 'imported-actions', slideId: 'b', versionId: 'b-v1', expectedRevision: 9 }));
+    await waitFor(() => expect(screen.getByText(/查看原项目对照 修订 1 · 当前交付/)).toBeVisible());
+    expect(api.approveVersion).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '编辑此版本' }));
+    await waitFor(() => expect(api.enqueue).toHaveBeenCalledWith('imported-actions', expect.any(String), [expect.objectContaining({ slideId: 'b', parentVersionId: 'b-v1', expectedRevision: 10 })]));
+    expect(original.basis).toBeNull();
+  });
   it('renders the exact native snapshot unsupported outcome through the real adapter and keeps PNG/history available', async () => {
     const user = userEvent.setup(); const api = adapter();
     const native = { snapshotId: 'delivery-v3-18', projectId: 'v3', revision: 18, createdAt: 'today', pages: [{ slideId: 'b', versionId: 'b-v2', image: { assetId: 'asset-b-v2', sha256: 'hash-b-v2' }, approvalId: 'approval-v2' }] };

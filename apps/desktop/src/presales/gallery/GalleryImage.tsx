@@ -23,16 +23,16 @@ export function GalleryImage({ image, loadImage, alt, priority = false }: {
     if (!ref.current || typeof IntersectionObserver === 'undefined') return;
     let active = true;
     const observer = new IntersectionObserver((entries) => {
-      if (active && entries.some((entry) => entry.isIntersecting)) { setVisibleKey(key); observer.disconnect(); }
+      if (active) setVisibleKey(entries.some((entry) => entry.isIntersecting) ? key : null);
     });
     observer.observe(ref.current);
     return () => { active = false; observer.disconnect(); };
   }, [key, priority]);
   useEffect(() => {
-    if (!visible) return;
+    if (!visible) { setResult(null); return; }
     let active = true;
     const cached = cache.get(key);
-    if (cached) { setResult({ key, src: cached }); return; }
+    if (cached) { cache.delete(key); cache.set(key, cached); setResult({ key, src: cached }); return; }
     setResult(null);
     void loadImage(image).then((src) => {
       if (!active) return;
@@ -44,7 +44,7 @@ export function GalleryImage({ image, loadImage, alt, priority = false }: {
     return () => { active = false; };
   }, [key, visible, image, loadImage]);
   return <div ref={ref} className="presales-gallery__image">
-    {result?.key === key && result.src ? <img src={result.src} alt={alt} loading={priority ? 'eager' : 'lazy'} />
+    {visible && result?.key === key && result.src ? <img src={result.src} alt={alt} loading={priority ? 'eager' : 'lazy'} />
       : <span>{result?.key === key && result.error ? result.error : visible ? '预览载入中…' : '滚动到此处载入预览'}</span>}
   </div>;
 }

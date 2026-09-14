@@ -85,9 +85,17 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
   function reconcileGenerationFences(current: GalleryModel) {
     let changed = false;
     for (const [id, fence] of generationPendingRef.current) {
-      if (fence.phase === 'submitting' || !fence.requestId) continue;
       const currentPage = current.pages.find(item => item.id === id);
-      if (currentPage && ((currentPage.job.state !== 'idle' && currentPage.job.requestId === fence.requestId) || currentPage.observedRequestIds?.includes(fence.requestId) ||
+      if (!fence.requestId && currentPage?.pendingAdmissionRequestId) fence.requestId = currentPage.pendingAdmissionRequestId;
+      if (!fence.requestId) continue;
+      const resolved = currentPage?.admissionResolutions?.find(item => item.submittedRequestId === fence.requestId);
+      if (resolved?.actualRequestId === null) {
+        generationPendingRef.current.delete(id);
+        changed = true;
+        continue;
+      }
+      if (resolved?.actualRequestId) fence.requestId = resolved.actualRequestId;
+      if (currentPage && ((!currentPage.pendingAdmissionRequestId && currentPage.job.state !== 'idle' && currentPage.job.requestId === fence.requestId) || currentPage.observedRequestIds?.includes(fence.requestId) ||
         currentPage.versions.some(item => item.requestId === fence.requestId))) {
         generationPendingRef.current.delete(id);
         changed = true;
@@ -111,7 +119,11 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
   }
   function runGeneration(ids: string[], key: string, work: () => Promise<GalleryGenerationReceipt>) {
     if (ids.some(id => generationPendingRef.current.has(id))) return;
-    for (const id of ids) generationPendingRef.current.set(id, { phase: 'submitting', requestId: null });
+    const owned = new Map<string, GenerationFence>();
+    for (const id of ids) {
+      const fence: GenerationFence = { phase: 'submitting', requestId: null };
+      generationPendingRef.current.set(id, fence); owned.set(id, fence);
+    }
     syncGenerationFences();
     setErrors(previous => ({ ...previous, [key]: '' }));
     void (async () => {
@@ -120,6 +132,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         const missing: string[] = [];
         const definite: string[] = [];
         for (const id of ids) {
+          if (generationPendingRef.current.get(id) !== owned.get(id)) continue;
           const requestId = receipt?.requestIds?.[id];
           if (typeof requestId === 'string' && requestId.trim()) generationPendingRef.current.set(id, { phase: 'awaiting-sync', requestId });
           else if (receipt?.notSubmitted?.[id]) { generationPendingRef.current.delete(id); definite.push(receipt.notSubmitted[id]); }
@@ -130,7 +143,9 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         else if (definite.length) setErrors(previous => ({ ...previous, [key]: `提交前校验未通过：${definite.join('；')}` }));
         reconcileGenerationFences(modelRef.current);
       } catch (error) {
-        for (const id of ids) generationPendingRef.current.set(id, { phase: 'outcome-unknown', requestId: null });
+        const stillOwned = ids.filter(id => generationPendingRef.current.get(id) === owned.get(id));
+        if (!stillOwned.length) return;
+        for (const id of stillOwned) generationPendingRef.current.set(id, { phase: 'outcome-unknown', requestId: owned.get(id)?.requestId ?? null });
         syncGenerationFences();
         setErrors(previous => ({ ...previous, [key]: `${explain(error)}；提交结果待确认，请核对任务列表，暂不重复提交。` }));
       }

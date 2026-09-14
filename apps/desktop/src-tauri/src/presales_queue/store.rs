@@ -594,7 +594,7 @@ fn validate_target(target: &QueueTarget) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn validate_identifier(value: &str, field: &str) -> Result<(), String> {
+pub(crate) fn validate_identifier(value: &str, field: &str) -> Result<(), String> {
     let bytes = value.as_bytes();
     if bytes.is_empty()
         || bytes.len() > 64

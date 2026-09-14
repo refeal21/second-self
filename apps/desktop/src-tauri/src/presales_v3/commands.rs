@@ -75,6 +75,19 @@ pub(crate) async fn presales_v3_enqueue(
     .await
 }
 #[tauri::command]
+pub(crate) async fn presales_v3_reconcile_image_admission(
+    service: State<'_, Arc<V3WorkbenchService>>,
+    input: EnqueuePages,
+) -> Result<ImageAdmissionResolution, String> {
+    run(&service, move |s| {
+        s.store
+            .lock()
+            .map_err(|_| "v3 store lock poisoned")?
+            .reconcile_image_admission(input)
+    })
+    .await
+}
+#[tauri::command]
 pub(crate) async fn presales_v3_settings(
     service: State<'_, Arc<V3WorkbenchService>>,
     host: State<'_, QueueSupervisor>,

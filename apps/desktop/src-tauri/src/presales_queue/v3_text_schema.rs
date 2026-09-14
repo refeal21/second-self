@@ -58,9 +58,12 @@ pub(super) fn upgrade(connection: &mut Connection) -> Result<(), String> {
     for object in OBJECTS {
         tx.execute(object.sql, []).map_err(message)?;
     }
+    for object in v3_withdrawal_schema::OBJECTS {
+        tx.execute(object.sql, []).map_err(message)?;
+    }
     #[cfg(test)]
     v3_schema_upgrade::failure_point("text_after_ddl")?;
     verify_schema(&user_schema_objects(&tx)?, DatabaseProfile::PresalesV3)?;
-    tx.pragma_update(None, "user_version", 3).map_err(message)?;
+    tx.pragma_update(None, "user_version", 4).map_err(message)?;
     tx.commit().map_err(message)
 }

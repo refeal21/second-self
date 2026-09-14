@@ -42,7 +42,7 @@ pub(super) fn receipt_on(connection: &Connection, project: &str) -> Result<Impor
         FILE_LIMIT,
     )?
     .ok_or("immutable import receipt missing")?;
-    if disk.bytes != raw.as_bytes() || encode(&r)? != raw {
+    if disk.bytes != raw.as_bytes() || !matches_receipt_encoding(&r, &raw)? {
         return Err("immutable import receipt differs".into());
     }
     let rows = read_envelope(&r, &verify_asset(&root, &r.evidence)?)?;
@@ -184,6 +184,43 @@ pub(super) fn receipt_on(connection: &Connection, project: &str) -> Result<Impor
         return Err("nonfrozen import cannot invent page basis".into());
     }
     Ok(r)
+}
+
+/// Accept exactly the two derived-Serialize representations shipped for v1
+/// receipts. The old serializer omitted each page's final empty references
+/// field; the frontend DTO now includes it. No arbitrary JSON normalization,
+/// raw byte rewriting, or differences in any other field are permitted.
+fn matches_receipt_encoding(receipt: &ImportReceipt, raw: &str) -> Result<bool, String> {
+    let current = encode(receipt)?;
+    if current == raw {
+        return Ok(true);
+    }
+    let mut historical_pages = Vec::new();
+    for page in &receipt.pages {
+        if !page.references.is_empty() {
+            return Ok(false);
+        }
+        let page_json = encode(page)?;
+        let Some(prefix) = page_json.strip_suffix(",\"references\":[]}") else {
+            return Ok(false);
+        };
+        historical_pages.push(format!("{prefix}}}"));
+    }
+    // Restrict substitution to the receipt's actual final pages/reasons fields,
+    // never matching similarly named fields inside pipeline/source evidence.
+    let reasons = encode(&receipt.reasons)?;
+    let suffix = format!(
+        "\"pages\":{},\"reasons\":{reasons}}}",
+        encode(&receipt.pages)?
+    );
+    let Some(prefix) = current.strip_suffix(&suffix) else {
+        return Ok(false);
+    };
+    Ok(raw
+        == format!(
+            "{prefix}\"pages\":[{}],\"reasons\":{reasons}}}",
+            historical_pages.join(",")
+        ))
 }
 
 pub(super) fn load_on(

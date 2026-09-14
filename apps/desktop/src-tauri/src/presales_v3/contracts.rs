@@ -99,6 +99,18 @@ pub struct EnqueuePages {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImageAdmissionResolution {
+    Admitted {
+        input: EnqueuePages,
+        outcome: crate::presales_queue::EnqueueOutcome,
+    },
+    Withdrawn {
+        input: EnqueuePages,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PageRequest {
     pub slide_id: String,

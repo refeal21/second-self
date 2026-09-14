@@ -71,10 +71,12 @@ fn current_schema_has_closed_text_operations_and_exact_v2_upgrade_preserves_rows
     assert_eq!(
         c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
-    c.execute_batch("DROP TABLE v3_text_operations; PRAGMA user_version=2")
-        .unwrap();
+    c.execute_batch(
+        "DROP TABLE v3_admission_withdrawals; DROP TABLE v3_text_operations; PRAGMA user_version=2",
+    )
+    .unwrap();
     let before: String = c
         .query_row("SELECT draft_json FROM v3_draft_projects", [], |r| r.get(0))
         .unwrap();
@@ -94,7 +96,7 @@ fn current_schema_has_closed_text_operations_and_exact_v2_upgrade_preserves_rows
     assert_eq!(
         c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     assert!(c.execute("INSERT INTO v3_text_operations(sequence,operation_id,attempt_id,project_id,stage,expected_draft_revision,target_json,target_sha256,status,created_at_ms,updated_at_ms) VALUES(1,'x','y','missing','made-up',1,'{}',?1,'queued',1,1)",["a".repeat(64)]).is_err());
 }
@@ -347,8 +349,10 @@ fn additive_migration_rolls_back_all_new_objects_and_preserves_unresolved_activi
     drop(s);
     let path = f.root.path().join("presales-v3.sqlite3");
     let c = rusqlite::Connection::open(&path).unwrap();
-    c.execute_batch("DROP TABLE v3_text_operations; PRAGMA user_version=2")
-        .unwrap();
+    c.execute_batch(
+        "DROP TABLE v3_admission_withdrawals; DROP TABLE v3_text_operations; PRAGMA user_version=2",
+    )
+    .unwrap();
     c.execute(
         "INSERT INTO v3_legacy_activity VALUES('opaque-unresolved','original unchanged evidence')",
         [],

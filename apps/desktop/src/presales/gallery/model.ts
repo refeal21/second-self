@@ -32,6 +32,9 @@ export interface GalleryPage {
   job: GalleryJob;
   /** All exact native image-job IDs for this page, independent of the newest display job. */
   observedRequestIds?: readonly string[];
+  /** Native exact-batch admission/reuse or durable non-admission proof. */
+  admissionResolutions?: readonly { submittedRequestId: string; actualRequestId: string | null }[];
+  pendingAdmissionRequestId?: string;
   /** null permits an action; a string explains why the host forbids it. */
   eligibility: Record<GalleryAction, string | null>;
   /** Native page-scoped review fence, separate from immutable version sequence. */

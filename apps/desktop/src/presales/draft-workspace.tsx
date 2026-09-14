@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { OutlineEditor } from '../outline-editor.js';
 import { DetailEditor } from '../detail-editor.js';
+import { PairedDesignEditor } from './paired-design-editor.js';
 import { detailDocumentError } from '../detail-document.js';
 import { parseVisualStyleProfile, type VisualStyleProfile } from '../../../worker/src/visual-style.js';
 import { parseOutlineEnvelope, parseDetailsEnvelope } from '../../../worker/src/presales/validation.js';
@@ -157,7 +158,19 @@ export function DraftWorkspace({ adapter, project, queue, refresh, onDirtyChange
     </section>
     {approvedOutline && <section className="presales-workspace__panel"><h2>逐页细化与设计 · 联合审核</h2><p>已批准的大纲保持冻结。可见文字变化后必须重新核对绑定和设计；演讲备注永远不是页面文字。</p>
       <DetailEditor value={{ outline: saved!.draft.outline.outline, specs: details.specs }} analysis={analysis} sources={sources} readOnly={approvedDetails} disabled={Boolean(pending)} onChange={next => { if (JSON.stringify(next.outline) !== JSON.stringify(saved!.draft.outline.outline)) { setError('已批准大纲不可修改；请保持页面 ID、顺序和标题。'); return; } setDetails(previous => ({ ...previous, specs: [...next.specs] })); setDesignReviewed(false); setDirtySections(previous => ({ ...previous, details: true })); }} />
-      {details.designs.map((design, index) => <div className="presales-workspace__row" key={design.slideId}><h3>第 {index + 1} 页设计 · {design.slideId}</h3><label>布局<input disabled={approvedDetails} value={design.layout} onChange={event => { setDetails(previous => ({ ...previous, designs: previous.designs.map((item, i) => i === index ? { ...item, layout: event.target.value } : item) })); setDirtySections(previous => ({ ...previous, details: true })); }} /></label><label>视觉重点<input disabled={approvedDetails} value={design.visualFocus} onChange={event => { setDetails(previous => ({ ...previous, designs: previous.designs.map((item, i) => i === index ? { ...item, visualFocus: event.target.value } : item) })); setDirtySections(previous => ({ ...previous, details: true })); }} /></label><label>演讲备注（不显示在页面上）<textarea disabled={approvedDetails} value={design.speakerNotes} onChange={event => { setDetails(previous => ({ ...previous, designs: previous.designs.map((item, i) => i === index ? { ...item, speakerNotes: event.target.value } : item) })); setDirtySections(previous => ({ ...previous, details: true })); }} /></label><p>可见文字绑定：{design.textBindings.map(binding => `${binding.id} → ${binding.path}`).join('、') || '尚未绑定'}</p><p>场景步骤：{design.scene?.steps.length ?? 0} · 连线：{design.scene?.edges.length ?? 0}</p><button disabled={approvedDetails} onClick={() => { const spec = details.specs[index]; if (!spec) return; setDetails(previous => ({ ...previous, designs: previous.designs.map((item, i) => i === index ? makeDesign(spec) : item) })); setDesignReviewed(false); setDirtySections(previous => ({ ...previous, details: true })); }}>按当前可见文字重建绑定（原场景清空）</button></div>)}
+      {details.designs.map((design, index) => {
+        const spec = details.specs.find(item => item.id === design.slideId);
+        const pagePlan = saved!.draft.outline.plan.pages.find(item => item.slideId === design.slideId);
+        if (!spec || !pagePlan) return <p role="alert" key={design.slideId}>页面 {design.slideId} 的内容或批准计划缺失，不能联合批准。</p>;
+        return <section className="presales-workspace__row" key={design.slideId}>
+          <h3>第 {index + 1} 页设计 · {design.slideId}</h3>
+          <PairedDesignEditor spec={spec} design={design} pagePlan={pagePlan} modules={saved!.draft.outline.plan.modules} readOnly={approvedDetails || Boolean(pending)} onChange={next => {
+            setDetails(previous => ({ ...previous, designs: previous.designs.map(item => item.slideId === design.slideId ? next : item) }));
+            setDesignReviewed(false);
+            setDirtySections(previous => ({ ...previous, details: true }));
+          }} />
+        </section>;
+      })}
       <label><input type="checkbox" disabled={approvedDetails} checked={designReviewed} onChange={event => setDesignReviewed(event.target.checked)} />已逐页重新核对设计与可见文字绑定</label>
       <div className="presales-workspace__actions"><button disabled={approvedDetails || Boolean(pending)} onClick={() => { const validation = detailDocumentError({ outline: saved!.draft.outline.outline, specs: details.specs }); if (validation) setError(validation); else void savePair('details'); }}>保存细化与设计</button><button disabled={approvedDetails || !saved?.draft.details || Boolean(pending || dirtySections.details)} onClick={() => void perform('细化与设计联合批准', () => adapter.approvePair(project.summary.projectId, project.summary.revision, 'details'))}>联合批准细化与设计</button></div>
     </section>}

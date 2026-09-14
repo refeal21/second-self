@@ -239,6 +239,111 @@ fn prepare(s: &V3WorkbenchService, f: &Fixture, mode: LegacyCopyMode) -> Prepare
 }
 
 #[test]
+fn historical_omitted_references_receipts_reopen_without_changing_immutable_bytes() {
+    for (paired, mode) in [
+        (false, LegacyCopyMode::FormatCopy),
+        (true, LegacyCopyMode::FormatCopy),
+        (true, LegacyCopyMode::PresalesContentRevision),
+    ] {
+        let f = if paired {
+            Fixture::paired(6)
+        } else {
+            Fixture::new(10)
+        };
+        let s = f.service();
+        let prepared = prepare(&s, &f, mode);
+        let copy = s.publish_legacy_copy(&prepared.preparation_id).unwrap();
+        let id = copy.summary().project_id.clone();
+        drop(s);
+        let db = rusqlite::Connection::open(f.root.path().join("presales-v3.sqlite3")).unwrap();
+        let current: String = db
+            .query_row(
+                "SELECT receipt_json FROM v3_import_receipts WHERE project_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt: super::import_evidence::ImportReceipt =
+            serde_json::from_str(&current).unwrap();
+        // Exact prior derived-Serialize representation: the final empty page
+        // field was skipped. No key reordering or generic JSON normalization.
+        assert_eq!(
+            current.matches(",\"references\":[]").count(),
+            receipt.pages.len()
+        );
+        assert!(!receipt.pages.is_empty());
+        let historical = current.replace(",\"references\":[]", "");
+        db.execute(
+            "UPDATE v3_import_receipts SET receipt_json=?1 WHERE project_id=?2",
+            rusqlite::params![historical, id],
+        )
+        .unwrap();
+        let path = f
+            .root
+            .path()
+            .join("presales-v3-assets")
+            .join(&id)
+            .join("receipt.json");
+        std::fs::write(&path, historical.as_bytes()).unwrap();
+        drop(db);
+        let reopened = f.service();
+        let loaded = reopened
+            .load_v3_project(&id)
+            .expect("intact historical receipt must reopen through the actual service");
+        assert_eq!(loaded, copy);
+        let dto = serde_json::to_value(&loaded).unwrap();
+        let pages = if loaded.kind() == V3CatalogKind::Draft {
+            &dto["project"]["comparisonPages"]
+        } else {
+            &dto["project"]["pages"]
+        };
+        assert!(pages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|page| page["references"] == json!([])));
+        assert_eq!(std::fs::read(&path).unwrap(), historical.as_bytes());
+        let db = rusqlite::Connection::open(f.root.path().join("presales-v3.sqlite3")).unwrap();
+        let after: String = db
+            .query_row(
+                "SELECT receipt_json FROM v3_import_receipts WHERE project_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, historical);
+        // Compatibility is exact, not generic lenient JSON loading. Changing
+        // unrelated identity, unknown fields, or canonical layout still fails
+        // even if BOTH durable copies contain the same altered bytes.
+        for altered in [
+            historical.replacen("\"schemaVersion\":1", "\"schemaVersion\":2", 1),
+            historical.replacen('{', "{\"unexpected\":true,", 1),
+            format!(" {historical}"),
+            historical.replacen(
+                "\"feedbackDrafts\":[]",
+                "\"feedbackDrafts\":[],\"references\":null",
+                1,
+            ),
+        ] {
+            db.execute(
+                "UPDATE v3_import_receipts SET receipt_json=?1 WHERE project_id=?2",
+                rusqlite::params![altered, id],
+            )
+            .unwrap();
+            std::fs::write(&path, altered.as_bytes()).unwrap();
+            assert!(reopened.load_v3_project(&id).is_err());
+        }
+        db.execute(
+            "UPDATE v3_import_receipts SET receipt_json=?1 WHERE project_id=?2",
+            rusqlite::params![historical, id],
+        )
+        .unwrap();
+        std::fs::write(&path, historical.as_bytes()).unwrap();
+        assert_eq!(reopened.load_v3_project(&id).unwrap(), copy);
+    }
+}
+
+#[test]
 fn real_replay_copy_preserves_origin_and_uses_distinct_repeat_copy_ids() {
     let f = Fixture::new(10);
     let s = f.service();

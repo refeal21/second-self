@@ -103,6 +103,9 @@ pub(super) fn upgrade(connection: &mut Connection) -> Result<(), String> {
         for object in v3_text_schema::OBJECTS {
             tx.execute(object.sql, []).map_err(message)?;
         }
+        for object in v3_withdrawal_schema::OBJECTS {
+            tx.execute(object.sql, []).map_err(message)?;
+        }
         verify_schema(&user_schema_objects(&tx)?, DatabaseProfile::PresalesV3)?;
         let violations = tx
             .prepare("PRAGMA foreign_key_check")
@@ -115,7 +118,7 @@ pub(super) fn upgrade(connection: &mut Connection) -> Result<(), String> {
         if violations || integrity != "ok" {
             return Err("v3 upgrade integrity verification failed".into());
         }
-        tx.pragma_update(None, "user_version", 3).map_err(message)?;
+        tx.pragma_update(None, "user_version", 4).map_err(message)?;
         #[cfg(test)]
         failure_point("before_commit")?;
         tx.commit().map_err(message)

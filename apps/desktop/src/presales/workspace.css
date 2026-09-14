@@ -16,6 +16,12 @@
 .presales-workspace__row{border-top:1px solid #e8ebf1;margin-top:12px;padding-top:12px}
 .presales-workspace__row fieldset{border:1px solid #e8ebf1;border-radius:8px}
 .presales-workspace__row fieldset label{display:inline-flex;gap:4px;margin-right:12px}
+.presales-workspace__row .presales-design-editor{min-width:0;overflow-wrap:anywhere}
+.presales-workspace__row .presales-design-editor label{display:block;margin:8px 0;min-width:0}
+.presales-design-editor select,.presales-design-editor input{min-width:0;max-width:100%}
+.presales-design-editor label>span{display:block;margin-top:6px;line-height:1.5}
+.presales-design-editor>fieldset{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px;min-width:0;margin:12px 0;padding:16px}
+@media(max-width:800px){.presales-design-editor>fieldset{grid-template-columns:minmax(0,1fr)}}
 .presales-workspace__palette{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
 .presales-workspace__palette input[type=color]{display:block;width:60px;height:36px;border:0}
 .presales-workspace [role=alert]{color:#a83c3c;background:#fff4f3;padding:10px;border-radius:8px}

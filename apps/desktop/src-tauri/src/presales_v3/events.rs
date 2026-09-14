@@ -7,16 +7,42 @@ use crate::presales_queue::{
 use rusqlite::{params, Connection, OptionalExtension};
 
 impl V3Store {
+    /// The writer lock orders this decision against both new admission and its
+    /// exact replay. A withdrawn input can never become a delayed admission.
+    pub fn reconcile_image_admission(
+        &mut self,
+        input: EnqueuePages,
+    ) -> Result<ImageAdmissionResolution, String> {
+        let encoded = validate_admission_input(&input)?;
+        write_on(&mut self.connection, |tx| {
+            let snapshot = load_on(tx, &input.project_id)?;
+            for page in &input.pages {
+                page_on(&snapshot, &page.slide_id)?;
+            }
+            if withdrawn_on(tx, &input)? {
+                return Ok(ImageAdmissionResolution::Withdrawn {
+                    input: input.clone(),
+                });
+            }
+            if let Some(outcome) = replay_on(tx, &input)? {
+                return Ok(ImageAdmissionResolution::Admitted {
+                    input: input.clone(),
+                    outcome,
+                });
+            }
+            tx.execute("INSERT INTO v3_admission_withdrawals(batch_id,project_id,input_json) VALUES (?1,?2,?3)", params![input.batch_id,input.project_id,encoded]).map_err(message)?;
+            Ok(ImageAdmissionResolution::Withdrawn {
+                input: input.clone(),
+            })
+        })
+    }
     /// Inputs name saved pages and versions. Native code owns all prompt and image evidence.
     pub fn enqueue_pages(
         &mut self,
         input: EnqueuePages,
         vault: Option<&ResultVault>,
     ) -> Result<EnqueueOutcome, String> {
-        let encoded = encode(&input)?;
-        if input.pages.is_empty() || input.pages.len() > 100 || encoded.len() > 2 * 1024 * 1024 {
-            return Err("admission requires 1..=100 pages within 2 MiB".into());
-        }
+        let encoded = validate_admission_input(&input)?;
         let (snapshot, active_pages) = {
             let tx = self.connection.unchecked_transaction().map_err(message)?;
             if let Some(outcome) = replay_on(&tx, &input)? {
@@ -129,10 +155,48 @@ impl V3Store {
     }
 }
 
+fn validate_admission_input(input: &EnqueuePages) -> Result<String, String> {
+    let encoded = encode(input)?;
+    if input.pages.is_empty() || input.pages.len() > 100 || encoded.len() > 2 * 1024 * 1024 {
+        return Err("admission requires 1..=100 pages within 2 MiB".into());
+    }
+    crate::presales_queue::store::validate_identifier(&input.batch_id, "batch_id")?;
+    let mut slides = std::collections::HashSet::new();
+    for page in &input.pages {
+        if !slides.insert(&page.slide_id) {
+            return Err("duplicate page in admission".into());
+        }
+        crate::presales_queue::store::validate_identifier(&page.request_id, "request_id")?;
+        crate::presales_queue::store::validate_identifier(&page.attempt_id, "attempt_id")?;
+    }
+    Ok(encoded)
+}
+
+fn withdrawn_on(connection: &Connection, input: &EnqueuePages) -> Result<bool, String> {
+    let saved: Option<String> = connection
+        .query_row(
+            "SELECT input_json FROM v3_admission_withdrawals WHERE batch_id=?1",
+            [&input.batch_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(message)?;
+    match saved {
+        None => Ok(false),
+        Some(saved) if decode::<EnqueuePages>(&saved)? == *input => Ok(true),
+        Some(_) => Err("batch withdrawal has different input".into()),
+    }
+}
+
 fn replay_on(
     connection: &Connection,
     input: &EnqueuePages,
 ) -> Result<Option<EnqueueOutcome>, String> {
+    // Called before expensive byte verification AND again inside the final
+    // writer transaction, closing a withdrawal during preflight.
+    if withdrawn_on(connection, input)? {
+        return Err("batch was withdrawn before admission".into());
+    }
     let original = connection
         .query_row(
             "SELECT input_json FROM v3_admissions WHERE batch_id=?1",

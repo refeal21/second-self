@@ -5,10 +5,26 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { PresalesRuntime, type RuntimeJob, type RuntimeProvider } from './runtime.js';
+import { buildPairedAuthoringPrompt } from './authoring.js';
+import { sourceAnalysis } from './fixtures.test-support.js';
+import { PRESALES_SKILL_METADATA } from './planning.js';
 
 const job = (n:number):RuntimeJob => ({kind:'image',job:{requestId:`request-${n}`,attemptId:`attempt-${n}`,epoch:1,target:{projectId:'synthetic',slideId:`page-${n}`,prompt:`中文 prompt ${n}`,promptVersion:'fixture',feedback:'',spec:{version:'v',sha256:'a'.repeat(64)},design:{version:'v',sha256:'b'.repeat(64)},skill:{version:'v',sha256:'c'.repeat(64)},palette:{version:'v',sha256:'d'.repeat(64)},parentVisual:null,references:[]}}});
 
 describe('private async presales runtime',()=>{
+  it.each(['not JSON', '{"schemaVersion":1}'])('reports confirmed completed malformed text as a correlated terminal failure: %s', async text => {
+    const context = { name: 'Synthetic', brief: '', context: { taskBrief: '', sourceInstructions: {}, outlineRequirements: '' }, preferences: {}, palette: { revision: 0, locked: false, profile: null }, skill: PRESALES_SKILL_METADATA, sources: [], analysis: { original: { output: sourceAnalysis() }, asset: { relativePath: 'copy/analysis.json' } }, approvedOutline: null };
+    const work: RuntimeJob = { kind: 'text', job: { requestId: 'text-1', operationId: 'text-1', attemptId: 'attempt-1', epoch: 1, targetSha256: 'a'.repeat(64), target: { ...context, schemaVersion: 1, projectId: 'copy', expectedRevision: 1, draftSha256: 'b'.repeat(64), stage: 'outline', origin: {}, importId: 'import', outlineApproval: null, promptVersion: 'v1', prompt: buildPairedAuthoringPrompt('outline', context) } } };
+    const lines: Record<string, unknown>[] = [];
+    const runtime = new PresalesRuntime({ available: true, async execute(_work, callbacks) { await callbacks.identity({ threadId: 'thread', turnId: 'completed-turn' }); return { kind: 'text', text }; }, async interrupt() { return { acknowledged: true }; } }, line => lines.push(JSON.parse(line)));
+    await runtime.handle({ id: 'start', method: 'presales/start', params: { generation: 1, work } });
+    const identity = lines.find(line => line.method === 'native/identity')!;
+    await runtime.handle({ id: String(identity.id), result: { persisted: true } });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(lines.find(line => line.method === 'presales/terminal')?.params).toMatchObject({ work, provider: { threadId: 'thread', turnId: 'completed-turn' }, result: { kind: 'failed', error: expect.any(String) } });
+    expect(lines.some(line => line.method === 'presales/unknown')).toBe(false);
+    runtime.close();
+  });
   it('acknowledges status while actual private provider bootstrap awaits native RPC',async()=>{
     const lines:Record<string,unknown>[]=[];
     const runtime=new PresalesRuntime(undefined,line=>lines.push(JSON.parse(line) as Record<string,unknown>),true);
@@ -62,6 +78,17 @@ describe('private async presales runtime',()=>{
     await new Promise(resolve=>setImmediate(resolve));
     expect(lines.some(l=>l.method==='presales/result')).toBe(false);
     expect(lines.some(l=>l.method==='presales/unknown')).toBe(true);
+    runtime.close();
+  });
+  it('retains uncertainty when transport disconnects after persisting turn identity', async () => {
+    const lines: Record<string, unknown>[] = [];
+    const runtime = new PresalesRuntime({ available: true, async execute(_work, callbacks) { await callbacks.identity({ threadId: 't', turnId: 'still-running' }); throw Error('transport disconnected before terminal evidence'); }, async interrupt() { return { acknowledged: false }; } }, line => lines.push(JSON.parse(line)));
+    await runtime.handle({ id: 'start', method: 'presales/start', params: { generation: 1, work: job(9) } });
+    const identity = lines.find(line => line.method === 'native/identity')!;
+    await runtime.handle({ id: String(identity.id), result: { persisted: true } });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(lines.some(line => line.method === 'presales/unknown')).toBe(true);
+    expect(lines.some(line => line.method === 'presales/terminal')).toBe(false);
     runtime.close();
   });
   it('real child stdin services a persistence callback, snapshot, and interrupt during a held job',async()=>{

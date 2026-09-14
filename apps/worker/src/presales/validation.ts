@@ -274,8 +274,9 @@ function parseDesign(value: unknown): SlideDesignPlan {
     speakerNotes: string(design.speakerNotes, 'speakerNotes'), textBindings, scene };
 }
 
-function visibleBindings(spec: SlideSpec, design: SlideDesignPlan): { id: string; path: string; text: string }[] {
-  if (spec.id !== design.slideId) throw new Error('Design slideId must match spec');
+/** The exact visible leaves, also used by the editable paired review. Notes
+ * and generation instructions deliberately never enter this collection. */
+export function visibleTextLeaves(spec: SlideSpec): Map<string, string> {
   const leaves = new Map<string, string>([['/title', spec.title]]);
   spec.body.forEach((text, index) => leaves.set(`/body/${index}`, text));
   spec.tables.forEach((table, index) => {
@@ -290,6 +291,12 @@ function visibleBindings(spec: SlideSpec, design: SlideDesignPlan): { id: string
     });
   });
   spec.shapes.forEach((shape, index) => { if (shape.text !== undefined) leaves.set(`/shapes/${index}/text`, shape.text); });
+  return leaves;
+}
+
+function visibleBindings(spec: SlideSpec, design: SlideDesignPlan): { id: string; path: string; text: string }[] {
+  if (spec.id !== design.slideId) throw new Error('Design slideId must match spec');
+  const leaves = visibleTextLeaves(spec);
   const result = design.textBindings.map((binding) => {
     if (!leaves.has(binding.path)) throw new Error(`Unsupported visible binding path: ${binding.path}`);
     return { ...binding, text: leaves.get(binding.path)! };

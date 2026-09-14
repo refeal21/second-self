@@ -8,6 +8,175 @@ mod tempfile;
 mod v1_fixture;
 
 #[test]
+fn withdrawal_fences_late_original_and_replays_admitted_reuse_without_cancelling_it() {
+    let (mut store, directory, _vault) = fixture();
+    let original = input(&store, 1, "withdraw-original");
+    let expected = store.load_project("frozen-project").unwrap();
+    assert!(matches!(
+        store.reconcile_image_admission(original.clone()).unwrap(),
+        ImageAdmissionResolution::Withdrawn { .. }
+    ));
+    assert!(matches!(
+        store.reconcile_image_admission(original.clone()).unwrap(),
+        ImageAdmissionResolution::Withdrawn { .. }
+    ));
+    let mut different = original.clone();
+    different.pages[0].feedback.push_str("changed");
+    assert!(store.reconcile_image_admission(different.clone()).is_err());
+    assert!(store.enqueue_pages(different, None).is_err());
+    drop(store);
+    let mut store = V3Store::open(directory.path().join("catalog.sqlite3")).unwrap();
+    assert!(store
+        .enqueue_pages(original.clone(), None)
+        .unwrap_err()
+        .contains("withdrawn"));
+    assert_eq!(store.load_project("frozen-project").unwrap(), expected);
+    let active = store
+        .enqueue_pages(input(&store, 1, "winner"), None)
+        .unwrap();
+    let mut competing = input(&store, 1, "reused-original");
+    competing.pages[0].expected_revision = 1;
+    let reused = store.enqueue_pages(competing.clone(), None).unwrap();
+    assert_eq!(reused.reused_request_ids, vec!["winner"]);
+    match store.reconcile_image_admission(competing.clone()).unwrap() {
+        ImageAdmissionResolution::Admitted { input, outcome } => {
+            assert_eq!(input, competing);
+            assert_eq!(outcome, reused);
+        }
+        _ => panic!("admitted batch must not be withdrawn"),
+    }
+    assert_eq!(
+        crate::presales_queue::store::read_job(&store.connection, "winner")
+            .unwrap()
+            .unwrap(),
+        active.jobs[0]
+    );
+    assert!(
+        store.enqueue_pages(original, None).is_err(),
+        "withdrawn original must not reuse later work"
+    );
+}
+
+#[test]
+fn withdrawal_rolls_back_on_persistence_failure_and_concurrent_admission_has_one_outcome() {
+    let (mut store, directory, _vault) = fixture();
+    let original = input(&store, 1, "rollback-withdrawal");
+    store.connection.execute_batch("CREATE TRIGGER refuse_withdrawal BEFORE INSERT ON v3_admission_withdrawals BEGIN SELECT RAISE(ABORT,'synthetic disk failure'); END").unwrap();
+    assert!(store.reconcile_image_admission(original.clone()).is_err());
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT count(*) FROM v3_admission_withdrawals", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
+    store
+        .connection
+        .execute("DROP TRIGGER refuse_withdrawal", [])
+        .unwrap();
+    store.enqueue_pages(original, None).unwrap();
+    let original = input(&store, 2, "racing-withdrawal");
+    let path = directory.path().join("catalog.sqlite3");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let other_barrier = barrier.clone();
+    let other_input = original.clone();
+    let other = std::thread::spawn(move || {
+        let mut other = V3Store::open(path).unwrap();
+        other_barrier.wait();
+        other.enqueue_pages(other_input, None)
+    });
+    barrier.wait();
+    let resolution = store.reconcile_image_admission(original.clone()).unwrap();
+    let admission = other.join().unwrap();
+    match &resolution {
+        ImageAdmissionResolution::Withdrawn { .. } => assert!(admission.is_err()),
+        ImageAdmissionResolution::Admitted { outcome, .. } => {
+            assert_eq!(&admission.unwrap(), outcome)
+        }
+    }
+    assert_eq!(
+        store.reconcile_image_admission(original).unwrap(),
+        resolution
+    );
+}
+
+#[test]
+fn admission_withdrawal_schema_is_durable_and_v3_upgrade_is_exact_and_atomic() {
+    let (store, directory, _vault) = fixture();
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='v3_admission_withdrawals'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    let expected = store.load_project("frozen-project").unwrap();
+    drop(store);
+    let path = directory.path().join("catalog.sqlite3");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("DROP TABLE v3_admission_withdrawals; PRAGMA user_version=3")
+        .unwrap();
+    db.execute(
+        "INSERT INTO v3_legacy_activity VALUES ('held','original raw evidence')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    crate::presales_queue::schema::inject_v3_upgrade_failure(Some("withdrawal_after_ddl"));
+    assert!(V3Store::open(&path).is_err());
+    crate::presales_queue::schema::inject_v3_upgrade_failure(None);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name='v3_admission_withdrawals'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    db.execute("CREATE TABLE unrelated(value TEXT)", [])
+        .unwrap();
+    drop(db);
+    assert!(V3Store::open(&path).is_err());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("DROP TABLE unrelated", []).unwrap();
+    drop(db);
+    let reopened = V3Store::open(&path).unwrap();
+    assert_eq!(reopened.load_project("frozen-project").unwrap(), expected);
+    assert_eq!(
+        reopened
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        reopened
+            .connection
+            .query_row(
+                "SELECT evidence_json FROM v3_legacy_activity WHERE evidence_id='held'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "original raw evidence"
+    );
+}
+
+#[test]
 fn exact_schema_upgrade_preserves_native_queue_history_approvals_and_delivery() {
     let (mut store, directory, vault) = fixture();
     for n in 1..=3 {
@@ -83,7 +252,7 @@ fn exact_schema_upgrade_preserves_native_queue_history_approvals_and_delivery() 
             .connection
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
 }
 

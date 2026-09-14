@@ -134,8 +134,18 @@ export class PresalesRuntime {
         return;
       }
       if(work.kind!==result.kind) throw new Error('Provider result kind mismatch');
-      const payload=work.kind==='text' && result.kind==='text'
-        ? {kind:'text',envelope:parsePairedAuthoringResult(work.job.target.stage,result.text,work.job.target)} : result;
+      let payload: unknown = result;
+      if (work.kind === 'text' && result.kind === 'text') {
+        try {
+          payload = { kind: 'text', envelope: parsePairedAuthoringResult(work.job.target.stage, result.text, work.job.target) };
+        } catch (error) {
+          // execute returned only after correlated turn/completed and identity ACK.
+          // Invalid authoring is a closed failure, not an uncertain remote turn.
+          const reason = `Completed text failed validation: ${error instanceof Error ? error.message : String(error)}`.replaceAll('\0', '').slice(0, 4096);
+          this.send({ method: 'presales/terminal', params: { generation: this.generation, work, provider, result: { kind: 'failed', error: reason } } });
+          return;
+        }
+      }
       this.send({method:'presales/result',params:{generation:this.generation,work,provider,result:payload}});
     }catch(error){
       if(!this.closed) this.send({method:'presales/unknown',params:{generation:this.generation,work,reason:(error instanceof Error?error.message:String(error)).slice(0,4096)}});

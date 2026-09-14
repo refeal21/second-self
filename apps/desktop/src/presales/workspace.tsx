@@ -5,15 +5,20 @@ import { toGalleryModel, nativePage } from './read-model.js';
 import { DraftWorkspace } from './draft-workspace.js';
 import { PreVersionFeedbackEditor } from './feedback-editor.js';
 import type { GalleryGenerationReceipt, GalleryVersionRef } from './gallery/model.js';
-import type { PresalesAdapter, V3Page, V3PageRequest, V3Project, V3ProjectSnapshot, V3QueueSnapshot } from './adapter.js';
+import type { PresalesAdapter, V3EnqueueInput, V3EnqueueOutcome, V3Page, V3PageRequest, V3Project, V3ProjectSnapshot, V3QueueSnapshot } from './adapter.js';
 import type { V3DeliveryPreparation } from '../../../worker/src/presales/delivery.js';
 import './workspace.css';
 
-type PendingIntent = { requestId: string; attemptId: string };
+type PendingIntent = { requestId: string; attemptId: string; input: V3EnqueueInput };
 const pendingIntents = new Map<string, PendingIntent>();
+const admissionResolutions = new Map<string, Map<string, string | null>>();
 const pendingKey = (projectId: string, slideId: string) => `${projectId}:${slideId}`;
 const makeId = () => crypto.randomUUID();
 const errorText = (error: unknown) => error instanceof Error ? error.message : typeof error === 'string' ? error : '操作未完成';
+function hasVersionEvidence(version: V3Page['versions'][number]) {
+  const kind = version.provenance && typeof version.provenance === 'object' ? (version.provenance as { kind?: string }).kind : null;
+  return Boolean(version.image && (kind === 'legacyImported' || (kind === 'presales' && version.basis)));
+}
 // Direct buttons report failures in component state; they do not have a caller to reject to.
 const fire = (promise: Promise<unknown>) => { void promise.catch(() => {}); };
 
@@ -29,6 +34,7 @@ export function PresalesWorkspacePage({ adapter, projectId, initialPageId, initi
   const [notice, setNotice] = useState<string | null>(null);
   const [delivery, setDelivery] = useState<V3DeliveryPreparation | null>(null);
   const [pending, setPending] = useState<Record<string, boolean>>({});
+  const [, updateAdmissions] = useState(0);
   const projectRef = useRef(loaded); projectRef.current = loaded;
   const queueRef = useRef(queue); queueRef.current = queue;
   const currentPages = loaded?.kind === 'frozen' ? loaded.project.pages : [];
@@ -91,7 +97,7 @@ export function PresalesWorkspacePage({ adapter, projectId, initialPageId, initi
         if (!native.visualBasis || currentQueue.jobs.some(job => job.kind === 'image' && job.projectId === projectId && job.slideId === id && ['queued', 'dispatching', 'running', 'result_ready', 'committing', 'cancel_requested', 'outcome_unknown'].includes(job.status))) throw new Error(`第 ${native.ordinal + 1} 页当前不符合生成条件`);
         if (pendingIntents.has(pendingKey(projectId, id))) throw new Error('该页前次提交结果待核对，请勿重复提交');
         const parentVersion = parent?.pageId === id ? exact(parent).version : null;
-        if (parent && (!parentVersion?.image || !parentVersion.basis)) throw new Error('父版本图片或依据缺失，不能作为图片编辑输入');
+        if (parent && (!parentVersion || !hasVersionEvidence(parentVersion))) throw new Error('父版本图片或依据缺失，不能作为图片编辑输入');
         return { id, native, parentVersion };
       });
       pages = targets.map(({ id, native, parentVersion }) => ({ slideId: id, requestId: makeId(), attemptId: makeId(), expectedRevision: native.revision, parentVersionId: parentVersion?.versionId ?? null,
@@ -99,29 +105,65 @@ export function PresalesWorkspacePage({ adapter, projectId, initialPageId, initi
     } catch (caught) {
       return { requestIds: {}, notSubmitted: Object.fromEntries(ids.map(id => [id, errorText(caught)])) };
     }
-    for (const submitted of pages) pendingIntents.set(pendingKey(projectId, submitted.slideId), { requestId: submitted.requestId, attemptId: submitted.attemptId });
-    try {
-      const result = await adapter.enqueue(projectId, makeId(), pages);
-      const requestIds: Record<string, string> = {};
-      const attemptedRequestIds = Object.fromEntries(pages.map(submitted => [submitted.slideId, submitted.requestId]));
-      for (const submitted of pages) {
-        const accepted = result.jobs.find(job => job.target.projectId === projectId && job.target.slideId === submitted.slideId && job.requestId === submitted.requestId);
-        if (accepted) requestIds[submitted.slideId] = accepted.requestId;
+    const input = { projectId, batchId: makeId(), pages };
+    for (const submitted of pages) pendingIntents.set(pendingKey(projectId, submitted.slideId), { requestId: submitted.requestId, attemptId: submitted.attemptId, input });
+    updateAdmissions(revision => revision + 1);
+    return submitImageBatch(input);
+  }
+  function recordAdmission(input: V3EnqueueInput, outcome: V3EnqueueOutcome | null): Record<string, string> {
+    const requestIds: Record<string, string> = {};
+    if (outcome) {
+      if (outcome.jobs.length !== input.pages.length) throw new Error('图片回执页数不匹配');
+      for (const submitted of input.pages) {
+        const matches = outcome.jobs.filter(job => job.target.projectId === input.projectId && job.target.slideId === submitted.slideId);
+        if (matches.length !== 1 || (matches[0]!.requestId !== submitted.requestId && !outcome.reusedRequestIds.includes(matches[0]!.requestId))) throw new Error('图片回执身份或复用依据不匹配');
+        requestIds[submitted.slideId] = matches[0]!.requestId;
       }
+    }
+    for (const submitted of input.pages) {
+      const key = pendingKey(input.projectId, submitted.slideId);
+      const resolutions = admissionResolutions.get(key) ?? new Map<string, string | null>();
+      const actual = requestIds[submitted.slideId] ?? null;
+      resolutions.set(submitted.requestId, actual); admissionResolutions.set(key, resolutions);
+      const pending = pendingIntents.get(key);
+      // A late response for the original batch never removes a newer intent.
+      if (pending?.input.batchId === input.batchId) {
+        if (actual) pendingIntents.set(key, { ...pending, requestId: actual });
+        else pendingIntents.delete(key);
+      }
+    }
+    return requestIds;
+  }
+  async function submitImageBatch(input: V3EnqueueInput): Promise<GalleryGenerationReceipt> {
+    const attemptedRequestIds = Object.fromEntries(input.pages.map(submitted => [submitted.slideId, submitted.requestId]));
+    try {
+      const result = await adapter.enqueue(input.projectId, input.batchId, input.pages);
+      const requestIds = recordAdmission(input, result);
       await refresh();
       return { requestIds, attemptedRequestIds };
     } catch (caught) {
       // A transport error is not proof of non-admission. Keep stable IDs for reconciliation.
-      setError(`${errorText(caught)}。提交结果待确认；不会自动重发。`);
+      if (input.pages.some(page => pendingIntents.get(pendingKey(input.projectId, page.slideId))?.input.batchId === input.batchId)) {
+        setError(`${errorText(caught)}。提交结果待确认；不会自动重发。`);
+      }
       try { await refresh(); } catch { /* remain fenced */ }
-      return { requestIds: {}, attemptedRequestIds: Object.fromEntries(pages.map(submitted => [submitted.slideId, submitted.requestId])) };
+      return { requestIds: {}, attemptedRequestIds };
     }
+  }
+  async function reconcileImageBatch(input: V3EnqueueInput) {
+    const resolution = await adapter.reconcileImageAdmission(input);
+    if (JSON.stringify(resolution.input) !== JSON.stringify(input)) throw new Error('图片核对回执与原始输入不匹配');
+    if (resolution.kind === 'admitted') recordAdmission(input, resolution.outcome);
+    else if (resolution.kind === 'withdrawn') recordAdmission(input, null);
+    else throw new Error('图片核对回执类型未知');
+    setNotice(resolution.kind === 'admitted' ? '已找到本机原请求或复用任务；未新建模型请求。' : '本机已持久化撤回未入队请求，迟到提交也不能入队；可明确创建新请求。');
   }
   async function versionAction(ref: GalleryVersionRef, kind: 'adopt' | 'restore' | 'approve', checks?: { contentChecked: true; visualChecked: true }) {
     const { currentPage, version } = exact(ref);
-    if (!version.image || !version.basis) throw new Error('此版本图片或依据缺失，不能批准或采用');
+    if (!hasVersionEvidence(version)) throw new Error('此版本图片或依据缺失，不能批准或采用');
     const input = { projectId, slideId: ref.pageId, versionId: version.versionId, expectedRevision: currentPage.revision };
     if (kind === 'approve') {
+      if (!version.basis) throw new Error('原项目图片不能获得新的售前批准');
       if (!checks?.contentChecked || !checks.visualChecked) throw new Error('须分别核对内容和视觉');
       if (currentPage.currentVersionId !== version.versionId) throw new Error('只能批准当前候选版本');
       if (!version.provenance || typeof version.provenance !== 'object' || (version.provenance as { kind?: string }).kind !== 'presales') throw new Error('原项目图片不能获得新的售前批准');
@@ -136,16 +178,24 @@ export function PresalesWorkspacePage({ adapter, projectId, initialPageId, initi
   const readOnly = loaded.kind === 'history_only';
   const snapshot = current as V3ProjectSnapshot | import('./adapter.js').V3HistoryProject;
   const model = toGalleryModel(snapshot, queue, readOnly);
+  for (const galleryPage of model.pages) galleryPage.admissionResolutions = [...admissionResolutions.get(pendingKey(projectId, galleryPage.id)) ?? []].map(([submittedRequestId, actualRequestId]) => ({ submittedRequestId, actualRequestId }));
   for (const galleryPage of model.pages) if (pendingIntents.has(pendingKey(projectId, galleryPage.id))) {
+    galleryPage.pendingAdmissionRequestId = pendingIntents.get(pendingKey(projectId, galleryPage.id))!.requestId;
     galleryPage.eligibility.generate = '前次提交结果待核对，请勿重复提交';
     galleryPage.eligibility.edit = '前次提交结果待核对，请勿重复提交';
     if (galleryPage.job.state === 'idle') galleryPage.job = { state: 'unknown', requestId: pendingIntents.get(pendingKey(projectId, galleryPage.id))!.requestId, label: '提交结果待核对' };
   }
   const selectedPage = snapshot.pages.find(item => item.slideId === selectedPageId) ?? snapshot.pages[0] ?? null;
+  const uncertainImage = selectedPage && pendingIntents.get(pendingKey(projectId, selectedPage.slideId));
   const selectedJob = selectedPage && [...queue.jobs].reverse().find(job => job.kind === 'image' && job.projectId === projectId && job.slideId === selectedPage.slideId);
   return <main className="presales-workspace" id="main-content">
     <header className="presales-workspace__intro"><div><p>售前 v3 · {readOnly ? '历史只读' : '冻结页面'}</p><h1>{snapshot.summary.name}</h1><small>源项目 {snapshot.origin.sourceProjectId} · 源修订 {snapshot.origin.sourceRevision} · 副本独立保存，原项目保持不变</small></div><button onClick={() => fire(refresh().catch(caught => { setError(errorText(caught)); }))}>重新核对状态</button></header>
     {error && <p role="alert">{error}</p>}{notice && <p role="status">{notice}</p>}
+    {uncertainImage && <section className="presales-workspace__panel" aria-label="图片提交恢复">
+      <h2>图片提交结果待核对</h2><p>保留原批次及全部页面输入。重试会使用完全相同的标识；撤回只影响尚未入队的请求，已入队任务仍按原状态运行。</p>
+      <button disabled={Boolean(pending['image-reconcile'])} onClick={() => fire(action('image-reconcile', () => submitImageBatch(uncertainImage.input)))}>用原图片请求重试确认</button>
+      <button disabled={Boolean(pending['image-reconcile'])} onClick={() => fire(action('image-reconcile', () => reconcileImageBatch(uncertainImage.input)))}>核对并撤回未入队请求</button>
+    </section>}
     <section className="presales-workspace__panel" aria-label="版本交付">
       <button disabled={Boolean(pending.delivery)} onClick={() => fire(action('delivery', async () => { setDelivery(null); const result = await adapter.delivery(projectId); setDelivery(result); }))}>导出可编辑 PPTX</button>
       <p>导出前由本机核对每页当前采用版本、批准依据和图片文件。</p>

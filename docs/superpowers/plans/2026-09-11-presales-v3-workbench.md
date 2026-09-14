@@ -352,6 +352,7 @@ The following shared contract is implemented by sequential reviewed Tasks 3c1 an
 **Interfaces:** Consume all preceding task interfaces; no new workflow authority.
 
 - [ ] **Step 1: Run synthetic five-page acceptance including out-of-order 1/2/4 concurrency, cross-page approval, five revision rounds, restart recovery, saved feedback, exact history selection, missing resources and unknown/cancelled remote outcomes.**
+- Use a genuine paired Chinese presales fixture: construction goals, architecture (or overview), two module pages and a linked personnel/scenario page. The architecture/overview module set must match the later module/scenario coverage; complete visible bindings, notes separation, saved palette and page-scoped reference inputs must pass the shared native/Worker validators. Reuse existing fixture helpers, but do not treat the legacy `golden-project.ts` cover/summary/KPI/table/chart background-only deck or five ID-renamed copies of one scenario as presales narrative coverage. Synthetic image output proves orchestration/UI behavior, not real model visual quality.
 
 ```text
 new/explicit-copy -> paired outline approval -> paired details approval

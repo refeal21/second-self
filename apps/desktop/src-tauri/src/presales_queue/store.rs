@@ -15,6 +15,7 @@ const MAX_FEEDBACK_BYTES: usize = 16_384;
 
 pub struct QueueStore {
     pub(super) connection: Connection,
+    pub(super) lifecycle_only: bool,
 }
 
 impl QueueStore {
@@ -29,6 +30,20 @@ impl QueueStore {
     fn initialize(connection: Connection, file_backed: bool) -> Result<Self, String> {
         Ok(Self {
             connection: initialize(connection, file_backed, DatabaseProfile::QueueOnly)?,
+            lifecycle_only: false,
+        })
+    }
+
+    /// Reuse verified image lifecycle operations under V3 schema ownership.
+    /// This handle cannot allocate work, claim slots, or advance the epoch.
+    pub(crate) fn open_v3_lifecycle(path: impl AsRef<Path>) -> Result<Self, String> {
+        Ok(Self {
+            connection: initialize(
+                Connection::open(path).map_err(message)?,
+                true,
+                DatabaseProfile::PresalesV3,
+            )?,
+            lifecycle_only: true,
         })
     }
 
@@ -77,6 +92,9 @@ impl QueueStore {
     }
 
     pub fn enqueue(&mut self, input: EnqueueBatch) -> Result<EnqueueOutcome, String> {
+        if self.lifecycle_only {
+            return Err("V3 admission belongs to the workbench service".into());
+        }
         validate_batch(&input)?;
         let transaction = self
             .connection
@@ -96,6 +114,9 @@ impl QueueStore {
     }
 
     pub fn claim_next(&mut self, epoch: i64) -> Result<Option<QueueJob>, String> {
+        if self.lifecycle_only {
+            return Err("V3 claims belong to the combined supervisor".into());
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -325,7 +346,7 @@ pub(super) fn message(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-pub(super) fn read_settings(connection: &Connection) -> Result<QueueSettings, String> {
+pub(crate) fn read_settings(connection: &Connection) -> Result<QueueSettings, String> {
     connection
         .query_row(
             "SELECT concurrency, paused, epoch FROM queue_settings WHERE singleton = 1",
@@ -376,6 +397,27 @@ pub(crate) fn read_job(
         )
         .optional()
         .map_err(message)
+}
+
+pub(crate) const ACTIVE_PAGE_QUERY: &str = "SELECT request_id FROM queue_jobs WHERE project_id=?1 AND slide_id=?2 AND status IN ('queued','dispatching','running','result_ready','committing','cancel_requested','outcome_unknown')";
+
+pub(crate) fn read_active_job(
+    connection: &Connection,
+    project: &str,
+    slide: &str,
+) -> Result<Option<QueueJob>, String> {
+    let id: Option<String> = connection
+        .query_row(ACTIVE_PAGE_QUERY, params![project, slide], |r| r.get(0))
+        .optional()
+        .map_err(message)?;
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    let job = read_job(connection, &id)?.ok_or("selected active job missing")?;
+    if job.target.project_id != project || job.target.slide_id != slide {
+        return Err("active queue row target identity mismatch".into());
+    }
+    Ok(Some(job))
 }
 
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJob> {

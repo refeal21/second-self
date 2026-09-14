@@ -17,10 +17,13 @@ use std::{
 
 pub struct V3WorkbenchService {
     pub(super) store: Mutex<V3Store>,
-    root: PathBuf,
+    pub(super) root: PathBuf,
+    pub(super) image_lifecycle: Mutex<crate::presales_queue::QueueStore>,
     activity: Arc<LegacyActivityTracker>,
     validator: LegacyValidatorProcess,
-    preparations: Mutex<HashMap<String, PreparedCopy>>,
+    preparations:
+        Mutex<HashMap<String, (PreparedCopy, super::preparation::PreparationReservation)>>,
+    preparation_capacity: super::preparation::PreparationCapacity,
 }
 
 impl V3WorkbenchService {
@@ -61,12 +64,20 @@ impl V3WorkbenchService {
             Err(e) => return Err(message(e)),
         }
         let root = std::fs::canonicalize(root).map_err(message)?;
+        let image_lifecycle = crate::presales_queue::QueueStore::open_v3_lifecycle(
+            store
+                .connection
+                .path()
+                .ok_or("V3 runtime requires a durable database")?,
+        )?;
         Ok(Self {
             store: Mutex::new(store),
             root,
             activity,
             validator,
             preparations: Mutex::new(HashMap::new()),
+            preparation_capacity: Default::default(),
+            image_lifecycle: Mutex::new(image_lifecycle),
         })
     }
 
@@ -78,17 +89,7 @@ impl V3WorkbenchService {
         if !Arc::ptr_eq(&self.activity, legacy.activity()) {
             return Err("legacy source activity owner mismatch".into());
         }
-        if self
-            .preparations
-            .lock()
-            .map_err(|_| "preparation lock poisoned")?
-            .len()
-            >= 2
-        {
-            return Err(
-                "two preparations are already awaiting publication; discard one first".into(),
-            );
-        }
+        let reservation = self.preparation_capacity.reserve()?;
         let source = legacy.native_copy_source(&input.source_project_id)?;
         if self.root.starts_with(&source.root) || source.root.starts_with(&self.root) {
             return Err("v3 and legacy asset roots must be separate".into());
@@ -134,10 +135,7 @@ impl V3WorkbenchService {
             .preparations
             .lock()
             .map_err(|_| "preparation lock poisoned")?;
-        if preparations.len() >= 2 {
-            return Err("preparation capacity reached".into());
-        }
-        preparations.insert(summary.preparation_id.clone(), prepared);
+        preparations.insert(summary.preparation_id.clone(), (prepared, reservation));
         Ok(summary)
     }
 
@@ -155,7 +153,7 @@ impl V3WorkbenchService {
             .lock()
             .map_err(|_| "preparation lock poisoned")?
             .remove(preparation_id);
-        let Some(prepared) = prepared else {
+        let Some((prepared, _reservation)) = prepared else {
             let store = self.store.lock().map_err(|_| "v3 store lock poisoned")?;
             let project: Option<String> = store
                 .connection

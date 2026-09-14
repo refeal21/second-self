@@ -15,6 +15,9 @@ impl QueueStore {
     /// Supervisor-only startup boundary. Opening a connection does not invoke it.
     /// Ambiguous attempts retain their slot and acquire the new owner's epoch.
     pub fn begin_runtime(&mut self) -> Result<RecoverySnapshot, String> {
+        if self.lifecycle_only {
+            return Err("V3 epochs belong to the combined supervisor".into());
+        }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -488,7 +491,7 @@ fn replay(
     }
 }
 
-fn persist_change(
+pub(crate) fn persist_change(
     tx: &Transaction<'_>,
     job: &mut QueueJob,
     from: JobStatus,

@@ -35,16 +35,43 @@ pub fn run() {
             let workspace = paths::default_workspace(&home);
             let service =
                 workbench::WorkbenchService::open(app_data.join("workbench.sqlite3"), workspace)?;
-            let v3 = presales_v3::V3WorkbenchService::bundled(
+            let v3 = std::sync::Arc::new(presales_v3::V3WorkbenchService::bundled(
                 app.handle(),
                 &service,
                 &app_data.join("presales-v3.sqlite3"),
-            )?;
+            )?);
+            let supervisor =
+                presales_v3::runtime_host::QueueSupervisor::bundled(app.handle(), v3.clone())?;
             app.manage(v3);
+            app.manage(std::sync::Arc::new(supervisor));
             app.manage(service);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            presales_v3::commands::presales_v3_list,
+            presales_v3::commands::presales_v3_load,
+            presales_v3::commands::presales_v3_queue,
+            presales_v3::commands::presales_v3_enqueue,
+            presales_v3::commands::presales_v3_settings,
+            presales_v3::commands::presales_v3_save_pair,
+            presales_v3::commands::presales_v3_approve_pair,
+            presales_v3::commands::presales_v3_draft_settings,
+            presales_v3::commands::presales_v3_promote,
+            presales_v3::commands::presales_v3_author,
+            presales_v3::commands::presales_v3_text_history,
+            presales_v3::commands::presales_v3_save_feedback,
+            presales_v3::commands::presales_v3_approve_version,
+            presales_v3::commands::presales_v3_adopt_version,
+            presales_v3::commands::presales_v3_cancel,
+            presales_v3::commands::presales_v3_abandon,
+            presales_v3::commands::presales_v3_retry_save,
+            presales_v3::commands::presales_v3_delivery,
+            presales_v3::commands::presales_v3_prepare_copy,
+            presales_v3::commands::presales_v3_publish_copy,
+            presales_v3::commands::presales_v3_discard_copy,
+            presales_v3::commands::presales_v3_restore_approval,
+            presales_v3::commands::presales_v3_set_references,
+            presales_v3::picker::presales_v3_pick_reference,
             tauri_codex::start_codex_app_server,
             tauri_codex::send_codex_app_server_line,
             tauri_codex::stop_codex_app_server,
@@ -80,6 +107,12 @@ pub fn run() {
             tauri_workbench::ppt_approve_outline,
             tauri_workbench::ppt_approve_details,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Digital Twin Workbench");
+        .build(tauri::generate_context!())
+        .expect("error while building Digital Twin Workbench")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<std::sync::Arc<presales_v3::runtime_host::QueueSupervisor>>()
+                    .shutdown();
+            }
+        });
 }

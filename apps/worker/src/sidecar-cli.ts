@@ -3,6 +3,11 @@ import { createInterface } from 'node:readline';
 import { handleLegacyCopyValidatorLine } from './presales/legacy-copy.js';
 
 async function main(): Promise<void> {
+  if (process.argv.includes('--presales-runtime')) {
+    const { runPresalesRuntime } = await import('./presales/runtime.js');
+    await runPresalesRuntime();
+    return;
+  }
   if (process.argv.includes('--presales-validate')) {
     // A separate mode and handler: the legacy runtime module is not loaded.
     let pending = Buffer.alloc(0);

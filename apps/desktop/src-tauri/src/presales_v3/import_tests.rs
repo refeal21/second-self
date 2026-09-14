@@ -15,6 +15,8 @@ mod draft_tests;
 mod reference_tests;
 #[path = "text_tests.rs"]
 mod text_tests;
+#[path = "supervisor_tests.rs"]
+mod supervisor_tests;
 
 #[path = "../../tests/support/v3_temp.rs"]
 mod temp;

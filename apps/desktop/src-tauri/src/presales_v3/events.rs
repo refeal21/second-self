@@ -1,8 +1,8 @@
 use super::store::{bump_project, decode, encode, load_on, message, page_on, write_on};
 use super::*;
 use crate::presales_queue::{
-    store::{enqueue_v3_on, read_batch_outcome, read_jobs},
-    EnqueueBatch, EnqueueJob, EnqueueOutcome, JobStatus, ResultVault,
+    store::{enqueue_v3_on, read_active_job, read_batch_outcome},
+    EnqueueBatch, EnqueueJob, EnqueueOutcome, ResultVault,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -156,18 +156,5 @@ pub(super) fn active_job(
     project_id: &str,
     slide_id: &str,
 ) -> Result<Option<crate::presales_queue::QueueJob>, String> {
-    Ok(read_jobs(connection)?.into_iter().find(|job| {
-        job.target.project_id == project_id
-            && job.target.slide_id == slide_id
-            && matches!(
-                job.status,
-                JobStatus::Queued
-                    | JobStatus::Dispatching
-                    | JobStatus::Running
-                    | JobStatus::ResultReady
-                    | JobStatus::Committing
-                    | JobStatus::CancelRequested
-                    | JobStatus::OutcomeUnknown
-            )
-    }))
+    read_active_job(connection, project_id, slide_id)
 }

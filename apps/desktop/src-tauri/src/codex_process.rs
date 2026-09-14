@@ -196,7 +196,7 @@ impl CodexAppServerProcess {
 
 /// Bound allocation before reading more bytes. EOF without a frame delimiter,
 /// invalid UTF-8 and dropped oversized frames are evidence loss, never terminal.
-fn read_bounded_lines(
+pub(crate) fn read_bounded_lines(
     mut reader: impl BufRead,
     limit: usize,
     line: impl Fn(String),

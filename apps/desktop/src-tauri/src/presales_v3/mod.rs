@@ -19,6 +19,7 @@ mod import_read;
 mod legacy_envelope;
 mod legacy_snapshot;
 mod prompt;
+mod preparation;
 mod publication;
 pub(crate) mod reference_assets;
 mod references;
@@ -30,6 +31,11 @@ mod text_prompt;
 mod text_result;
 pub use reference_assets::NativeSelectedReference;
 mod service;
+pub(crate) mod supervisor;
+pub(crate) mod runtime_host;
+mod runtime_callbacks;
+pub(crate) mod commands;
+pub(crate) mod picker;
 mod store;
 mod validator_process;
 mod wal_snapshot;
@@ -65,5 +71,7 @@ pub(crate) fn validate_native_upgrade(
 mod activity_tests;
 #[cfg(test)]
 mod events_tests;
+#[cfg(test)]
+mod preparation_tests;
 #[cfg(test)]
 mod import_tests;

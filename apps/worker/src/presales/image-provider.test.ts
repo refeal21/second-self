@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { CodexAppServerClient, type AppServerExit, type AppServerTransport, type JsonRpcMessage } from '../app-server.js';
 import { PrivateCodexProvider } from './image-provider.js';
-import type { RuntimeJob } from './runtime.js';
+import { PresalesRuntime, type RuntimeJob } from './runtime.js';
 
 class Protocol implements AppServerTransport {
   sent: JsonRpcMessage[]=[];
@@ -9,7 +9,8 @@ class Protocol implements AppServerTransport {
   exits=new Set<(detail:AppServerExit)=>void>();
   account:unknown={account:{type:'chatgpt',email:'synthetic@example.invalid',planType:'pro'},requiresOpenaiAuth:true};
   config:unknown={config:{model_provider:'openai'},origins:{},layers:null};
-  image=true; modalities=['text','image']; threadProvider='openai';
+  image=true; modalities=['text','image']; threadProvider='openai';threadModel='synthetic-model';
+  threadGate:Promise<void>|undefined;
   onThread:(()=>void)|undefined;
   held=false;
   terminal='completed';
@@ -31,7 +32,7 @@ class Protocol implements AppServerTransport {
       case 'configRequirements/read':result={requirements:null};break;
       case 'model/list':result={data:[{id:'catalog-id',model:'synthetic-model',isDefault:true,inputModalities:this.modalities}],nextCursor:null};break;
       case 'modelProvider/capabilities/read':result={namespaceTools:true,imageGeneration:this.image,webSearch:false};break;
-      case 'thread/start':result={thread:{id:'thread-1',modelProvider:this.threadProvider},modelProvider:this.threadProvider,model:'synthetic-model'};this.onThread?.();break;
+      case 'thread/start':result={thread:{id:'thread-1',modelProvider:this.threadProvider},modelProvider:this.threadProvider,model:this.threadModel};this.onThread?.();if(this.threadGate)await this.threadGate;break;
       case 'turn/start':result={turn:{id:'turn-1'}};break;
     }
     if(m.id!==undefined)this.emit({id:m.id,result});
@@ -47,6 +48,64 @@ const setup=()=>{const protocol=new Protocol();const provider=new PrivateCodexPr
 const callbacks={async identity(){},progress(){}};
 
 describe('private stock Codex provider',()=>{
+  it.each(['inputs','thread','thread identity'])('retains cancellation during %s setup until the turn can be interrupted',async stage=>{
+    const protocol=new Protocol();protocol.held=true;
+    let release!:()=>void;let entered=false;
+    const gate=new Promise<void>(r=>{release=r;});
+    if(stage==='thread'){protocol.threadGate=gate;protocol.onThread=()=>{entered=true;};}
+    const provider=new PrivateCodexProvider(new CodexAppServerClient(protocol),async()=>{
+      if(stage==='inputs'){entered=true;await gate;}return inputs;
+    },async()=>inputs.cwd);
+    await provider.prepare();
+    const outcome=provider.execute(work(),{...callbacks,async identity(v){
+      if(stage==='thread identity'&&v.turnId===null){entered=true;await gate;}
+    }});
+    try{
+      while(!entered)await new Promise(r=>setImmediate(r));
+      expect(await provider.interrupt(work())).toEqual({acknowledged:false});
+      release();
+      while(!protocol.sent.some(m=>m.method==='turn/start'))await new Promise(r=>setImmediate(r));
+      await new Promise(r=>setImmediate(r));
+      expect(protocol.sent.filter(m=>m.method==='turn/interrupt')).toHaveLength(1);
+    }finally{
+      release();protocol.emit({method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-1',status:'interrupted',items:[]}}});
+      await outcome;
+    }
+  });
+  it('runtime keeps an early negative ACK uncertain and interrupts before native turn persistence completes',async()=>{
+    const protocol=new Protocol();protocol.held=true;let release!:()=>void;let resolving=false;
+    const gate=new Promise<void>(r=>{release=r;});
+    const provider=new PrivateCodexProvider(new CodexAppServerClient(protocol),async()=>{resolving=true;await gate;return inputs;},async()=>inputs.cwd);
+    await provider.prepare();const lines:JsonRpcMessage[]=[];
+    const runtime=new PresalesRuntime(provider,line=>lines.push(JSON.parse(line) as JsonRpcMessage));
+    try{
+      await runtime.handle({id:'start',method:'presales/start',params:{generation:1,work:work()}});
+      while(!resolving)await new Promise(r=>setImmediate(r));
+      await runtime.handle({id:'cancel',method:'presales/interrupt',params:{generation:1,requestId:'request'}});
+      await new Promise(r=>setImmediate(r));
+      expect(lines.find(m=>m.id==='cancel')?.result).toEqual({acknowledged:false});
+      expect(lines.some(m=>m.method==='presales/terminal')).toBe(false);
+      release();
+      while(!lines.some(m=>m.method==='native/identity'))await new Promise(r=>setImmediate(r));
+      await runtime.handle({id:lines.find(m=>m.method==='native/identity')!.id!,result:{persisted:true}});
+      while(lines.filter(m=>m.method==='native/identity').length<2)await new Promise(r=>setImmediate(r));
+      expect(protocol.sent.filter(m=>m.method==='turn/interrupt')).toHaveLength(1);
+      protocol.emit({method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-1',status:'interrupted',items:[]}}});
+      expect(lines.some(m=>m.method==='presales/terminal')).toBe(false);
+      await runtime.handle({id:lines.filter(m=>m.method==='native/identity')[1]!.id!,result:{persisted:true}});
+      await new Promise(r=>setImmediate(r));
+      expect(lines.find(m=>m.method==='presales/terminal')?.params).toMatchObject({provider:{threadId:'thread-1',turnId:'turn-1'},result:{kind:'cancelled'}});
+      expect(lines.some(m=>m.method==='presales/result')).toBe(false);
+    }finally{release();runtime.close();}
+  });
+  it.each(['provider','model'])('revokes readiness on returned thread %s mismatch',async field=>{
+    const {protocol,provider}=setup();await provider.prepare();
+    if(field==='provider')protocol.threadProvider='custom';else protocol.threadModel='other-model';
+    await expect(provider.execute(work(),callbacks)).rejects.toThrow('route mismatch');
+    expect(provider.available).toBe(false);
+    expect(provider.capabilities).toMatchObject({generation:false,referenceEditing:false});
+    expect(protocol.sent.some(m=>m.method==='turn/start')).toBe(false);
+  });
   it('accepts documented stock route and sends exact frozen prompt with pinned model',async()=>{
     const {protocol,provider}=setup();await provider.prepare();
     expect(provider.available).toBe(true);expect(provider.capabilities).toEqual({generation:true,referenceEditing:true});

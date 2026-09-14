@@ -5,6 +5,7 @@ import type { ProviderIdentity, RuntimeJob, RuntimeProvider, RuntimeResult } fro
 export type ImageCapabilities={generation:boolean;referenceEditing:boolean;reason?:string};
 export type NativeInputs={cwd:string;images:{assetId:string;sha256:string;path:string;role:string}[]};
 type Callbacks=Parameters<RuntimeProvider['execute']>[1];
+type ActiveAttempt={identity:ProviderIdentity|null;cancel:boolean;invalidate():void};
 const unavailable=(reason:string):ImageCapabilities=>({generation:false,referenceEditing:false,reason});
 const record=(v:unknown):Record<string,unknown>|undefined=>v!==null&&typeof v==='object'&&!Array.isArray(v)?v as Record<string,unknown>:undefined;
 const identity=(v:unknown):v is string=>typeof v==='string'&&v.length>0&&v.length<=256&&[...v].every(c=>c.charCodeAt(0)>=32);
@@ -15,7 +16,7 @@ export class PrivateCodexProvider implements RuntimeProvider {
   private revision=0;
   private model:string|null=null;
   private preparing:Promise<void>|null=null;
-  private readonly active=new Map<string,{identity:ProviderIdentity;cancel:boolean;invalidate():void}>();
+  private readonly active=new Map<string,ActiveAttempt>();
   constructor(private readonly client:CodexAppServerClient,
     private readonly resolve:(work:RuntimeJob)=>Promise<NativeInputs>,
     private readonly cwd:()=>Promise<string>,
@@ -28,7 +29,7 @@ export class PrivateCodexProvider implements RuntimeProvider {
     this.capabilities=unavailable('账户或连接已变化，等待重新验证');this.changed();
     for(const entry of this.active.values()){
       entry.invalidate();entry.cancel=true;
-      if(entry.identity.turnId)void this.client.privateV3Request('turn/interrupt',{threadId:entry.identity.threadId,turnId:entry.identity.turnId}).catch(()=>{});
+      if(entry.identity?.turnId)void this.client.privateV3Request('turn/interrupt',{threadId:entry.identity.threadId,turnId:entry.identity.turnId}).catch(()=>{});
     }
   }
   async prepare():Promise<void>{
@@ -74,25 +75,39 @@ export class PrivateCodexProvider implements RuntimeProvider {
   }
   async execute(work:RuntimeJob,callbacks:Callbacks):Promise<RuntimeResult>{
     const revision=this.revision;
-    const inputs=await this.resolve(work);this.assertLease(revision);
-    try{await this.client.connect();await this.validate(inputs.cwd,revision);}
-    catch{this.invalidate();throw Error('Private route validation failed');}
-    if(!this.available||!this.model)throw Error('Private route unavailable');
-    const images=inputs.images;
-    if(work.kind==='image'){
-      if(!this.capabilities.generation)throw Error('Image generation unavailable');
-      const expected=[...(work.job.target.parentVisual?[work.job.target.parentVisual]:[]),...work.job.target.references];
-      if(expected.length>0&&!this.capabilities.referenceEditing)throw Error('Reference input unavailable; no text fallback');
-      if(images.length!==expected.length||images.some((v,i)=>v.assetId!==expected[i]?.assetId||v.sha256!==expected[i]?.sha256||!v.path.startsWith('/')||(i===0&&work.job.target.parentVisual&&v.role!=='parent')))throw Error('Verified image inputs mismatch');
-    }else if(images.length!==0)throw Error('Unexpected text image inputs');
-    this.assertLease(revision);
-    return this.turn(work,inputs,callbacks,revision,this.model);
+    // Keep intent across every setup await. No turn ID still means no remote ACK.
+    const entry:ActiveAttempt={identity:null,cancel:false,invalidate:()=>{}};
+    this.active.set(work.job.requestId,entry);
+    try{
+      const inputs=await this.resolve(work);
+      this.assertLease(revision);
+      try{
+        await this.client.connect();
+        await this.validate(inputs.cwd,revision);
+      }catch{
+        this.invalidate();
+        throw Error('Private route validation failed');
+      }
+      if(!this.available||!this.model)throw Error('Private route unavailable');
+      const images=inputs.images;
+      if(work.kind==='image'){
+        if(!this.capabilities.generation)throw Error('Image generation unavailable');
+        const expected=[...(work.job.target.parentVisual?[work.job.target.parentVisual]:[]),...work.job.target.references];
+        if(expected.length>0&&!this.capabilities.referenceEditing)throw Error('Reference input unavailable; no text fallback');
+        if(images.length!==expected.length||images.some((v,i)=>v.assetId!==expected[i]?.assetId||v.sha256!==expected[i]?.sha256||!v.path.startsWith('/')||(i===0&&work.job.target.parentVisual&&v.role!=='parent')))throw Error('Verified image inputs mismatch');
+      }else if(images.length!==0)throw Error('Unexpected text image inputs');
+      this.assertLease(revision);
+      return await this.turn(work,inputs,callbacks,revision,this.model,entry);
+    }finally{
+      this.active.delete(work.job.requestId);
+    }
   }
-  private async turn(work:RuntimeJob,inputs:NativeInputs,callbacks:Callbacks,revision:number,model:string):Promise<RuntimeResult>{
+  private async turn(work:RuntimeJob,inputs:NativeInputs,callbacks:Callbacks,revision:number,model:string,entry:ActiveAttempt):Promise<RuntimeResult>{
     let thread:string|null=null;let turn:string|null=null;let persisted=false;let expired=false;
     const pending:JsonRpcMessage[]=[];const items=new Map<string,Record<string,unknown>>();
     let settle!:(v:RuntimeResult)=>void;let fail!:(e:Error)=>void;
     const result=new Promise<RuntimeResult>((resolve,reject)=>{settle=resolve;fail=reject;});
+    entry.invalidate=()=>fail(Error('Account changed during provider work; outcome unknown'));
     // An early disconnect may reject before setup reaches await result.
     void result.catch(()=>{});
     const consume=(m:JsonRpcMessage)=>{
@@ -124,22 +139,40 @@ export class PrivateCodexProvider implements RuntimeProvider {
     const check=()=>{this.assertLease(revision);if(expired)throw Error('Private turn setup expired');};
     try{
       const started=record(await this.client.privateV3Request('thread/start',{cwd:inputs.cwd,modelProvider:'openai',model,allowProviderModelFallback:false,approvalPolicy:'never',approvalsReviewer:'user',sandbox:'read-only',ephemeral:true}));
-      const t=record(started?.thread);if(!identity(t?.id))throw Error('Private thread identity missing');thread=t.id;
-      await callbacks.identity({threadId:thread,turnId:null});check();
-      if(started?.modelProvider!=='openai'||t.modelProvider!=='openai'||started?.model!==model)throw Error('Private thread route mismatch');
-      const entry={identity:{threadId:thread,turnId:null} as ProviderIdentity,cancel:false,invalidate:()=>fail(Error('Account changed during provider work; outcome unknown'))};
-      this.active.set(work.job.requestId,entry);
-      const start=record(await this.client.privateV3Request('turn/start',{threadId:thread,model,input:[{type:'text',text:work.job.target.prompt,text_elements:[]},...inputs.images.map(i=>({type:'localImage',path:i.path}))]}));
-      const id=record(start?.turn)?.id;if(!identity(id))throw Error('Private turn identity missing');turn=id;entry.identity.turnId=id;
+      const t=record(started?.thread);
+      if(!identity(t?.id))throw Error('Private thread identity missing');
+      thread=t.id;
+      entry.identity={threadId:thread,turnId:null};
+      const routeMatches=started?.modelProvider==='openai'&&t.modelProvider==='openai'&&started?.model===model;
+      // Revoke admission immediately, before the native identity persistence await.
+      if(!routeMatches)this.invalidate();
       await callbacks.identity(entry.identity);
+      if(!routeMatches)throw Error('Private thread route mismatch');
+      check();
+      const start=record(await this.client.privateV3Request('turn/start',{threadId:thread,model,input:[{type:'text',text:work.job.target.prompt,text_elements:[]},...inputs.images.map(i=>({type:'localImage',path:i.path}))]}));
+      const id=record(start?.turn)?.id;
+      if(!identity(id))throw Error('Private turn identity missing');
+      turn=id;
+      entry.identity={threadId:thread,turnId:id};
+      // Interrupt as soon as possible; publication still waits for native identity ACK.
       if(entry.cancel||expired)void this.client.privateV3Request('turn/interrupt',{threadId:thread,turnId:turn}).catch(()=>{});
-      check();persisted=true;for(const event of pending.splice(0))consume(event);
+      await callbacks.identity(entry.identity);
+      check();
+      persisted=true;
+      for(const event of pending.splice(0))consume(event);
       return await result;
-    }finally{clearTimeout(timer);unsubscribe();exit();this.active.delete(work.job.requestId);}
+    }finally{clearTimeout(timer);unsubscribe();exit();}
   }
   async interrupt(work:RuntimeJob):Promise<{acknowledged:boolean}>{
-    const entry=this.active.get(work.job.requestId);if(!entry)return {acknowledged:false};entry.cancel=true;
-    if(!entry.identity.turnId)return {acknowledged:false};
-    try{await this.client.privateV3Request('turn/interrupt',{threadId:entry.identity.threadId,turnId:entry.identity.turnId});return {acknowledged:true};}catch{return {acknowledged:false};}
+    const entry=this.active.get(work.job.requestId);
+    if(!entry)return {acknowledged:false};
+    entry.cancel=true;
+    if(!entry.identity?.turnId)return {acknowledged:false};
+    try{
+      await this.client.privateV3Request('turn/interrupt',{threadId:entry.identity.threadId,turnId:entry.identity.turnId});
+      return {acknowledged:true};
+    }catch{
+      return {acknowledged:false};
+    }
   }
 }

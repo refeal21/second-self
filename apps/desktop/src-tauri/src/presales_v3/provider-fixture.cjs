@@ -19,7 +19,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     case 'thread/start': {
       const id = `thread-${++sequence}`;
       threads.set(id, p.cwd);
-      result = { thread: { id, modelProvider: 'openai' }, modelProvider: 'openai', model: 'synthetic-model' }; break;
+      const provider = fixture.threadProvider || 'openai';
+      result = { thread: { id, modelProvider: provider }, modelProvider: provider, model: fixture.threadModel || 'synthetic-model' }; break;
     }
     case 'turn/start': {
       const id = `turn-${++sequence}`;

@@ -25,7 +25,7 @@ fn exact_v1_owner_upgrades_without_changing_durable_activity_bytes() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         db.query_row(

@@ -25,6 +25,7 @@ impl V3Store {
         Ok(Self { connection })
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_project(&mut self, seed: ValidatedV3ProjectSeed) -> Result<(), String> {
         let snapshot = seed.into_snapshot();
         let tx = self
@@ -36,18 +37,7 @@ impl V3Store {
             params![snapshot.summary.project_id, snapshot.summary.revision],
         )
         .map_err(message)?;
-        tx.execute("INSERT INTO v3_projects (project_id, name, frozen_json, origin_json, palette_json, created_at, revision)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![snapshot.summary.project_id, snapshot.summary.name,
-                encode(&snapshot.frozen_checkpoint)?, encode(&snapshot.origin)?, encode(&snapshot.palette)?,
-                snapshot.summary.created_at, snapshot.summary.revision]).map_err(message)?;
-        for page in &snapshot.pages {
-            tx.execute("INSERT INTO v3_pages (project_id, slide_id, ordinal, spec_json, design_json, basis_json)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![
-                    snapshot.summary.project_id, page.slide_id, page.ordinal as i64,
-                    encode(&page.spec)?, page.design.as_ref().map(encode).transpose()?,
-                    page.visual_basis.as_ref().map(encode).transpose()?]).map_err(message)?;
-        }
+        insert_frozen_on(&tx, &snapshot)?;
         tx.commit().map_err(message)
     }
 
@@ -91,6 +81,25 @@ impl V3Store {
         tx.commit().map_err(message)?;
         Ok(snapshot)
     }
+}
+
+pub(super) fn insert_frozen_on(
+    tx: &Connection,
+    snapshot: &V3ProjectSnapshot,
+) -> Result<(), String> {
+    tx.execute("INSERT INTO v3_projects (project_id, name, frozen_json, origin_json, palette_json, created_at, revision)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![snapshot.summary.project_id, snapshot.summary.name,
+                encode(&snapshot.frozen_checkpoint)?, encode(&snapshot.origin)?, encode(&snapshot.palette)?,
+                snapshot.summary.created_at, snapshot.summary.revision]).map_err(message)?;
+    for page in &snapshot.pages {
+        tx.execute("INSERT INTO v3_pages (project_id, slide_id, ordinal, spec_json, design_json, basis_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![
+                    snapshot.summary.project_id, page.slide_id, page.ordinal as i64,
+                    encode(&page.spec)?, page.design.as_ref().map(encode).transpose()?,
+                    page.visual_basis.as_ref().map(encode).transpose()?]).map_err(message)?;
+    }
+    Ok(())
 }
 
 pub(super) fn load_on(
@@ -192,15 +201,21 @@ pub(super) fn load_pages_on(
         return Err("v3 frozen page set is incomplete".into());
     }
     for (page, row) in pages.iter_mut().zip(rows) {
+        let persisted_basis = row
+            .4
+            .as_deref()
+            .map(|raw| super::references::decode_basis(connection, project_id, &page.slide_id, raw))
+            .transpose()?;
         if page.slide_id != row.0
             || page.ordinal as i64 != row.1
             || page.spec != decode::<serde_json::Value>(&row.2)?
             || page.design != row.3.as_deref().map(decode).transpose()?
-            || page.visual_basis != row.4.as_deref().map(decode).transpose()?
+            || page.visual_basis != persisted_basis.as_ref().map(|(basis, _)| basis.clone())
         {
             return Err("v3 page does not match frozen evidence".into());
         }
         page.current_version_id = row.5;
+        page.references = persisted_basis.map_or_else(Vec::new, |(_, references)| references);
         page.revision = row.7;
         page.intent_request_id = row.8;
         page.approval = None;

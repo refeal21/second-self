@@ -51,7 +51,7 @@ pub struct V3FrozenCheckpoint {
 pub struct V3ProjectSnapshot {
     pub summary: V3ProjectSummary,
     pub origin: V3Origin,
-    pub frozen_checkpoint: V3FrozenCheckpoint,
+    pub frozen_checkpoint: super::V3FrozenEvidence,
     pub palette: VisualStyleState,
     pub pages: Vec<V3PageState>,
     pub delivery_snapshot: Option<V3DeliverySnapshot>,
@@ -86,6 +86,8 @@ pub struct V3PageState {
     pub origin_approvals: Vec<super::V3OriginApprovalRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_approval: Option<super::V3OriginApprovalRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<crate::presales_queue::ImageReferenceContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +214,8 @@ pub enum V3VisualProvenance {
         prompt_version: String,
         parent_visual: Option<ImageReference>,
         references: Vec<ImageReference>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reference_context: Vec<crate::presales_queue::ImageReferenceContext>,
     },
     LegacyImported {
         origin_digest: String,

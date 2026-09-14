@@ -22,7 +22,7 @@ pub(super) fn target(
     {
         return Err("frozen page requires a different bundled skill".into());
     }
-    let prompt = render(
+    let mut prompt = render(
         &page.spec,
         page.design.as_ref().ok_or("page has no approved design")?,
         &snapshot.palette,
@@ -30,6 +30,18 @@ pub(super) fn target(
         &policy,
         &skill,
     )?;
+    if !page.references.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(
+            policy["references"]
+                .as_str()
+                .ok_or("reference policy missing")?,
+        );
+        prompt.push('\n');
+        prompt.push_str(
+            &serde_json::to_string_pretty(&page.references).map_err(super::store::message)?,
+        );
+    }
     Ok(QueueTarget {
         project_id: snapshot.summary.project_id.clone(),
         slide_id: page.slide_id.clone(),
@@ -38,7 +50,8 @@ pub(super) fn target(
         skill: basis.skill.clone(),
         palette: basis.palette.clone(),
         parent_visual,
-        references: vec![],
+        references: page.references.iter().map(|r| r.image.clone()).collect(),
+        reference_context: page.references.clone(),
         prompt_version: policy["version"]
             .as_str()
             .ok_or("missing prompt policy version")?

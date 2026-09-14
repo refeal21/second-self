@@ -83,7 +83,7 @@ fn exact_schema_upgrade_preserves_native_queue_history_approvals_and_delivery() 
             .connection
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
 }
 
@@ -149,7 +149,7 @@ fn input(store: &V3Store, n: usize, request: &str) -> EnqueuePages {
         }],
     }
 }
-fn ready(store: &mut V3Store, vault: &ResultVault, request: &str) -> CommitResult {
+pub(super) fn ready(store: &mut V3Store, vault: &ResultVault, request: &str) -> CommitResult {
     // Synthetic provider completion: no login, external call, or generated customer file.
     let tx = store.connection.transaction().unwrap();
     loop {

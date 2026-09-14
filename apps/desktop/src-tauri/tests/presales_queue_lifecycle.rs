@@ -40,6 +40,7 @@ fn input(n: usize, slide: &str) -> EnqueueBatch {
                     sha256: "c".repeat(64),
                 }],
                 prompt_version: "v1".into(),
+                reference_context: vec![],
                 prompt: "Synthetic manifest test only".into(),
                 feedback: "Original feedback\n保留原文".into(),
             },

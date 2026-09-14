@@ -34,7 +34,9 @@ pub(crate) struct CapturedLegacySnapshot {
     checkpoint: ProjectCheckpoint,
     evidence: LegacySourceEvidence,
     snapshot_sha256: String,
+    #[cfg(test)]
     original_main: Vec<u8>,
+    #[cfg(test)]
     original_wal: Option<Vec<u8>>,
     selected_envelope: super::legacy_envelope::SelectedEnvelope,
 }
@@ -126,7 +128,9 @@ impl CapturedLegacySnapshot {
                     checkpoint,
                     evidence,
                     snapshot_sha256,
+                    #[cfg(test)]
                     original_main: files.0.bytes,
+                    #[cfg(test)]
                     original_wal: files.1.map(|w| w.bytes),
                     selected_envelope,
                 })
@@ -172,6 +176,7 @@ impl CapturedLegacySnapshot {
     }
     /// Original bounded database/WAL bytes remain private capture/recheck data.
     /// Never persist these shared database bytes in a selected-project envelope.
+    #[cfg(test)]
     pub(crate) fn raw_database_bytes(&self) -> (&[u8], Option<&[u8]>) {
         (&self.original_main, self.original_wal.as_deref())
     }

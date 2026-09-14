@@ -35,6 +35,12 @@ impl V3Store {
             let snapshot = load_on(tx, &input.project_id)?;
             let page = page_on(&snapshot, &input.slide_id)?;
             require_reviewable(tx, &input.project_id, page, input.expected_revision)?;
+            if !super::references::version_matches(
+                page,
+                super::publication::version_on(page, &input.version_id)?,
+            ) {
+                return Err("version references differ from current page selection".into());
+            }
             if page.current_version_id.as_deref() != Some(&input.version_id)
                 || page.visual_basis.as_ref() != Some(&input.basis)
                 || super::publication::version_on(page, &input.version_id)?
@@ -102,6 +108,12 @@ impl V3Store {
             let snapshot = load_on(tx, &input.project_id)?;
             let page = page_on(&snapshot, &input.slide_id)?;
             require_reviewable(tx, &input.project_id, page, input.expected_revision)?;
+            if !super::references::version_matches(
+                page,
+                super::publication::version_on(page, &input.version_id)?,
+            ) {
+                return Err("version references differ from current page selection".into());
+            }
             if super::publication::version_on(page, &input.version_id)?
                 .image
                 .as_ref()

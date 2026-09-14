@@ -9,6 +9,13 @@ use std::{
     time::Duration,
 };
 
+#[path = "draft_tests.rs"]
+mod draft_tests;
+#[path = "reference_tests.rs"]
+mod reference_tests;
+#[path = "text_tests.rs"]
+mod text_tests;
+
 #[path = "../../tests/support/v3_temp.rs"]
 mod temp;
 
@@ -606,7 +613,10 @@ fn cross_validated_pair_without_visuals_is_frozen_but_not_deliverable() {
         frozen.origin.hash_algorithm,
         "legacy-source-snapshot-sha256-v1"
     );
-    assert_eq!(frozen.frozen_checkpoint.pipeline["project"]["id"], f.id);
+    let V3FrozenEvidence::Native(evidence) = &frozen.frozen_checkpoint else {
+        panic!()
+    };
+    assert_eq!(evidence.pipeline["project"]["id"], f.id);
     assert!(project.pages()[0].versions.is_empty());
     assert!(s
         .create_delivery_snapshot(&project.summary().project_id)

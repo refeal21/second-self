@@ -1,9 +1,13 @@
 pub(crate) mod activity;
 mod activity_protocol;
 mod activity_storage;
+pub(crate) mod admission;
 mod basis;
 mod contracts;
 mod delivery;
+mod draft;
+mod draft_contracts;
+mod draft_settings;
 mod events;
 mod feedback;
 mod history;
@@ -16,7 +20,15 @@ mod legacy_envelope;
 mod legacy_snapshot;
 mod prompt;
 mod publication;
+pub(crate) mod reference_assets;
+mod references;
 mod review;
+mod text_context;
+mod text_contracts;
+mod text_operations;
+mod text_prompt;
+mod text_result;
+pub use reference_assets::NativeSelectedReference;
 mod service;
 mod store;
 mod validator_process;
@@ -24,9 +36,11 @@ mod wal_snapshot;
 
 pub(crate) use basis::ValidatedV3ProjectSeed;
 pub use contracts::*;
+pub use draft_contracts::*;
 pub use import_contracts::*;
 pub use service::V3WorkbenchService;
 pub use store::V3Store;
+pub use text_contracts::*;
 
 pub(crate) fn validate_native_upgrade(
     connection: &rusqlite::Connection,

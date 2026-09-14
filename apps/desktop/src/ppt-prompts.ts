@@ -1,8 +1,9 @@
 import type { NativePptPipeline, NativePromptContext } from '../../worker/src/native-pipeline.js';
 import { DETAIL_SPEC_CONTRACT } from '../../worker/src/slide-spec-contract.js';
 import type { VisualStyleState } from '../../worker/src/visual-style.js';
-import { buildPresalesStageInstructions, PRESALES_SKILL_METADATA, type PresalesPromptOptions } from '../../worker/src/presales/planning.js';
+import { PRESALES_SKILL_METADATA, type PresalesPromptOptions } from '../../worker/src/presales/planning.js';
 import { parseOutlineEnvelope } from '../../worker/src/presales/validation.js';
+import { buildPairedAuthoringPrompt } from '../../worker/src/presales/authoring.js';
 
 export type PptPromptStage = 'analysis' | 'outline' | 'details';
 
@@ -28,7 +29,6 @@ export function promptContextError(pipeline: NativePptPipeline, context: NativeP
 export function buildPptPrompt(pipeline: NativePptPipeline, stage: PptPromptStage, style?: VisualStyleState, presales?: PresalesPromptOptions): string {
   const context = getPromptContext(pipeline);
   const presalesStage = presales !== undefined && stage !== 'analysis' ? stage : null;
-  let approvedPresalesPlan;
   if (presalesStage === 'details') {
     if (!presales?.outline || !pipeline.outline) throw new Error('Presales details require the paired approved outline');
     if (!pipeline.analysis) throw new Error('Presales details require the current analysis');
@@ -39,7 +39,16 @@ export function buildPptPrompt(pipeline: NativePptPipeline, stage: PptPromptStag
     if (JSON.stringify(paired.outline) !== JSON.stringify(current.outline)) {
       throw new Error('Paired outline must exactly match the caller pipeline outline');
     }
-    approvedPresalesPlan = paired.plan;
+  }
+  if (presalesStage) {
+    if (!pipeline.analysis) throw new Error('Paired authoring requires current analysis');
+    return buildPairedAuthoringPrompt(presalesStage, {
+      name:pipeline.project.name,brief:pipeline.project.goal,context,
+      sources:pipeline.sources.map(source=>({original:source,asset:{relativePath:source.relativePath}})),
+      analysis:{original:pipeline.analysis,asset:{relativePath:pipeline.analysis.artifactRelativePath}},
+      preferences:pipeline.preferenceSnapshot,palette:style??{revision:0,profile:null,locked:false},
+      skill:PRESALES_SKILL_METADATA,approvedOutline:presales?.outline??null,
+    });
   }
   const input = {
     project: { name: pipeline.project.name, goal: pipeline.project.goal },
@@ -55,16 +64,8 @@ export function buildPptPrompt(pipeline: NativePptPipeline, stage: PptPromptStag
     ...(stage === 'details' ? { approvedOutline: pipeline.outline?.value ?? null,
       confirmedVisualStyle: style?.profile ? style : null } : {}),
     approvedPreferences: pipeline.preferenceSnapshot,
-    ...(presalesStage ? { presalesSkill: PRESALES_SKILL_METADATA } : {}),
-    ...(approvedPresalesPlan ? { approvedPresalesPlan } : {}),
   };
-  const task = presalesStage ? [
-    presalesStage === 'outline'
-      ? '依据 currentAnalysis 指定的当前分析产物生成完整售前大纲。默认中文、16:9、商务汇报；本次用户要求优先于默认值。'
-      : '依据 approvedOutline、approvedPresalesPlan 和 currentAnalysis 指定的当前分析产物生成全部页面细化与设计。',
-    buildPresalesStageInstructions(presalesStage),
-    '只使用当前分析与已给定材料，不使用旧版分析或旧大纲。confirmedVisualStyle 是配色与表达约束，不是事实来源；已确认项目配色优先于临时颜色意见与默认值，按主色、背景、文字和辅助色的角色使用。',
-  ] : {
+  const task = {
     analysis: [
       '读取下面 sourceFiles 清单中的材料，只使用文件内可验证事实；不要扫描项目外的文件。',
       '返回严格 JSON，结构必须符合 SourceAnalysis：{findings:[{id,text,sourceIds}],dataPoints:[{id,label,value,unit,sourceIds}],sourceMap:[{sourceId,title,locator,url?}]}。',

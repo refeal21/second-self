@@ -44,6 +44,7 @@ impl V3Store {
                 || page.revision != revision
                 || decode::<QueueTarget>(&target)? != current.target
                 || !target_matches_basis(&current, page)
+                || current.target.reference_context != page.references
             {
                 return Err("stale page generation intent or visual basis".into());
             }
@@ -75,6 +76,7 @@ impl V3Store {
                     prompt_version: current.target.prompt_version.clone(),
                     parent_visual: current.target.parent_visual.clone(),
                     references: current.target.references.clone(),
+                    reference_context: current.target.reference_context.clone(),
                 }),
                 created_at: created_at.clone(),
                 missing_image: None,

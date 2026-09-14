@@ -1,7 +1,7 @@
 use super::{
-    bundled_skill_metadata, native_value_hash, validate_pair, AnalysisBasis, DetailsBasis,
-    OutlineBasis, PresalesApprovalBinding, PresalesBasis, PresalesCheckpoint, PresalesDraftPair,
-    ProjectCheckpoint, SkillIdentity, VisibleBindingBasis, NATIVE_VALUE_HASH_ALGORITHM,
+    bundled_skill_metadata, validate_pair, PresalesApprovalBinding, PresalesBasis,
+    PresalesCheckpoint, PresalesDraftPair, ProjectCheckpoint, SkillIdentity,
+    NATIVE_VALUE_HASH_ALGORITHM,
 };
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde_json::Value;
@@ -64,58 +64,18 @@ fn derive_basis(pipeline: &Value, pair: &PresalesDraftPair) -> Result<PresalesBa
         }
     }
 
-    let outline = OutlineBasis {
-        version_id: string(pipeline, "/outline/version/id")?,
-        content_hash: native_value_hash(required(pipeline, "/outline/value")?).map_err(invalid)?,
-        plan_hash: native_value_hash(required(&pair.outline, "/plan")?).map_err(invalid)?,
-    };
-    let mut bindings = Vec::new();
-    let details = if let Some((specs_value, designs_value)) = details {
-        let specs = specs_value
-            .as_array()
-            .ok_or_else(|| invalid("details specs must be an array"))?;
-        let designs = designs_value
-            .as_array()
-            .ok_or_else(|| invalid("details designs must be an array"))?;
-        for (spec, design) in specs.iter().zip(designs) {
-            let slide_id = string(spec, "/id")?;
-            for binding in required(design, "/textBindings")?
-                .as_array()
-                .ok_or_else(|| invalid("textBindings must be an array"))?
-            {
-                let path = string(binding, "/path")?;
-                let visible = spec.pointer(&path).ok_or_else(|| {
-                    invalid(format!(
-                        "binding path {path} is absent from slide {slide_id}"
-                    ))
-                })?;
-                bindings.push(VisibleBindingBasis {
-                    slide_id: slide_id.clone(),
-                    id: string(binding, "/id")?,
-                    path,
-                    visible_value_hash: native_value_hash(visible).map_err(invalid)?,
-                });
-            }
-        }
-        Some(DetailsBasis {
-            version_id: string(pipeline, "/slideSpecs/version/id")?,
-            content_hash: native_value_hash(required(pipeline, "/slideSpecs/value")?)
-                .map_err(invalid)?,
-            design_hash: native_value_hash(designs_value).map_err(invalid)?,
-        })
-    } else {
-        None
-    };
-    Ok(PresalesBasis {
-        analysis: AnalysisBasis {
-            request_id: string(pipeline, "/analysis/requestId")?,
-            artifact_sha256: string(pipeline, "/analysis/sha256")?,
-            output_hash: native_value_hash(analysis).map_err(invalid)?,
-        },
-        outline,
-        details,
-        bindings,
-    })
+    super::paired_basis::derive_pair_basis(
+        analysis,
+        &string(pipeline, "/analysis/requestId")?,
+        &string(pipeline, "/analysis/sha256")?,
+        &string(pipeline, "/outline/version/id")?,
+        details
+            .map(|_| string(pipeline, "/slideSpecs/version/id"))
+            .transpose()?
+            .as_deref(),
+        pair,
+    )
+    .map_err(invalid)
 }
 
 fn structural_revision_is_pending(pipeline: &Value) -> bool {
@@ -357,6 +317,7 @@ fn validate_lifecycle(pipeline: &Value, checkpoint: &PresalesCheckpoint) -> Resu
     };
 
     for (index, binding) in bindings.iter().enumerate() {
+        super::paired_basis::validate_joint_binding(checkpoint, index).map_err(invalid)?;
         let expected_stage = if index == 0 {
             "outline_review"
         } else {

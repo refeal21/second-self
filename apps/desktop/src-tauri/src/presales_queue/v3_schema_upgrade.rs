@@ -8,7 +8,7 @@ pub(crate) fn inject_failure(stage: Option<&'static str>) {
     FAILURE.with(|f| f.set(stage));
 }
 #[cfg(test)]
-fn failure_point(stage: &'static str) -> Result<(), String> {
+pub(super) fn failure_point(stage: &'static str) -> Result<(), String> {
     if FAILURE.with(|f| f.get() == Some(stage)) {
         return Err(format!("injected v3 upgrade failure: {stage}"));
     }
@@ -100,6 +100,9 @@ pub(super) fn upgrade(connection: &mut Connection) -> Result<(), String> {
                 failure_point("after_row_copy")?;
             }
         }
+        for object in v3_text_schema::OBJECTS {
+            tx.execute(object.sql, []).map_err(message)?;
+        }
         verify_schema(&user_schema_objects(&tx)?, DatabaseProfile::PresalesV3)?;
         let violations = tx
             .prepare("PRAGMA foreign_key_check")
@@ -112,7 +115,7 @@ pub(super) fn upgrade(connection: &mut Connection) -> Result<(), String> {
         if violations || integrity != "ok" {
             return Err("v3 upgrade integrity verification failed".into());
         }
-        tx.pragma_update(None, "user_version", 2).map_err(message)?;
+        tx.pragma_update(None, "user_version", 3).map_err(message)?;
         #[cfg(test)]
         failure_point("before_commit")?;
         tx.commit().map_err(message)

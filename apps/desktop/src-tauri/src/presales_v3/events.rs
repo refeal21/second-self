@@ -1,7 +1,7 @@
 use super::store::{bump_project, decode, encode, load_on, message, page_on, write_on};
 use super::*;
 use crate::presales_queue::{
-    store::{enqueue_on, read_batch_outcome, read_jobs},
+    store::{enqueue_v3_on, read_batch_outcome, read_jobs},
     EnqueueBatch, EnqueueJob, EnqueueOutcome, JobStatus, ResultVault,
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -94,7 +94,7 @@ impl V3Store {
                     target,
                 });
             }
-            let outcome = enqueue_on(
+            let outcome = enqueue_v3_on(
                 tx,
                 EnqueueBatch {
                     batch_id: input.batch_id.clone(),

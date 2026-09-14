@@ -66,6 +66,7 @@ fn target(project_id: &str, slide_id: &str) -> QueueTarget {
             sha256: HASH_C.into(),
         }],
         prompt_version: "prompt-v1".into(),
+        reference_context: vec![],
         prompt: format!("Generate synthetic slide {slide_id}"),
         feedback: "Synthetic feedback only".into(),
     }

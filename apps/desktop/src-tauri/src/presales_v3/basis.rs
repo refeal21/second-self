@@ -14,6 +14,38 @@ pub(crate) struct ValidatedV3ProjectSeed {
 }
 
 impl ValidatedV3ProjectSeed {
+    pub(super) fn from_authored(
+        draft: V3ImportedDraft,
+        receipt: &super::import_evidence::ImportReceipt,
+    ) -> Result<Self, String> {
+        let V3WorkbenchProject::Draft(initial) = super::import::initial_projection(receipt)? else {
+            return Err("authored seed requires exact imported draft origin".into());
+        };
+        super::draft::validate(&draft, &initial)?;
+        let current: SkillIdentity =
+            serde_json::from_value(bundled_skill_metadata()).map_err(message)?;
+        if draft
+            .authored
+            .as_ref()
+            .ok_or("authored evidence missing")?
+            .skill
+            != current
+        {
+            return Err("promotion requires the current bundled skill".into());
+        }
+        let promoted_revision = draft
+            .summary
+            .revision
+            .checked_add(1)
+            .ok_or("draft revision exhausted")?;
+        Ok(Self {
+            snapshot: authored_snapshot(V3AuthoredFrozen {
+                kind: V3AuthoredKind::AuthoredV3,
+                origin: draft,
+                promoted_revision,
+            })?,
+        })
+    }
     pub(crate) fn from_checkpoint(
         checkpoint: ProjectCheckpoint,
         palette: VisualStyleState,
@@ -92,10 +124,6 @@ pub(super) fn frozen_snapshot(
         .details
         .as_ref()
         .ok_or("missing paired details")?;
-    let specs = details["specs"].as_array().ok_or("missing paired specs")?;
-    let designs = details["designs"]
-        .as_array()
-        .ok_or("missing paired designs")?;
     let version = &frozen
         .presales
         .basis
@@ -107,6 +135,86 @@ pub(super) fn frozen_snapshot(
         version: frozen.presales.skill.version.clone(),
         sha256: frozen.presales.skill.sha256.clone(),
     };
+    let pages = pages_from_pair(details, version, skill, palette_hash)?;
+    let origin = V3Origin {
+        source_project_id: project_id.clone(),
+        source_revision,
+        hash_algorithm: NATIVE_VALUE_HASH_ALGORITHM.into(),
+        snapshot_digest: native_value_hash(&serde_json::to_value(&frozen).map_err(message)?)?,
+    };
+    Ok(V3ProjectSnapshot {
+        summary: V3ProjectSummary {
+            project_id,
+            name,
+            page_count: pages.len(),
+            revision: 1,
+            created_at,
+        },
+        origin,
+        frozen_checkpoint: V3FrozenEvidence::Native(frozen),
+        palette,
+        pages,
+        delivery_snapshot: None,
+    })
+}
+
+pub(super) fn authored_snapshot(evidence: V3AuthoredFrozen) -> Result<V3ProjectSnapshot, String> {
+    let draft = &evidence.origin;
+    let a = draft.authored.as_ref().ok_or("authored pair missing")?;
+    let c = a.checkpoint.as_ref().ok_or("authored checkpoint missing")?;
+    if c.approval_bindings.len() != 2
+        || draft.summary.revision.checked_add(1) != Some(evidence.promoted_revision)
+    {
+        return Err("promotion requires both exact joint approvals".into());
+    }
+    let palette = &a.settings.palette;
+    if palette.revision < 1 {
+        return Err("promotion requires saved palette revision".into());
+    }
+    let profile = palette
+        .profile
+        .as_ref()
+        .ok_or("promotion requires saved palette")?;
+    validate_profile(profile)?;
+    let details = c.draft.details.as_ref().ok_or("complete details missing")?;
+    let pages = pages_from_pair(
+        details,
+        &c.basis
+            .details
+            .as_ref()
+            .ok_or("details basis missing")?
+            .version_id,
+        VersionHash {
+            version: a.skill.version.clone(),
+            sha256: a.skill.sha256.clone(),
+        },
+        VersionHash {
+            version: palette.revision.to_string(),
+            sha256: native_value_hash(&serde_json::to_value(profile).map_err(message)?)?,
+        },
+    )?;
+    let mut summary = draft.summary.clone();
+    summary.revision = evidence.promoted_revision;
+    Ok(V3ProjectSnapshot {
+        summary,
+        origin: draft.origin.clone(),
+        palette: palette.clone(),
+        pages,
+        frozen_checkpoint: V3FrozenEvidence::Authored(evidence),
+        delivery_snapshot: None,
+    })
+}
+
+pub(super) fn pages_from_pair(
+    details: &Value,
+    version: &str,
+    skill: VersionHash,
+    palette_hash: VersionHash,
+) -> Result<Vec<V3PageState>, String> {
+    let specs = details["specs"].as_array().ok_or("missing paired specs")?;
+    let designs = details["designs"]
+        .as_array()
+        .ok_or("missing paired designs")?;
     let mut ids = std::collections::HashSet::new();
     let pages = specs
         .iter()
@@ -125,11 +233,11 @@ pub(super) fn frozen_snapshot(
                 visual_basis: Some(V3VisualBasis {
                     hash_algorithm: NATIVE_VALUE_HASH_ALGORITHM.into(),
                     spec: VersionHash {
-                        version: version.clone(),
+                        version: version.into(),
                         sha256: native_value_hash(spec)?,
                     },
                     design: VersionHash {
-                        version: version.clone(),
+                        version: version.into(),
                         sha256: native_value_hash(design)?,
                     },
                     skill: skill.clone(),
@@ -145,29 +253,11 @@ pub(super) fn frozen_snapshot(
                 feedback_drafts: vec![],
                 origin_approvals: vec![],
                 origin_approval: None,
+                references: vec![],
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let origin = V3Origin {
-        source_project_id: project_id.clone(),
-        source_revision,
-        hash_algorithm: NATIVE_VALUE_HASH_ALGORITHM.into(),
-        snapshot_digest: native_value_hash(&serde_json::to_value(&frozen).map_err(message)?)?,
-    };
-    Ok(V3ProjectSnapshot {
-        summary: V3ProjectSummary {
-            project_id,
-            name,
-            page_count: pages.len(),
-            revision: 1,
-            created_at,
-        },
-        origin,
-        frozen_checkpoint: frozen,
-        palette,
-        pages,
-        delivery_snapshot: None,
-    })
+    Ok(pages)
 }
 
 fn required_string(value: &Value, pointer: &str) -> Result<String, String> {
@@ -342,11 +432,11 @@ pub(super) mod tests {
         store.insert_project(seed).unwrap();
         let loaded = store.load_project("frozen-project").unwrap();
         assert_eq!(loaded.summary.page_count, 1);
-        assert_eq!(loaded.frozen_checkpoint.pipeline, checkpoint.pipeline);
-        assert_eq!(
-            Some(loaded.frozen_checkpoint.presales.clone()),
-            checkpoint.presales
-        );
+        let V3FrozenEvidence::Native(evidence) = &loaded.frozen_checkpoint else {
+            panic!()
+        };
+        assert_eq!(evidence.pipeline, checkpoint.pipeline);
+        assert_eq!(Some(evidence.presales.clone()), checkpoint.presales);
         assert_eq!(loaded.palette, palette);
         assert!(loaded.pages[0].versions.is_empty());
         assert!(loaded.pages[0].approval.is_none());

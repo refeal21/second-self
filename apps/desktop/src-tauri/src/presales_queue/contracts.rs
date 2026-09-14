@@ -15,6 +15,23 @@ pub struct ImageReference {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferencePurpose {
+    Style,
+    Layout,
+    Composition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageReferenceContext {
+    pub image: ImageReference,
+    pub relative_path: String,
+    pub byte_length: u64,
+    pub purpose: ReferencePurpose,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueueTarget {
     pub project_id: String,
@@ -25,6 +42,8 @@ pub struct QueueTarget {
     pub palette: VersionHash,
     pub parent_visual: Option<ImageReference>,
     pub references: Vec<ImageReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_context: Vec<ImageReferenceContext>,
     pub prompt_version: String,
     pub prompt: String,
     pub feedback: String,

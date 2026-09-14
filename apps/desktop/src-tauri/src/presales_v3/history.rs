@@ -60,6 +60,7 @@ pub(super) fn load_page_history(
                 prompt_version,
                 parent_visual,
                 references,
+                reference_context,
             }),
         ) = (
             &version.request_id,
@@ -84,8 +85,12 @@ pub(super) fn load_page_history(
             || job.target.prompt_version != *prompt_version
             || job.target.parent_visual != *parent_visual
             || job.target.references != *references
+            || job.target.reference_context != *reference_context
         {
             return Err("version provenance mismatch".into());
+        }
+        for reference in reference_context {
+            super::reference_assets::verify(connection, project_id, &page.slide_id, reference)?;
         }
         let (receipt_attempt, receipt_version, encoded): (String, String, String) = connection
             .query_row(
@@ -174,6 +179,9 @@ pub(super) fn load_page_history(
     }
     super::import_read::load_origins(connection, project_id, page, imported)?;
     if let Some(id) = approved_version {
+        if !super::references::version_matches(page, super::publication::version_on(page, id)?) {
+            return Err("effective approval has stale page references".into());
+        }
         if page.current_version_id.as_deref() != Some(id)
             || super::events::active_job(connection, project_id, &page.slide_id)?.is_some()
         {

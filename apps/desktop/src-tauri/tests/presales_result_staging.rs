@@ -55,6 +55,7 @@ fn target(slide: &str) -> QueueTarget {
         palette: version(),
         parent_visual: None,
         references: Vec::new(),
+        reference_context: vec![],
         prompt_version: "v1".into(),
         prompt: format!("Synthetic staging test for {slide}"),
         feedback: String::new(),

@@ -203,6 +203,13 @@ pub(super) fn load_on(
         .map_err(message)?;
     let counts: (i64,i64,i64) = connection.query_row("SELECT (SELECT count(*) FROM v3_projects WHERE project_id=?1),(SELECT count(*) FROM v3_draft_projects WHERE project_id=?1),(SELECT count(*) FROM v3_history_projects WHERE project_id=?1)",[project],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(message)?;
     let mut result = super::import::initial_projection(&receipt)?;
+    if receipt.kind == V3CatalogKind::Draft && kind == "frozen" {
+        if counts != (1, 0, 0) {
+            return Err("authored frozen catalog mismatch".into());
+        }
+        return super::draft::load_frozen_on(connection, project, &receipt, revision)
+            .map(V3WorkbenchProject::Frozen);
+    }
     match &mut result {
         V3WorkbenchProject::Frozen(p) => {
             if kind != "frozen" || counts != (1, 0, 0) {
@@ -210,7 +217,7 @@ pub(super) fn load_on(
             }
             let (name,frozen,origin,palette,created,stored_revision): (String,String,String,String,String,i64) = connection.query_row("SELECT name,frozen_json,origin_json,palette_json,created_at,revision FROM v3_projects WHERE project_id=?1",[project],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).map_err(message)?;
             if name != p.summary.name
-                || decode::<V3FrozenCheckpoint>(&frozen)? != p.frozen_checkpoint
+                || decode::<V3FrozenEvidence>(&frozen)? != p.frozen_checkpoint
                 || decode::<V3Origin>(&origin)? != p.origin
                 || decode::<crate::visual_style::VisualStyleState>(&palette)? != p.palette
                 || created != p.summary.created_at
@@ -242,20 +249,14 @@ pub(super) fn load_on(
                 super::history::load_delivery_pages(connection, &p.summary, &p.pages)?;
         }
         V3WorkbenchProject::Draft(p) => {
-            if kind != "draft" || counts != (0, 1, 0) || revision != 1 {
+            if kind != "draft" || counts != (0, 1, 0) {
                 return Err("import draft catalog mismatch".into());
             }
-            let raw: String = connection
-                .query_row(
-                    "SELECT draft_json FROM v3_draft_projects WHERE project_id=?1",
-                    [project],
-                    |r| r.get(0),
-                )
-                .map_err(message)?;
             let live: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM v3_pages WHERE project_id=?1) OR EXISTS(SELECT 1 FROM v3_delivery_snapshots WHERE project_id=?1)",[project],|r|r.get(0)).map_err(message)?;
-            if decode::<V3ImportedDraft>(&raw)? != *p || live {
+            if live {
                 return Err("import draft has modified origin or live visual selection".into());
             }
+            *p = super::draft::load_on(connection, project, &receipt)?;
         }
     }
     Ok(result)

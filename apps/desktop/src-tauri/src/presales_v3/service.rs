@@ -16,7 +16,7 @@ use std::{
 };
 
 pub struct V3WorkbenchService {
-    store: Mutex<V3Store>,
+    pub(super) store: Mutex<V3Store>,
     root: PathBuf,
     activity: Arc<LegacyActivityTracker>,
     validator: LegacyValidatorProcess,

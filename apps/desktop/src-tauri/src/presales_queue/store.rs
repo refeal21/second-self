@@ -110,6 +110,21 @@ pub(crate) fn enqueue_on(
     transaction: &rusqlite::Transaction<'_>,
     input: EnqueueBatch,
 ) -> Result<EnqueueOutcome, String> {
+    enqueue_with_sequence_on(transaction, input, false)
+}
+
+pub(crate) fn enqueue_v3_on(
+    transaction: &rusqlite::Transaction<'_>,
+    input: EnqueueBatch,
+) -> Result<EnqueueOutcome, String> {
+    enqueue_with_sequence_on(transaction, input, true)
+}
+
+fn enqueue_with_sequence_on(
+    transaction: &rusqlite::Transaction<'_>,
+    input: EnqueueBatch,
+    v3: bool,
+) -> Result<EnqueueOutcome, String> {
     validate_batch(&input)?;
     let input_json = serde_json::to_string(&input).map_err(message)?;
     let now = epoch_milliseconds()?;
@@ -134,6 +149,13 @@ pub(crate) fn enqueue_on(
     }
 
     for job in &input.jobs {
+        if v3 {
+            crate::presales_v3::admission::check_image_identities(
+                transaction,
+                &job.request_id,
+                &job.attempt_id,
+            )?;
+        }
         let collision = transaction
             .query_row(
                 "SELECT 1 FROM queue_batch_entries
@@ -173,12 +195,17 @@ pub(crate) fn enqueue_on(
             (request_id, true)
         } else {
             let target_json = serde_json::to_string(&input_job.target).map_err(message)?;
+            let sequence = if v3 {
+                Some(crate::presales_v3::admission::next_sequence(transaction)?)
+            } else {
+                None
+            };
             transaction
                 .execute(
                     "INSERT INTO queue_jobs (
                            batch_id, request_id, attempt_id, project_id, slide_id, target_json,
-                           status, created_at_ms, updated_at_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?7)",
+                           status, created_at_ms, updated_at_ms, sequence
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?7, ?8)",
                     params![
                         input.batch_id,
                         input_job.request_id,
@@ -187,6 +214,7 @@ pub(crate) fn enqueue_on(
                         input_job.target.slide_id,
                         target_json,
                         now,
+                        sequence,
                     ],
                 )
                 .map_err(message)?;
@@ -496,6 +524,26 @@ fn validate_target(target: &QueueTarget) -> Result<(), String> {
         }
     }
     let encoded = serde_json::to_vec(target).map_err(message)?;
+    if !target.reference_context.is_empty() {
+        if target.reference_context.len() != target.references.len() {
+            return Err("reference context must match exact image set".into());
+        }
+        for (context, image) in target.reference_context.iter().zip(&target.references) {
+            if &context.image != image
+                || context.byte_length == 0
+                || context.byte_length > 64 * 1024 * 1024
+                || context.relative_path.len() > 1024
+                || context.relative_path.contains('\\')
+                || context.relative_path.contains('\0')
+                || context
+                    .relative_path
+                    .split('/')
+                    .any(|p| p.is_empty() || p == "." || p == "..")
+            {
+                return Err("reference context image, locator or byte length mismatch".into());
+            }
+        }
+    }
     if encoded.len() > MAX_TARGET_BYTES {
         return Err(format!(
             "serialized target exceeds {MAX_TARGET_BYTES} bytes"

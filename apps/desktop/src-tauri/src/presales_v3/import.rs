@@ -118,6 +118,7 @@ pub(super) fn prepare(
                     feedback_drafts: vec![],
                     origin_approvals: vec![],
                     origin_approval: None,
+                    references: vec![],
                 })
             })
             .collect::<Result<Vec<_>, String>>()?
@@ -304,6 +305,7 @@ pub(super) fn initial_projection(receipt: &ImportReceipt) -> Result<V3WorkbenchP
                 original_outline: optional(&receipt.pipeline["outline"]),
                 palette: receipt.palette.clone(),
                 comparison_pages: receipt.pages.clone(),
+                authored: None,
             }))
         }
     }

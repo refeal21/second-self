@@ -5,6 +5,8 @@ use std::time::Duration;
 mod v3_schema_upgrade;
 #[path = "v3_schema_v1.rs"]
 mod v3_schema_v1;
+#[path = "v3_text_schema.rs"]
+mod v3_text_schema;
 
 #[cfg(test)]
 pub(crate) use v3_schema_upgrade::inject_failure as inject_v3_upgrade_failure;
@@ -317,15 +319,21 @@ impl DatabaseProfile {
     fn identity(self) -> (i64, i64) {
         match self {
             Self::QueueOnly => (0x44545133, 2),
-            Self::PresalesV3 => (0x44545633, 2),
+            Self::PresalesV3 => (0x44545633, 3),
         }
     }
 
     fn objects(self) -> impl Iterator<Item = &'static SchemaObject> {
-        SCHEMA_OBJECTS.iter().chain(match self {
-            Self::QueueOnly => [].iter(),
-            Self::PresalesV3 => V3_OBJECTS.iter(),
-        })
+        SCHEMA_OBJECTS
+            .iter()
+            .chain(match self {
+                Self::QueueOnly => [].iter(),
+                Self::PresalesV3 => V3_OBJECTS.iter(),
+            })
+            .chain(match self {
+                Self::QueueOnly => [].iter(),
+                Self::PresalesV3 => v3_text_schema::OBJECTS.iter(),
+            })
     }
 }
 
@@ -339,12 +347,19 @@ pub(crate) fn initialize(
     let user_version = pragma_i64(&connection, "user_version")?;
     let objects = user_schema_objects(&connection)?;
     let unowned_empty = application_id == 0 && user_version == 0 && objects.is_empty();
-    let upgrade = matches!(profile, DatabaseProfile::PresalesV3)
+    let upgrade_v1 = matches!(profile, DatabaseProfile::PresalesV3)
         && application_id == 0x44545633
         && user_version == 1;
-    if upgrade {
+    let upgrade_v2 = matches!(profile, DatabaseProfile::PresalesV3)
+        && application_id == 0x44545633
+        && user_version == 2;
+    let upgrade = upgrade_v1 || upgrade_v2;
+    if upgrade_v1 {
         v3_schema_upgrade::verify_v1(&objects)?;
         v3_schema_upgrade::upgrade(&mut connection)?;
+    }
+    if upgrade_v2 {
+        v3_text_schema::upgrade(&mut connection)?;
     }
     if !unowned_empty
         && !upgrade

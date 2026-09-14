@@ -1,4 +1,5 @@
 mod checkpoint;
+pub(crate) mod paired_basis;
 pub(crate) mod storage;
 mod validation;
 

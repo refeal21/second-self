@@ -324,6 +324,52 @@ describe('Gallery', () => {
     expect(onGenerate).toHaveBeenCalledTimes(1);
   });
 
+  it('releases an uncertain submission only when the exact attempted request appears in native state', async () => {
+    const user = userEvent.setup();
+    const onGenerate = vi.fn(async () => ({ requestIds: {}, attemptedRequestIds: { b: 'attempted-b-request' } }));
+    const input = props({ onGenerate }); const { rerender } = render(<Gallery {...input} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.click(screen.getByRole('button', { name: '生成新稿' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(await screen.findByText('提交结果待确认，请核对任务列表；暂不重复提交。')).toBeVisible();
+    rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'completed', requestId: 'other-request' } } : p) }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'completed', requestId: 'attempted-b-request' } } : p) }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+  });
+
+  it('reconciles accepted and missing pages of a partial batch independently by their exact request IDs', async () => {
+    const user = userEvent.setup();
+    const d = { ...base.pages[1]!, id: 'd', number: 4, title: '成果', candidateVersionId: 'd1', versions: [{ id: 'd1', revision: 1, label: '候选稿', manualRevision: 0, approved: false, image: image('d1') }] };
+    const initial = { ...base, pages: [...base.pages, d] };
+    const onBatchGenerate = vi.fn(async () => ({ requestIds: { b: 'accepted-b' }, attemptedRequestIds: { b: 'accepted-b', d: 'attempted-d' } }));
+    const input = props({ model: initial, onBatchGenerate }); const { rerender } = render(<Gallery {...input} />);
+    await user.click(screen.getByRole('checkbox', { name: '选择第 2 页' }));
+    await user.click(screen.getByRole('checkbox', { name: '选择第 4 页' }));
+    await user.click(screen.getByRole('button', { name: '批量生成所选页' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('回执不完整');
+    rerender(<Gallery {...input} model={{ ...initial, pages: initial.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'completed', requestId: 'accepted-b' } } : p.id === 'd' ? { ...p, job: { state: 'completed', requestId: 'other-d' } } : p) }} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: /第 4 页 成果/ }));
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    rerender(<Gallery {...input} model={{ ...initial, pages: initial.pages.map(p => p.id === 'd' ? { ...p, job: { state: 'completed', requestId: 'attempted-d' } } : p) }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+  });
+
+  it('releases a proven pre-invocation validation failure without treating it as uncertain admission', async () => {
+    const user = userEvent.setup();
+    const onGenerate = vi.fn(async () => ({ requestIds: {}, notSubmitted: { b: '页面依据已变化' } }));
+    render(<Gallery {...props({ onGenerate })} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.click(screen.getByRole('button', { name: '生成新稿' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('页面依据已变化');
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+    expect(onGenerate).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps a generic rejected generation fenced as outcome-unknown until authoritative reconciliation', async () => {
     const user = userEvent.setup(); const onGenerate = vi.fn(async () => { throw new Error('入队失败'); });
     render(<Gallery {...props({ onGenerate })} />);

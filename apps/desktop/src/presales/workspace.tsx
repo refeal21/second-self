@@ -5,7 +5,7 @@ import { toGalleryModel, nativePage } from './read-model.js';
 import { DraftWorkspace } from './draft-workspace.js';
 import { PreVersionFeedbackEditor } from './feedback-editor.js';
 import type { GalleryGenerationReceipt, GalleryVersionRef } from './gallery/model.js';
-import type { PresalesAdapter, V3Page, V3Project, V3ProjectSnapshot, V3QueueSnapshot } from './adapter.js';
+import type { PresalesAdapter, V3Page, V3PageRequest, V3Project, V3ProjectSnapshot, V3QueueSnapshot } from './adapter.js';
 import './workspace.css';
 
 type PendingIntent = { requestId: string; attemptId: string };
@@ -77,38 +77,41 @@ export function PresalesWorkspacePage({ adapter, projectId, initialPageId, initi
     return { currentPage, version };
   }
   async function enqueue(ids: string[], parent: GalleryVersionRef | null): Promise<GalleryGenerationReceipt> {
-    const current = frozen(); const currentQueue = queueRef.current;
-    if (!currentQueue?.capabilities?.generation) throw new Error(currentQueue?.capabilities?.reason ?? '图片生成能力尚未确认');
-    if (parent && !currentQueue.capabilities.referenceEditing) throw new Error(currentQueue.capabilities.reason ?? '模型不支持图片参考编辑');
-    const targets = ids.map(id => {
-      const native = nativePage(current, id);
-      if (!native.visualBasis || currentQueue.jobs.some(job => job.kind === 'image' && job.projectId === projectId && job.slideId === id && ['queued', 'dispatching', 'running', 'result_ready', 'committing', 'cancel_requested', 'outcome_unknown'].includes(job.status))) throw new Error(`第 ${native.ordinal} 页当前不符合生成条件`);
-      const existing = pendingIntents.get(pendingKey(projectId, id));
-      if (existing) throw new Error('该页前次提交结果待核对，请勿重复提交');
-      const parentVersion = parent?.pageId === id ? exact(parent).version : null;
-      if (parent && (!parentVersion?.image || !parentVersion.basis)) throw new Error('父版本图片或依据缺失，不能作为图片编辑输入');
-      return { id, native, parentVersion };
-    });
-    const pages = targets.map(({ id, native, parentVersion }) => {
-      const intent = { requestId: makeId(), attemptId: makeId() };
-      pendingIntents.set(pendingKey(projectId, id), intent);
-      return { slideId: id, ...intent, expectedRevision: native.revision, parentVersionId: parentVersion?.versionId ?? null,
-        feedback: native.feedbackDrafts.find(draft => draft.baseVersionId === (parentVersion?.versionId ?? native.currentVersionId ?? null))?.text ?? '' };
-    });
+    let pages: V3PageRequest[];
+    try {
+      const current = frozen(); const currentQueue = queueRef.current;
+      if (!currentQueue?.capabilities?.generation) throw new Error(currentQueue?.capabilities?.reason ?? '图片生成能力尚未确认');
+      if (parent && !currentQueue.capabilities.referenceEditing) throw new Error(currentQueue.capabilities.reason ?? '模型不支持图片参考编辑');
+      const targets = ids.map(id => {
+        const native = nativePage(current, id);
+        if (native.references.length && !currentQueue.capabilities?.referenceEditing) throw new Error(currentQueue.capabilities?.reason ?? '当前模型未确认图片参考输入能力');
+        if (!native.visualBasis || currentQueue.jobs.some(job => job.kind === 'image' && job.projectId === projectId && job.slideId === id && ['queued', 'dispatching', 'running', 'result_ready', 'committing', 'cancel_requested', 'outcome_unknown'].includes(job.status))) throw new Error(`第 ${native.ordinal} 页当前不符合生成条件`);
+        if (pendingIntents.has(pendingKey(projectId, id))) throw new Error('该页前次提交结果待核对，请勿重复提交');
+        const parentVersion = parent?.pageId === id ? exact(parent).version : null;
+        if (parent && (!parentVersion?.image || !parentVersion.basis)) throw new Error('父版本图片或依据缺失，不能作为图片编辑输入');
+        return { id, native, parentVersion };
+      });
+      pages = targets.map(({ id, native, parentVersion }) => ({ slideId: id, requestId: makeId(), attemptId: makeId(), expectedRevision: native.revision, parentVersionId: parentVersion?.versionId ?? null,
+        feedback: native.feedbackDrafts.find(draft => draft.baseVersionId === (parentVersion?.versionId ?? null))?.text ?? '' }));
+    } catch (caught) {
+      return { requestIds: {}, notSubmitted: Object.fromEntries(ids.map(id => [id, errorText(caught)])) };
+    }
+    for (const submitted of pages) pendingIntents.set(pendingKey(projectId, submitted.slideId), { requestId: submitted.requestId, attemptId: submitted.attemptId });
     try {
       const result = await adapter.enqueue(projectId, makeId(), pages);
       const requestIds: Record<string, string> = {};
+      const attemptedRequestIds = Object.fromEntries(pages.map(submitted => [submitted.slideId, submitted.requestId]));
       for (const submitted of pages) {
         const accepted = result.jobs.find(job => job.target.projectId === projectId && job.target.slideId === submitted.slideId && job.requestId === submitted.requestId);
         if (accepted) requestIds[submitted.slideId] = accepted.requestId;
       }
       await refresh();
-      return { requestIds };
+      return { requestIds, attemptedRequestIds };
     } catch (caught) {
       // A transport error is not proof of non-admission. Keep stable IDs for reconciliation.
       setError(`${errorText(caught)}。提交结果待确认；不会自动重发。`);
       try { await refresh(); } catch { /* remain fenced */ }
-      return { requestIds: {} };
+      return { requestIds: {}, attemptedRequestIds: Object.fromEntries(pages.map(submitted => [submitted.slideId, submitted.requestId])) };
     }
   }
   async function versionAction(ref: GalleryVersionRef, kind: 'adopt' | 'restore' | 'approve', checks?: { contentChecked: true; visualChecked: true }) {

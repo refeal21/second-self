@@ -31,7 +31,8 @@ function alignPlan(outline: PptOutline, previous: OutlineEnvelope['plan']): Outl
 }
 function explain(error: unknown) { return error instanceof Error ? error.message : typeof error === 'string' ? error : '操作未完成'; }
 const activeStatuses = new Set(['queued', 'dispatching', 'running', 'result_ready', 'committing', 'cancel_requested', 'outcome_unknown']);
-const uncertainTextRequests = new Map<string, string>();
+type AuthorInput = Parameters<PresalesAdapter['author']>[0];
+const uncertainTextRequests = new Map<string, AuthorInput>();
 
 export function DraftWorkspace({ adapter, project, queue, refresh, onDirtyChange }: { adapter: PresalesAdapter; project: V3ImportedDraft; queue: V3QueueSnapshot; refresh: () => Promise<void>; onDirtyChange: (dirty: boolean) => void }) {
   const saved = project.authored?.checkpoint;
@@ -45,7 +46,7 @@ export function DraftWorkspace({ adapter, project, queue, refresh, onDirtyChange
   const [manualPalette, setManualPalette] = useState(false);
   const [profile, setProfile] = useState<VisualStyleProfile>(settings?.palette.profile ?? emptyProfile());
   const [operations, setOperations] = useState<V3TextOperation[]>([]);
-  const [uncertainRequest, setUncertainRequest] = useState(() => uncertainTextRequests.get(project.summary.projectId) ?? null);
+  const [uncertainRequest, setUncertainRequest] = useState<AuthorInput | null>(() => uncertainTextRequests.get(project.summary.projectId) ?? null);
   const [selectedOperationId, setSelectedOperationId] = useState<string | null>(null);
   const [designReviewed, setDesignReviewed] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -57,7 +58,7 @@ export function DraftWorkspace({ adapter, project, queue, refresh, onDirtyChange
   const sources = useMemo(() => sourcesOf(project), [project.sources]);
   const dirty = Object.values(dirtySections).some(Boolean);
   useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
-  useEffect(() => { let active = true; void adapter.textHistory(project.summary.projectId).then(items => { if (!active) return; setOperations(items); const pendingId = uncertainTextRequests.get(project.summary.projectId); if (pendingId && items.some(item => item.operationId === pendingId)) { uncertainTextRequests.delete(project.summary.projectId); setUncertainRequest(null); } }, caught => { if (active) setError(explain(caught)); }); return () => { active = false; }; }, [adapter, project.summary.projectId, project.summary.revision, queue.jobs]);
+  useEffect(() => { let active = true; void adapter.textHistory(project.summary.projectId).then(items => { if (!active) return; setOperations(items); const pendingInput = uncertainTextRequests.get(project.summary.projectId); if (pendingInput && items.some(item => item.operationId === pendingInput.operationId && item.attemptId === pendingInput.attemptId)) { uncertainTextRequests.delete(project.summary.projectId); setUncertainRequest(null); } }, caught => { if (active) setError(explain(caught)); }); return () => { active = false; }; }, [adapter, project.summary.projectId, project.summary.revision, queue.jobs]);
   useEffect(() => {
     if (priorRevision.current !== project.summary.revision && dirty) setError('项目已被其他操作更新；本地未保存输入保留。请核对最新版本后明确保存，系统不会覆盖或自动重发。');
     priorRevision.current = project.summary.revision;
@@ -74,16 +75,44 @@ export function DraftWorkspace({ adapter, project, queue, refresh, onDirtyChange
   }
   const operation = operations.find(item => item.operationId === selectedOperationId) ?? operations.at(-1) ?? null;
   const unfinished = Boolean(uncertainRequest) || operations.some(item => activeStatuses.has(item.status));
+  async function submitAuthor(input: AuthorInput, label: string) {
+    await perform(label, async () => {
+      const result = await adapter.author(input);
+      if (result.operationId !== input.operationId || result.attemptId !== input.attemptId) throw new Error('文本任务回执身份不匹配');
+      uncertainTextRequests.delete(project.summary.projectId); setUncertainRequest(null);
+      setOperations(previous => [...previous.filter(item => item.operationId !== result.operationId), result]); setSelectedOperationId(result.operationId);
+    });
+  }
   async function author(stage: V3Stage) {
     if (unfinished) { setError('该项目已有未结束的文本任务，请先核对状态。'); return; }
-    const operationId = crypto.randomUUID();
-    uncertainTextRequests.set(project.summary.projectId, operationId); setUncertainRequest(operationId);
-    await perform(stage === 'outline' ? '大纲与计划请求' : '细化与设计请求', async () => {
-      const result = await adapter.author({ projectId: project.summary.projectId, expectedRevision: project.summary.revision, operationId, attemptId: crypto.randomUUID(), stage });
-      if (result.operationId !== operationId) throw new Error('文本任务回执身份不匹配');
-      uncertainTextRequests.delete(project.summary.projectId); setUncertainRequest(null);
-      setOperations(previous => [...previous, result]); setSelectedOperationId(result.operationId);
-    });
+    if (!analysis) { setError('副本缺少可验证的分析，未向本机提交文本任务；请核对副本资料后重试。'); return; }
+    const input = { projectId: project.summary.projectId, expectedRevision: project.summary.revision, operationId: crypto.randomUUID(), attemptId: crypto.randomUUID(), stage };
+    uncertainTextRequests.set(project.summary.projectId, input); setUncertainRequest(input);
+    await submitAuthor(input, stage === 'outline' ? '大纲与计划请求' : '细化与设计请求');
+  }
+  async function reconcileUncertain() {
+    const input = uncertainRequest;
+    if (!input || pending) return;
+    setPending('核对并恢复'); setError(null); setNotice(null);
+    try {
+      // Native text admission checks the captured draft revision in its writer transaction.
+      // These reads must remain ordered: a newer draft revision first, then full history.
+      const current = await adapter.load(input.projectId);
+      if (current.kind !== 'draft' || current.project.summary.projectId !== input.projectId) throw new Error('当前副本类型或身份已变化，仍需人工核对');
+      if (current.project.summary.revision <= input.expectedRevision) {
+        setNotice('副本修订尚未超过原请求修订；旧请求仍可能入队，继续保留占位。');
+        return;
+      }
+      const items = await adapter.textHistory(input.projectId);
+      const matching = items.find(item => item.operationId === input.operationId && item.attemptId === input.attemptId);
+      if (!matching && items.some(item => item.operationId === input.operationId)) throw new Error('原任务 ID 存在但尝试身份不匹配，继续保留占位');
+      await refresh();
+      setOperations(items);
+      if (matching) setSelectedOperationId(matching.operationId);
+      uncertainTextRequests.delete(input.projectId); setUncertainRequest(null);
+      setNotice(matching ? '已在本机历史中找到原任务；未创建新请求。' : '新修订与随后读取的完整历史确认旧请求未入队；可在新修订上明确创建请求。');
+    } catch (caught) { setError(`${explain(caught)}。原请求占位仍保留，可用同一请求标识重试确认。`); }
+    finally { setPending(null); }
   }
   async function savePair(stage: V3Stage) {
     if (!analysis) { setError('副本没有可验证的分析，无法保存配对内容。'); return; }
@@ -114,7 +143,7 @@ export function DraftWorkspace({ adapter, project, queue, refresh, onDirtyChange
     <section className="presales-workspace__panel"><h2>模型配对生成与历史</h2><p>生成操作和完整请求由本机持久化；完成后填入未批准的配对草稿，绝不自动批准。</p>
       <div className="presales-workspace__actions"><button disabled={Boolean(pending || unfinished || approvedOutline || !queue.dispatchAvailable || dirty)} onClick={() => void author('outline')}>生成大纲与售前计划</button><button disabled={Boolean(pending || unfinished || !approvedOutline || approvedDetails || !queue.dispatchAvailable || dirty)} onClick={() => void author('details')}>生成细化与设计</button></div>
       {!queue.dispatchAvailable && <p>文本模型运行环境当前不可用；仍可手工编辑已保存草稿。</p>}
-      {uncertainRequest && <p role="alert">文本提交结果待核对（{uncertainRequest}）；暂不重发。返回此页仍会保持占位，直到权威历史确认同一任务。</p>}
+      {uncertainRequest && <div><p role="alert">文本提交结果待核对（{uncertainRequest.operationId}）；不会自动创建新请求。返回此页仍会保持占位，直到权威历史确认同一任务。</p><div className="presales-workspace__actions"><button disabled={Boolean(pending)} onClick={() => void submitAuthor(uncertainRequest, '原请求重试确认')}>用原请求标识重试确认</button><button disabled={Boolean(pending)} onClick={() => void reconcileUncertain()}>核对并恢复</button></div><p>原请求可用相同项目、修订、阶段、任务 ID 和尝试 ID 明确重试。恢复操作会先读取本机新修订，再读取完整任务历史；没有新修订或读取失败时不会解除占位。</p></div>}
       {operations.length > 0 && <label>生成历史<select value={operation?.operationId ?? ''} onChange={event => setSelectedOperationId(event.target.value)}>{operations.map(item => <option key={item.operationId} value={item.operationId}>{item.target.stage} · {item.status} · {item.operationId}</option>)}</select></label>}
       {operation && <div><p>状态：{operation.status}{operation.error ? ` · ${operation.error}` : ''}{operation.commit ? ' · 已保存配对结果，未自动批准' : ''}</p><details><summary>查看实际保存的请求与上下文</summary><p>提示词版本：{operation.target.promptVersion}</p><h4>提交时的项目简介</h4><p>{operation.target.brief}</p><h4>提交时的任务上下文</h4><p>{operation.target.context.taskBrief}</p><p>大纲要求：{operation.target.context.outlineRequirements}</p>{Object.entries(operation.target.context.sourceInstructions).map(([id, instruction]) => <p key={id}>材料 {id}：<span>{instruction}</span></p>)}<p>提交时的配色：{operation.target.palette.profile ? `${operation.target.palette.profile.primaryColor} / ${operation.target.palette.profile.backgroundColor}` : '未提供已验证配色'}</p><h4>实际保存的完整请求</h4><pre>{operation.target.prompt}</pre></details>{operation.status === 'conflict' && <p>模型结果与新手工修改冲突；结果证据保留，当前输入不会被覆盖。</p>}{['outcome_unknown', 'cancel_requested'].includes(operation.status) && <button onClick={() => { if (window.confirm('远端可能仍会完成并计费。确认承担重复执行风险并放弃占位？')) void perform('放弃文本任务', () => adapter.abandon('text', operation.operationId)); }}>确认风险并放弃占位</button>}{['queued', 'running'].includes(operation.status) && <button onClick={() => void perform('取消文本任务', () => adapter.cancel('text', operation.operationId))}>取消任务</button>}</div>}
     </section>

@@ -45,7 +45,7 @@ export function toGalleryModel(snapshot: Pick<V3ProjectSnapshot, 'summary' | 'pa
         retryReason: job.status === 'failed' ? '失败任务需要明确创建新请求；本按钮不自动重试' : null,
       },
       eligibility: {
-        generate: historyReason ?? basisReason ?? activeReason ?? generationReason,
+        generate: historyReason ?? basisReason ?? activeReason ?? generationReason ?? (page.references.length ? editingReason : null),
         edit: historyReason ?? basisReason ?? activeReason ?? editingReason ?? (!current?.image ? '请选择有图片的父版本' : null),
         adopt: historyReason ?? activeReason ?? (!current ? '尚无版本' : null),
         restore: historyReason ?? activeReason ?? (!page.approvals.length && !page.originApprovals?.length ? '没有可恢复的历史批准' : null),

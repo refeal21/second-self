@@ -85,7 +85,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
   function reconcileGenerationFences(current: GalleryModel) {
     let changed = false;
     for (const [id, fence] of generationPendingRef.current) {
-      if (fence.phase !== 'awaiting-sync' || !fence.requestId) continue;
+      if (fence.phase === 'submitting' || !fence.requestId) continue;
       const currentPage = current.pages.find(item => item.id === id);
       if (currentPage && ((currentPage.job.state !== 'idle' && currentPage.job.requestId === fence.requestId) ||
         currentPage.versions.some(item => item.requestId === fence.requestId))) {
@@ -118,13 +118,16 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
       try {
         const receipt = await work();
         const missing: string[] = [];
+        const definite: string[] = [];
         for (const id of ids) {
           const requestId = receipt?.requestIds?.[id];
           if (typeof requestId === 'string' && requestId.trim()) generationPendingRef.current.set(id, { phase: 'awaiting-sync', requestId });
-          else { generationPendingRef.current.set(id, { phase: 'outcome-unknown', requestId: null }); missing.push(id); }
+          else if (receipt?.notSubmitted?.[id]) { generationPendingRef.current.delete(id); definite.push(receipt.notSubmitted[id]); }
+          else { generationPendingRef.current.set(id, { phase: 'outcome-unknown', requestId: receipt?.attemptedRequestIds?.[id] ?? null }); missing.push(id); }
         }
         syncGenerationFences();
         if (missing.length) setErrors(previous => ({ ...previous, [key]: `任务回执不完整（${missing.length} 页），提交结果待确认；请核对任务列表，暂不重复提交` }));
+        else if (definite.length) setErrors(previous => ({ ...previous, [key]: `提交前校验未通过：${definite.join('；')}` }));
         reconcileGenerationFences(modelRef.current);
       } catch (error) {
         for (const id of ids) generationPendingRef.current.set(id, { phase: 'outcome-unknown', requestId: null });

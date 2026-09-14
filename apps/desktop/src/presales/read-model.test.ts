@@ -32,4 +32,11 @@ describe('native v3 gallery join', () => {
     expect(model.pages[0]!.currentDeliveryVersionId).toBe('legacy-v1');
     expect(model.pages[0]!.eligibility.approve).toMatch(/原始图片/);
   });
+  it('blocks ordinary generation when the page has an attached reference but image input is unavailable', () => {
+    const referenced = { ...page('referenced', 1), references: [{ image: { assetId: 'reference-1', sha256: 'sha-reference' }, relativePath: 'assets/reference.png', byteLength: 123, purpose: 'layout' as const }] };
+    const ordinary = page('ordinary', 2);
+    const model = toGalleryModel({ ...snapshot, pages: [referenced, ordinary] }, { ...queue, jobs: [] });
+    expect(model.pages[0]!.eligibility.generate).toContain('image input unavailable');
+    expect(model.pages[1]!.eligibility.generate).toBeNull();
+  });
 });

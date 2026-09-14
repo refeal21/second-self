@@ -50,9 +50,9 @@ export interface GalleryModel {
   capabilityReasons: { reference: string | null; edit: string | null };
 }
 export interface GalleryVersionRef { pageId: string; versionId: string; revision: number }
-/** Accepted native request IDs for each affected page. Missing IDs mean outcome-unknown and remain fenced.
- * Callback rejection must mean definite non-admission; an uncertain outcome returns without that page's ID. */
-export interface GalleryGenerationReceipt { requestIds: Record<string, string> }
+/** Accepted IDs come only from matching native jobs. Attempted IDs are reconciliation keys,
+ * never admission proof: missing accepted IDs stay fenced until the exact job/version appears. */
+export interface GalleryGenerationReceipt { requestIds: Record<string, string>; attemptedRequestIds?: Record<string, string>; /** Only pre-invocation host validation may populate this. */ notSubmitted?: Record<string, string> }
 export interface GalleryProps {
   model: GalleryModel;
   readOnly?: boolean;

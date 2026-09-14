@@ -20,13 +20,13 @@ const image = (id: string) => ({ id, sha256: `${id}-sha` });
 const base: GalleryModel = {
   pages: [
     { id: 'a', number: 1, title: '开场', summary: '项目定位', currentDeliveryVersionId: null, candidateVersionId: null,
-      versions: [], job: { state: 'running', label: '生成中' }, eligibility: { generate: null, edit: '正在生成', adopt: '无候选稿', restore: '无历史稿', approve: '无候选稿' } },
+      versions: [], job: { state: 'running', requestId: 'a-existing', label: '生成中' }, eligibility: { generate: null, edit: '正在生成', adopt: '无候选稿', restore: '无历史稿', approve: '无候选稿' } },
     { id: 'b', number: 2, title: '机会', summary: '机会说明', currentDeliveryVersionId: null, candidateVersionId: 'b2',
       versions: [{ id: 'b1', revision: 1, label: '初稿', image: image('b1'), manualRevision: 0, approved: true },
         { id: 'b2', revision: 2, label: '候选稿', image: image('b2'), manualRevision: 1, approved: false }],
-      job: { state: 'idle' }, eligibility: { generate: null, edit: null, adopt: null, restore: null, approve: null } },
+      job: { state: 'idle', requestId: null }, eligibility: { generate: null, edit: null, adopt: null, restore: null, approve: null } },
     { id: 'c', number: 3, title: '方案', summary: '方案说明', currentDeliveryVersionId: null, candidateVersionId: null,
-      versions: [], job: { state: 'queued', label: '排队中', cancelReason: '队列未确认取消' },
+      versions: [], job: { state: 'queued', requestId: 'c-existing', label: '排队中', cancelReason: '队列未确认取消' },
       eligibility: { generate: '已排队', edit: '无候选稿', adopt: '无候选稿', restore: '无历史稿', approve: '无候选稿' } },
   ],
   savedFeedback: {}, queue: { concurrency: 2, paused: false, pauseReason: null, resumeReason: null, generateAllMissingReason: null },
@@ -35,14 +35,15 @@ const base: GalleryModel = {
 
 function props(overrides: Partial<GalleryProps> = {}): GalleryProps {
   return { model: base, loadImage: vi.fn(async () => 'data:image/png;base64,aGVsbG8='),
-    onGenerate: vi.fn(async () => {}), onEdit: vi.fn(async () => {}), onAdopt: vi.fn(async () => {}),
+    onGenerate: vi.fn(async (id: string) => ({ requestIds: { [id]: `${id}-request` } })),
+    onEdit: vi.fn(async (ref) => ({ requestIds: { [ref.pageId]: `${ref.pageId}-edit-request` } })), onAdopt: vi.fn(async () => {}),
     onRestore: vi.fn(async () => {}), onApprove: vi.fn(async () => {}), onSaveFeedback: vi.fn(async (_ref, text: string) => ({ text, revision: 1 })),
-    onQueueChange: vi.fn(async () => {}), onBatchGenerate: vi.fn(async () => {}), onDirtyChange: vi.fn(), ...overrides };
+    onQueueChange: vi.fn(async () => {}), onBatchGenerate: vi.fn(async (batch) => ({ requestIds: Object.fromEntries(batch.pageIds.map((id: string) => [id, `${id}-request`])) })), onDirtyChange: vi.fn(), ...overrides };
 }
 
 describe('Gallery', () => {
   it('keeps B selected while A runs and allows B edit and exact-version approval without submitting a new draft', async () => {
-    const user = userEvent.setup(); const pending = deferred();
+    const user = userEvent.setup(); const pending = deferred<{ requestIds: Record<string, string> }>();
     const onEdit = vi.fn(() => pending.promise); const onApprove = vi.fn(async () => {});
     const input = props({ onEdit, onApprove });
     const { rerender } = render(<Gallery {...input} />);
@@ -56,9 +57,9 @@ describe('Gallery', () => {
     expect(screen.getByRole('button', { name: '批准此版本' })).toBeEnabled();
     await user.click(screen.getByRole('button', { name: '批准此版本' }));
     expect(onApprove).toHaveBeenCalledWith({ pageId: 'b', versionId: 'b2', revision: 2 });
-    rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'a' ? { ...p, job: { state: 'idle' } } : p) }} />);
+    rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'a' ? { ...p, job: { state: 'idle', requestId: null } } : p) }} />);
     expect(screen.getByRole('heading', { name: /第 2 页 · 机会/ })).toBeVisible();
-    pending.resolve();
+    pending.resolve({ requestIds: { b: 'b-edit-request' } });
   });
 
   it('inspects history without adoption, then requires explicit adoption or restoration', async () => {
@@ -108,7 +109,7 @@ describe('Gallery', () => {
   });
 
   it('requires batch confirmation, reports disabled reasons, and keeps queued cancellation gated', async () => {
-    const user = userEvent.setup(); const onBatchGenerate = vi.fn(async () => {}); const onQueueChange = vi.fn(async () => {});
+    const user = userEvent.setup(); const onBatchGenerate = vi.fn(async () => ({ requestIds: { b: 'b-request' } })); const onQueueChange = vi.fn(async () => {});
     render(<Gallery {...props({ onBatchGenerate, onQueueChange })} />);
     await user.click(screen.getByRole('checkbox', { name: /选择第 2 页/ }));
     await user.click(screen.getByRole('button', { name: '批量生成所选页' }));
@@ -133,7 +134,7 @@ describe('Gallery', () => {
   });
 
   it('requires explicit replacement confirmation before single-page generation', async () => {
-    const user = userEvent.setup(); const onGenerate = vi.fn(async () => {});
+    const user = userEvent.setup(); const onGenerate = vi.fn(async () => ({ requestIds: { b: 'b-request' } }));
     render(<Gallery {...props({ onGenerate })} />);
     await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
     await user.click(screen.getByRole('button', { name: '生成新稿' }));
@@ -214,8 +215,8 @@ describe('Gallery', () => {
   });
 
   it('blocks overlapping generation paths for B while permitting a different page to generate', async () => {
-    const user = userEvent.setup(); const running = deferred();
-    const onGenerate = vi.fn(() => running.promise); const onBatchGenerate = vi.fn(async () => {});
+    const user = userEvent.setup(); const running = deferred<{ requestIds: Record<string, string> }>();
+    const onGenerate = vi.fn(() => running.promise); const onBatchGenerate = vi.fn(async () => ({ requestIds: { d: 'd-request' } }));
     const d = { ...base.pages[1]!, id: 'd', number: 4, title: '成果', candidateVersionId: 'd1',
       versions: [{ id: 'd1', revision: 1, label: '候选稿', manualRevision: 0, approved: false, image: image('d1') }] };
     render(<Gallery {...props({ model: { ...base, pages: [...base.pages, d] }, onGenerate, onBatchGenerate })} />);
@@ -230,12 +231,76 @@ describe('Gallery', () => {
     await user.click(screen.getByRole('button', { name: /第 4 页 成果/ }));
     expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
     expect(onBatchGenerate).not.toHaveBeenCalled();
-    await act(async () => running.resolve());
+    await act(async () => running.resolve({ requestIds: { b: 'b-request' } }));
+  });
+
+  it('keeps a submitted page fenced after callback success until its exact request appears in the host model', async () => {
+    const user = userEvent.setup(); const onGenerate = vi.fn(async () => ({ requestIds: { b: 'new-b-request' } }));
+    const input = props({ onGenerate }); const { rerender } = render(<Gallery {...input} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.click(screen.getByRole('button', { name: '生成新稿' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    await waitFor(() => expect(onGenerate).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    expect(screen.getByText(/等待任务状态同步/)).toBeVisible();
+    rerender(<Gallery {...input} model={{ ...base, pages: [...base.pages] }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'completed', requestId: 'other-request' } } : p) }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'completed', requestId: 'new-b-request' } } : p) }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+  });
+
+  it('accepts a matching completed version as sync evidence even before its job appears', async () => {
+    const user = userEvent.setup(); const onGenerate = vi.fn(async () => ({ requestIds: { b: 'version-request' } }));
+    const input = props({ onGenerate }); const { rerender } = render(<Gallery {...input} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.click(screen.getByRole('button', { name: '生成新稿' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? {
+      ...p, candidateVersionId: 'b3', versions: [...p.versions, { id: 'b3', revision: 3, label: '新候选稿', manualRevision: 0,
+        approved: false, image: image('b3'), requestId: 'other-request' }],
+    } : p) }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? {
+      ...p, candidateVersionId: 'b3', versions: [...p.versions, { id: 'b3', revision: 3, label: '新候选稿', manualRevision: 0,
+        approved: false, image: image('b3'), requestId: 'version-request' }],
+    } : p) }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+  });
+
+  it('unfences a page with no batch receipt but retains the acknowledged page fence and shows an error', async () => {
+    const user = userEvent.setup(); const onBatchGenerate = vi.fn(async () => ({ requestIds: { b: 'b-request' } }));
+    const d = { ...base.pages[1]!, id: 'd', number: 4, title: '成果', candidateVersionId: 'd1',
+      versions: [{ id: 'd1', revision: 1, label: '候选稿', manualRevision: 0, approved: false, image: image('d1') }] };
+    render(<Gallery {...props({ model: { ...base, pages: [...base.pages, d] }, onBatchGenerate })} />);
+    await user.click(screen.getByRole('checkbox', { name: '选择第 2 页' }));
+    await user.click(screen.getByRole('checkbox', { name: '选择第 4 页' }));
+    await user.click(screen.getByRole('button', { name: '批量生成所选页' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('回执不完整');
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: /第 4 页 成果/ }));
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+    expect(onBatchGenerate).toHaveBeenCalledTimes(1);
+  });
+
+  it('unfences rejected generation with a visible error so the page can be retried explicitly', async () => {
+    const user = userEvent.setup(); const onGenerate = vi.fn(async () => { throw new Error('入队失败'); });
+    render(<Gallery {...props({ onGenerate })} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.click(screen.getByRole('button', { name: '生成新稿' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('入队失败');
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
+    expect(onGenerate).toHaveBeenCalledTimes(1);
   });
 
   it('allows a disjoint batch while another batch is awaiting its callback', async () => {
-    const user = userEvent.setup(); const first = deferred();
-    const onBatchGenerate = vi.fn((batch: { pageIds: string[] }) => batch.pageIds[0] === 'b' ? first.promise : Promise.resolve());
+    const user = userEvent.setup(); const first = deferred<{ requestIds: Record<string, string> }>();
+    const onBatchGenerate = vi.fn((batch: { pageIds: string[] }) => batch.pageIds[0] === 'b' ? first.promise : Promise.resolve({ requestIds: { d: 'd-request' } }));
     const d = { ...base.pages[1]!, id: 'd', number: 4, title: '成果', candidateVersionId: 'd1',
       versions: [{ id: 'd1', revision: 1, label: '候选稿', manualRevision: 0, approved: false, image: image('d1') }] };
     render(<Gallery {...props({ model: { ...base, pages: [...base.pages, d] }, onBatchGenerate })} />);
@@ -249,11 +314,11 @@ describe('Gallery', () => {
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
     expect(onBatchGenerate).toHaveBeenCalledTimes(2);
     expect(onBatchGenerate).toHaveBeenNthCalledWith(2, { pageIds: ['d'], replaceCandidates: true });
-    await act(async () => first.resolve());
+    await act(async () => first.resolve({ requestIds: { b: 'b-request' } }));
   });
 
   it('treats a pending edit as generation work for that page only', async () => {
-    const user = userEvent.setup(); const running = deferred();
+    const user = userEvent.setup(); const running = deferred<{ requestIds: Record<string, string> }>();
     const onEdit = vi.fn(() => running.promise);
     render(<Gallery {...props({ onEdit })} />);
     await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
@@ -262,11 +327,11 @@ describe('Gallery', () => {
     expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
     await user.click(screen.getByRole('checkbox', { name: '选择第 2 页' }));
     expect(screen.getByRole('button', { name: '批量生成所选页' })).toBeDisabled();
-    await act(async () => running.resolve());
+    await act(async () => running.resolve({ requestIds: { b: 'b-edit-request' } }));
   });
 
   it('requires fresh replacement confirmation when a candidate appears while the dialog is open', async () => {
-    const user = userEvent.setup(); const onGenerate = vi.fn(async () => {});
+    const user = userEvent.setup(); const onGenerate = vi.fn(async () => ({ requestIds: { d: 'd-request' } }));
     const d = { ...base.pages[1]!, id: 'd', number: 4, title: '成果', candidateVersionId: null, versions: [] };
     const first: GalleryModel = { ...base, pages: [...base.pages, d] };
     const { rerender } = render(<Gallery {...props({ model: first, onGenerate })} />);
@@ -286,12 +351,12 @@ describe('Gallery', () => {
   });
 
   it('rejects a batch confirmation when a selected page becomes queued before dispatch', async () => {
-    const user = userEvent.setup(); const onBatchGenerate = vi.fn(async () => {});
+    const user = userEvent.setup(); const onBatchGenerate = vi.fn(async () => ({ requestIds: { b: 'b-request' } }));
     const input = props({ onBatchGenerate });
     const { rerender } = render(<Gallery {...input} />);
     await user.click(screen.getByRole('checkbox', { name: '选择第 2 页' }));
     await user.click(screen.getByRole('button', { name: '批量生成所选页' }));
-    const updated: GalleryModel = { ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'queued', label: '排队中' } } : p) };
+    const updated: GalleryModel = { ...base, pages: base.pages.map(p => p.id === 'b' ? { ...p, job: { state: 'queued', requestId: 'other-request', label: '排队中' } } : p) };
     rerender(<Gallery {...input} model={updated} />);
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
     expect(onBatchGenerate).not.toHaveBeenCalled();
@@ -299,8 +364,23 @@ describe('Gallery', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('页面状态已变化，请重新选择');
   });
 
+  it('rejects generate-all confirmation if the host revokes queue eligibility while the dialog is open', async () => {
+    const user = userEvent.setup(); const onBatchGenerate = vi.fn(async () => ({ requestIds: { d: 'new-d-request' } }));
+    const d = { ...base.pages[1]!, id: 'd', number: 4, title: '成果', candidateVersionId: null, versions: [] };
+    const initial: GalleryModel = { ...base, pages: [...base.pages, d] };
+    const input = props({ model: initial, onBatchGenerate }); const { rerender } = render(<Gallery {...input} />);
+    await user.click(screen.getByRole('button', { name: '生成全部缺失页' }));
+    expect(screen.getByRole('dialog')).toBeVisible();
+    rerender(<Gallery {...input} model={{ ...initial, queue: { ...initial.queue, generateAllMissingReason: '队列已暂停' } }} />);
+    expect(screen.getByRole('button', { name: '生成全部缺失页' })).toBeDisabled();
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(onBatchGenerate).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('队列已暂停');
+  });
+
   it('requires fresh confirmation when the same candidate identity gets a new revision', async () => {
-    const user = userEvent.setup(); const onGenerate = vi.fn(async () => {});
+    const user = userEvent.setup(); const onGenerate = vi.fn(async () => ({ requestIds: { b: 'b-request' } }));
     const input = props({ onGenerate }); const { rerender } = render(<Gallery {...input} />);
     await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
     await user.click(screen.getByRole('button', { name: '生成新稿' }));
@@ -353,7 +433,7 @@ describe('Gallery', () => {
   });
 
   it('requires saving typed feedback before editing that version and keeps text after a failed save', async () => {
-    const user = userEvent.setup(); const onEdit = vi.fn(async () => {});
+    const user = userEvent.setup(); const onEdit = vi.fn(async () => ({ requestIds: { b: 'b-edit-request' } }));
     const onSaveFeedback = vi.fn(async () => { throw new Error('版本冲突'); });
     render(<Gallery {...props({ onEdit, onSaveFeedback })} />);
     await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));

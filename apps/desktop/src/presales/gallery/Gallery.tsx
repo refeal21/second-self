@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { GalleryImage } from './GalleryImage.js';
-import type { GalleryAction, GalleryFeedback, GalleryPage, GalleryProps, GalleryVersion, GalleryVersionRef } from './model.js';
+import type { GalleryAction, GalleryFeedback, GalleryGenerationReceipt, GalleryModel, GalleryPage, GalleryProps, GalleryVersion, GalleryVersionRef } from './model.js';
 import './gallery.css';
 
 const feedbackKey = (pageId: string, versionId: string, revision: number) => `${pageId}:${versionId}:${revision}`;
@@ -26,6 +26,7 @@ function versionSnapshot(page: GalleryPage, id: string | null): string | null {
   const version = page.versions.find(item => item.id === id);
   return JSON.stringify([id, version?.revision ?? null, version?.image?.id ?? null, version?.image?.sha256 ?? null]);
 }
+type GenerationFence = { phase: 'submitting' | 'awaiting-sync'; requestId: string | null };
 
 export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onRestore, onApprove, onSaveFeedback,
   onQueueChange, onBatchGenerate, onCancelJob, onRetryJob, onDirtyChange }: GalleryProps) {
@@ -37,8 +38,10 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
   const acknowledgedFeedbackRef = useRef<Record<string, GalleryFeedback>>({});
   const feedbackRevisionFloorRef = useRef<Record<string, number>>({});
   const [pending, setPending] = useState<Record<string, boolean>>({});
-  const generationPendingRef = useRef(new Set<string>());
-  const [generationPending, setGenerationPending] = useState<string[]>([]);
+  const generationPendingRef = useRef(new Map<string, GenerationFence>());
+  const [generationPending, setGenerationPending] = useState<Record<string, GenerationFence>>({});
+  const modelRef = useRef(model);
+  modelRef.current = model;
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [checked, setChecked] = useState<Record<string, boolean>>({});
   const [confirmation, setConfirmation] = useState<{
@@ -78,6 +81,22 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
     Object.keys(pending).some(key => key.startsWith('feedback:') && pending[key]), [feedback, baseline, pending]);
   useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
 
+  function syncGenerationFences() { setGenerationPending(Object.fromEntries(generationPendingRef.current)); }
+  function reconcileGenerationFences(current: GalleryModel) {
+    let changed = false;
+    for (const [id, fence] of generationPendingRef.current) {
+      if (fence.phase !== 'awaiting-sync' || !fence.requestId) continue;
+      const currentPage = current.pages.find(item => item.id === id);
+      if (currentPage && ((currentPage.job.state !== 'idle' && currentPage.job.requestId === fence.requestId) ||
+        currentPage.versions.some(item => item.requestId === fence.requestId))) {
+        generationPendingRef.current.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) syncGenerationFences();
+  }
+  useEffect(() => { reconcileGenerationFences(model); }, [model.pages]);
+
   const page = model.pages.find(p => p.id === pageId) ?? model.pages[0] ?? null;
   const version = page?.versions.find(v => v.id === versionIds[page.id]) ?? (page ? firstVersion(page) : null);
   const ref = page && version ? versionRef(page, version) : null;
@@ -90,21 +109,38 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
     catch (error) { setErrors(previous => ({ ...previous, [key]: explain(error) })); }
     finally { setPending(previous => ({ ...previous, [key]: false })); }
   }
-  function runGeneration(ids: string[], key: string, work: () => Promise<void>) {
+  function runGeneration(ids: string[], key: string, work: () => Promise<GalleryGenerationReceipt>) {
     if (ids.some(id => generationPendingRef.current.has(id))) return;
-    for (const id of ids) generationPendingRef.current.add(id);
-    setGenerationPending([...generationPendingRef.current]);
-    void perform(key, work).finally(() => {
-      for (const id of ids) generationPendingRef.current.delete(id);
-      setGenerationPending([...generationPendingRef.current]);
-    });
+    for (const id of ids) generationPendingRef.current.set(id, { phase: 'submitting', requestId: null });
+    syncGenerationFences();
+    setErrors(previous => ({ ...previous, [key]: '' }));
+    void (async () => {
+      try {
+        const receipt = await work();
+        const missing: string[] = [];
+        for (const id of ids) {
+          const requestId = receipt?.requestIds?.[id];
+          if (typeof requestId === 'string' && requestId.trim()) generationPendingRef.current.set(id, { phase: 'awaiting-sync', requestId });
+          else { generationPendingRef.current.delete(id); missing.push(id); }
+        }
+        syncGenerationFences();
+        if (missing.length) setErrors(previous => ({ ...previous, [key]: `任务回执不完整（${missing.length} 页），请核对后再试；未自动重试` }));
+        reconcileGenerationFences(modelRef.current);
+      } catch (error) {
+        for (const id of ids) generationPendingRef.current.delete(id);
+        syncGenerationFences();
+        setErrors(previous => ({ ...previous, [key]: explain(error) }));
+      }
+    })();
   }
-  const isGenerating = (id: string) => generationPending.includes(id);
-  function doVersionAction(action: GalleryAction, work: (ref: GalleryVersionRef) => Promise<void>) {
-    if (!page || !ref || page.eligibility[action] || (action === 'restore' && !version?.approved) || pending[actionKey(page.id, action)] ||
-      (action === 'edit' && (feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`]))) return;
-    if (action === 'edit') runGeneration([page.id], actionKey(page.id, action), () => work(ref));
-    else void perform(actionKey(page.id, action), () => work(ref));
+  const isGenerating = (id: string) => Boolean(generationPending[id]);
+  function doVersionAction(action: Exclude<GalleryAction, 'edit' | 'generate'>, work: (ref: GalleryVersionRef) => Promise<void>) {
+    if (!page || !ref || page.eligibility[action] || (action === 'restore' && !version?.approved) || pending[actionKey(page.id, action)]) return;
+    void perform(actionKey(page.id, action), () => work(ref));
+  }
+  function doEdit() {
+    if (!page || !ref || page.eligibility.edit || model.capabilityReasons.edit || feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`]) return;
+    runGeneration([page.id], actionKey(page.id, 'edit'), () => onEdit(ref));
   }
   const feedbackId = ref ? feedbackKey(ref.pageId, ref.versionId, ref.revision) : '';
   const feedbackText = feedback[feedbackId] ?? model.savedFeedback[feedbackId]?.text ?? '';
@@ -124,6 +160,11 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
   function confirmGeneration() {
     if (!confirmation) return;
     const batch = confirmation;
+    if (batch.source === 'missing' && model.queue.generateAllMissingReason) {
+      setConfirmation(null);
+      setErrors(previous => ({ ...previous, batch: model.queue.generateAllMissingReason ?? '队列当前不可用' }));
+      return;
+    }
     const currentIds = batch.source === 'selected' ? selected : batch.source === 'missing' ? generateMissingIds : batch.pageIds;
     const targets = batch.pageIds.map(id => model.pages.find(p => p.id === id));
     if (currentIds.length !== batch.pageIds.length || currentIds.some((id, index) => id !== batch.pageIds[index]) ||
@@ -148,7 +189,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
       ? onGenerate(batch.pageIds[0]!, batch.replaceCandidates)
       : onBatchGenerate({ pageIds: batch.pageIds, replaceCandidates: batch.replaceCandidates }));
   }
-  const selectedBlocker = selected.map(id => { const item = model.pages.find(p => p.id === id); return item ? isGenerating(id) ? '该页操作进行中' : generateReason(item) : '页面已移除'; }).find(Boolean);
+  const selectedBlocker = selected.map(id => { const item = model.pages.find(p => p.id === id); return item ? isGenerating(id) ? generationPending[id]?.phase === 'awaiting-sync' ? '等待任务状态同步' : '该页操作进行中' : generateReason(item) : '页面已移除'; }).find(Boolean);
   return <section className="presales-gallery" aria-label="多页视觉图库">
     <header className="presales-gallery__header"><div><p className="presales-gallery__eyebrow">视觉工作台 / 逐页审核</p><h1>多页图库</h1><p>逐页检查、修订和确认。新生成稿不会自动提交或成为交付版本。</p></div>
       <div className="presales-gallery__queue" aria-label="队列设置">
@@ -185,10 +226,10 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         <div className="presales-gallery__history"><h3>版本历史</h3><div>{page.versions.map(item => <button key={item.id} type="button" className={item.id === version?.id ? 'is-active' : ''}
           onClick={() => setVersionIds(previous => ({ ...previous, [page.id]: item.id }))}>查看{item.label} 修订 {item.revision}{item.id === page.currentDeliveryVersionId ? ' · 当前交付' : ''}</button>)}</div></div>
         <div className="presales-gallery__actions" aria-label="页面操作">
-          <button type="button" disabled={Boolean(generateReason(page) || isGenerating(page.id))} title={generateReason(page) ?? (isGenerating(page.id) ? '该页操作进行中' : undefined)}
+          <button type="button" disabled={Boolean(generateReason(page) || isGenerating(page.id))} title={generateReason(page) ?? (isGenerating(page.id) ? generationPending[page.id]?.phase === 'awaiting-sync' ? '等待任务状态同步' : '该页操作进行中' : undefined)}
             onClick={() => openBatch([page.id], 'single')}>生成新稿</button>
           <button type="button" disabled={!ref || Boolean(page.eligibility.edit || model.capabilityReasons.edit || isGenerating(page.id) || feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`])} title={page.eligibility.edit ?? model.capabilityReasons.edit ?? (feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`] ? '先保存此版本反馈，再修改' : isGenerating(page.id) ? '该页操作进行中' : undefined)}
-            onClick={() => doVersionAction('edit', onEdit)}>编辑此版本</button>
+            onClick={doEdit}>编辑此版本</button>
           <button type="button" disabled={!ref || Boolean(page.eligibility.adopt || pending[actionKey(page.id, 'adopt')])} title={page.eligibility.adopt ?? undefined}
             onClick={() => doVersionAction('adopt', onAdopt)}>选择用于交付</button>
           <button type="button" disabled={!ref || Boolean(!version?.approved || page.eligibility.restore || pending[actionKey(page.id, 'restore')])} title={!version?.approved ? '仅已批准版本可恢复' : page.eligibility.restore ?? undefined}
@@ -197,6 +238,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         <div className="presales-gallery__reasons">{model.capabilityReasons.reference && <p>参考图：{model.capabilityReasons.reference}</p>}{model.capabilityReasons.edit && <p>编辑：{model.capabilityReasons.edit}</p>}
           {Object.entries({ ...page.eligibility, generate: generateReason(page) }).map(([action, reason]) => reason && <p key={action}>{({ generate: '生成', edit: '编辑', adopt: '采用', restore: '恢复', approve: '批准' } as Record<string,string>)[action]}：{reason}</p>)}
           {!version?.approved && version && <p>恢复：仅已批准版本可恢复</p>}
+          {generationPending[page.id]?.phase === 'awaiting-sync' && <p>已提交，等待任务状态同步；暂不重复提交。</p>}
           {ref && (feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`]) && <p>先保存此版本反馈，再修改</p>}
           {page.job.state === 'unknown' && <p>任务结果待确认，暂不自动重试。</p>}</div>
         {(onCancelJob || onRetryJob) && <div className="presales-gallery__actions">

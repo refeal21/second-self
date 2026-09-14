@@ -144,12 +144,23 @@ fn apply_event(draft: &mut V3ImportedDraft, event: V3DraftEvent) -> Result<(), S
                 .cloned()
                 .ok_or("a complete pair must be saved before approval")?;
             let (stage_name, version_id, content_hash, companion_hash) = match stage {
-                V3TextStage::Outline if approvals == 0 => (
-                    "outline_review",
-                    c.basis.outline.version_id.clone(),
-                    c.basis.outline.content_hash.clone(),
-                    c.basis.outline.plan_hash.clone(),
-                ),
+                V3TextStage::Outline if approvals == 0 => {
+                    let palette = &authored.settings.palette;
+                    if palette.revision < 1 {
+                        return Err("outline approval requires saved palette revision".into());
+                    }
+                    let profile = palette
+                        .profile
+                        .as_ref()
+                        .ok_or("outline approval requires saved palette")?;
+                    crate::visual_style::validate_profile(profile)?;
+                    (
+                        "outline_review",
+                        c.basis.outline.version_id.clone(),
+                        c.basis.outline.content_hash.clone(),
+                        c.basis.outline.plan_hash.clone(),
+                    )
+                }
                 V3TextStage::Details if approvals == 1 => {
                     let d = c
                         .basis

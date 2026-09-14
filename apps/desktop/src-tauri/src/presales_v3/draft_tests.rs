@@ -188,6 +188,9 @@ fn destination_settings_supply_missing_manual_palette_without_rewriting_origin_a
         envelope: f.pair["outline"].clone(),
     })
     .unwrap();
+    let before_approval = s.load_v3_project(id).unwrap();
+    assert!(s.approve_draft_pair(id, 2, V3TextStage::Outline).is_err());
+    assert_eq!(s.load_v3_project(id).unwrap(), before_approval);
     let profile=serde_json::from_value(json!({"primaryColor":"#123456","backgroundColor":"#FFFFFF","textColor":"#000000","accentColors":[],"instructions":"Manual user palette","template":null})).unwrap();
     let settings = SaveDraftSettings {
         project_id: id.clone(),

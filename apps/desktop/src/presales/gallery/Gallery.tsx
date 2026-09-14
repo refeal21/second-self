@@ -26,7 +26,7 @@ function versionSnapshot(page: GalleryPage, id: string | null): string | null {
   const version = page.versions.find(item => item.id === id);
   return JSON.stringify([id, version?.revision ?? null, version?.image?.id ?? null, version?.image?.sha256 ?? null]);
 }
-type GenerationFence = { phase: 'submitting' | 'awaiting-sync'; requestId: string | null };
+type GenerationFence = { phase: 'submitting' | 'awaiting-sync' | 'outcome-unknown'; requestId: string | null };
 
 export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onRestore, onApprove, onSaveFeedback,
   onQueueChange, onBatchGenerate, onCancelJob, onRetryJob, onDirtyChange }: GalleryProps) {
@@ -121,10 +121,10 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         for (const id of ids) {
           const requestId = receipt?.requestIds?.[id];
           if (typeof requestId === 'string' && requestId.trim()) generationPendingRef.current.set(id, { phase: 'awaiting-sync', requestId });
-          else { generationPendingRef.current.delete(id); missing.push(id); }
+          else { generationPendingRef.current.set(id, { phase: 'outcome-unknown', requestId: null }); missing.push(id); }
         }
         syncGenerationFences();
-        if (missing.length) setErrors(previous => ({ ...previous, [key]: `任务回执不完整（${missing.length} 页），请核对后再试；未自动重试` }));
+        if (missing.length) setErrors(previous => ({ ...previous, [key]: `任务回执不完整（${missing.length} 页），提交结果待确认；请核对任务列表，暂不重复提交` }));
         reconcileGenerationFences(modelRef.current);
       } catch (error) {
         for (const id of ids) generationPendingRef.current.delete(id);
@@ -134,6 +134,10 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
     })();
   }
   const isGenerating = (id: string) => Boolean(generationPending[id]);
+  function generationReason(id: string) {
+    const phase = generationPending[id]?.phase;
+    return phase === 'outcome-unknown' ? '提交结果待确认，请核对任务列表' : phase === 'awaiting-sync' ? '等待任务状态同步' : phase ? '该页操作进行中' : null;
+  }
   function doVersionAction(action: Exclude<GalleryAction, 'edit' | 'generate'>, work: (ref: GalleryVersionRef) => Promise<void>) {
     if (!page || !ref || page.eligibility[action] || (action === 'restore' && !version?.approved) || pending[actionKey(page.id, action)]) return;
     void perform(actionKey(page.id, action), () => work(ref));
@@ -189,7 +193,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
       ? onGenerate(batch.pageIds[0]!, batch.replaceCandidates)
       : onBatchGenerate({ pageIds: batch.pageIds, replaceCandidates: batch.replaceCandidates }));
   }
-  const selectedBlocker = selected.map(id => { const item = model.pages.find(p => p.id === id); return item ? isGenerating(id) ? generationPending[id]?.phase === 'awaiting-sync' ? '等待任务状态同步' : '该页操作进行中' : generateReason(item) : '页面已移除'; }).find(Boolean);
+  const selectedBlocker = selected.map(id => { const item = model.pages.find(p => p.id === id); return item ? generationReason(id) ?? generateReason(item) : '页面已移除'; }).find(Boolean);
   return <section className="presales-gallery" aria-label="多页视觉图库">
     <header className="presales-gallery__header"><div><p className="presales-gallery__eyebrow">视觉工作台 / 逐页审核</p><h1>多页图库</h1><p>逐页检查、修订和确认。新生成稿不会自动提交或成为交付版本。</p></div>
       <div className="presales-gallery__queue" aria-label="队列设置">
@@ -226,7 +230,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
         <div className="presales-gallery__history"><h3>版本历史</h3><div>{page.versions.map(item => <button key={item.id} type="button" className={item.id === version?.id ? 'is-active' : ''}
           onClick={() => setVersionIds(previous => ({ ...previous, [page.id]: item.id }))}>查看{item.label} 修订 {item.revision}{item.id === page.currentDeliveryVersionId ? ' · 当前交付' : ''}</button>)}</div></div>
         <div className="presales-gallery__actions" aria-label="页面操作">
-          <button type="button" disabled={Boolean(generateReason(page) || isGenerating(page.id))} title={generateReason(page) ?? (isGenerating(page.id) ? generationPending[page.id]?.phase === 'awaiting-sync' ? '等待任务状态同步' : '该页操作进行中' : undefined)}
+          <button type="button" disabled={Boolean(generateReason(page) || isGenerating(page.id))} title={generateReason(page) ?? generationReason(page.id) ?? undefined}
             onClick={() => openBatch([page.id], 'single')}>生成新稿</button>
           <button type="button" disabled={!ref || Boolean(page.eligibility.edit || model.capabilityReasons.edit || isGenerating(page.id) || feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`])} title={page.eligibility.edit ?? model.capabilityReasons.edit ?? (feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`] ? '先保存此版本反馈，再修改' : isGenerating(page.id) ? '该页操作进行中' : undefined)}
             onClick={doEdit}>编辑此版本</button>
@@ -239,6 +243,7 @@ export function Gallery({ model, loadImage, onGenerate, onEdit, onAdopt, onResto
           {Object.entries({ ...page.eligibility, generate: generateReason(page) }).map(([action, reason]) => reason && <p key={action}>{({ generate: '生成', edit: '编辑', adopt: '采用', restore: '恢复', approve: '批准' } as Record<string,string>)[action]}：{reason}</p>)}
           {!version?.approved && version && <p>恢复：仅已批准版本可恢复</p>}
           {generationPending[page.id]?.phase === 'awaiting-sync' && <p>已提交，等待任务状态同步；暂不重复提交。</p>}
+          {generationPending[page.id]?.phase === 'outcome-unknown' && <p>提交结果待确认，请核对任务列表；暂不重复提交。</p>}
           {ref && (feedbackText !== feedbackBase || pending[`feedback:${feedbackId}`]) && <p>先保存此版本反馈，再修改</p>}
           {page.job.state === 'unknown' && <p>任务结果待确认，暂不自动重试。</p>}</div>
         {(onCancelJob || onRetryJob) && <div className="presales-gallery__actions">

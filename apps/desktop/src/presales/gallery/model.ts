@@ -48,7 +48,8 @@ export interface GalleryModel {
   capabilityReasons: { reference: string | null; edit: string | null };
 }
 export interface GalleryVersionRef { pageId: string; versionId: string; revision: number }
-/** Accepted native request IDs for each affected page. Missing entries surface an error and are not retried automatically. */
+/** Accepted native request IDs for each affected page. Missing IDs mean outcome-unknown and remain fenced.
+ * Callback rejection must mean definite non-admission; an uncertain outcome returns without that page's ID. */
 export interface GalleryGenerationReceipt { requestIds: Record<string, string> }
 export interface GalleryProps {
   model: GalleryModel;

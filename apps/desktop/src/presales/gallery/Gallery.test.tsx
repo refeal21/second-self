@@ -270,11 +270,13 @@ describe('Gallery', () => {
     expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
   });
 
-  it('unfences a page with no batch receipt but retains the acknowledged page fence and shows an error', async () => {
+  it('keeps every potentially accepted batch page fenced when a successful receipt omits one page', async () => {
     const user = userEvent.setup(); const onBatchGenerate = vi.fn(async () => ({ requestIds: { b: 'b-request' } }));
     const d = { ...base.pages[1]!, id: 'd', number: 4, title: '成果', candidateVersionId: 'd1',
       versions: [{ id: 'd1', revision: 1, label: '候选稿', manualRevision: 0, approved: false, image: image('d1') }] };
-    render(<Gallery {...props({ model: { ...base, pages: [...base.pages, d] }, onBatchGenerate })} />);
+    const e = { ...d, id: 'e', number: 5, title: '附录', candidateVersionId: 'e1',
+      versions: [{ id: 'e1', revision: 1, label: '候选稿', manualRevision: 0, approved: false, image: image('e1') }] };
+    render(<Gallery {...props({ model: { ...base, pages: [...base.pages, d, e] }, onBatchGenerate })} />);
     await user.click(screen.getByRole('checkbox', { name: '选择第 2 页' }));
     await user.click(screen.getByRole('checkbox', { name: '选择第 4 页' }));
     await user.click(screen.getByRole('button', { name: '批量生成所选页' }));
@@ -283,8 +285,27 @@ describe('Gallery', () => {
     await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
     expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
     await user.click(screen.getByRole('button', { name: /第 4 页 成果/ }));
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    expect(screen.getByText('提交结果待确认，请核对任务列表；暂不重复提交。')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /第 5 页 附录/ }));
     expect(screen.getByRole('button', { name: '生成新稿' })).toBeEnabled();
     expect(onBatchGenerate).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a single page fenced after an incomplete successful receipt and unrelated host changes', async () => {
+    const user = userEvent.setup(); const onGenerate = vi.fn(async () => ({ requestIds: {} }));
+    const input = props({ onGenerate }); const { rerender } = render(<Gallery {...input} />);
+    await user.click(screen.getByRole('button', { name: /第 2 页 机会/ }));
+    await user.click(screen.getByRole('button', { name: '生成新稿' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认批量生成' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('回执不完整');
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    expect(screen.getByText('提交结果待确认，请核对任务列表；暂不重复提交。')).toBeVisible();
+    rerender(<Gallery {...input} model={{ ...base, pages: base.pages.map(p => p.id === 'b' ? {
+      ...p, job: { state: 'completed', requestId: 'unrelated-request' },
+    } : p) }} />);
+    expect(screen.getByRole('button', { name: '生成新稿' })).toBeDisabled();
+    expect(onGenerate).toHaveBeenCalledTimes(1);
   });
 
   it('unfences rejected generation with a visible error so the page can be retried explicitly', async () => {
